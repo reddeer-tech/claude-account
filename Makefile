@@ -246,14 +246,21 @@ release: check version dist
 	@$(MAKE) --no-print-directory preflight
 	@git tag -a "v$(VERSION)" -m "claude-account $(VERSION)" 2>/dev/null || echo "tag v$(VERSION) already exists"
 	@git push origin "v$(VERSION)"
-	@# ⚠️ NEVER `--clobber` HERE. It leaves a metadata record whose backing blob is gone:
-	@# the API reports state=uploaded with the right size while every download returns 404
-	@# BlobNotFound. Delete the asset outright, then upload a fresh one.
+	@# ⚠️ NEVER `--clobber`, AND NEVER RE-UPLOAD NEEDLESSLY. --clobber leaves a metadata record
+	@# whose backing blob is gone (API says state=uploaded, every download 404s BlobNotFound),
+	@# and even a clean delete+upload needs time to propagate — so re-uploading on every run
+	@# left the asset broken for minutes at a time. Upload only when the published bytes are
+	@# actually wrong.
 	@if $(GH) release view "v$(VERSION)" >/dev/null 2>&1; then \
-	  id=$$($(GH) api repos/$(REPO)/releases/tags/v$(VERSION) \
-	        --jq '.assets[]|select(.name=="claude-account-$(VERSION).tar.gz")|.id' 2>/dev/null); \
-	  [ -n "$$id" ] && $(GH) api -X DELETE repos/$(REPO)/releases/assets/$$id >/dev/null 2>&1 || true; \
-	  $(GH) release upload "v$(VERSION)" $(TARBALL); \
+	  want=$$(shasum -a 256 $(TARBALL) | awk '{print $$1}'); \
+	  got=$$(curl -sSLf --retry 3 --retry-delay 2 "$(ASSET_URL)" 2>/dev/null | shasum -a 256 | awk '{print $$1}'); \
+	  if [ "$$want" = "$$got" ]; then echo "  release asset already matches — not re-uploading"; \
+	  else \
+	    id=$$($(GH) api repos/$(REPO)/releases/tags/v$(VERSION) \
+	          --jq '.assets[]|select(.name=="claude-account-$(VERSION).tar.gz")|.id' 2>/dev/null); \
+	    [ -n "$$id" ] && $(GH) api -X DELETE repos/$(REPO)/releases/assets/$$id >/dev/null 2>&1 || true; \
+	    $(GH) release upload "v$(VERSION)" $(TARBALL); \
+	  fi; \
 	else \
 	  $(GH) release create "v$(VERSION)" $(TARBALL) --title "claude-account $(VERSION)" --generate-notes; \
 	fi
