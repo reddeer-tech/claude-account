@@ -147,8 +147,11 @@ clean: ; @rm -rf $(DIST)
 # ── HOMEBREW ─────────────────────────────────────────────────────────────────────────────────────
 # The formula points at a GitHub release tarball, so `make release` must tag and upload BEFORE
 # the formula is regenerated — otherwise the sha256 is of a file nobody else can download.
+# SHA256_OVERRIDE lets `release` pin the formula to the sha of the asset ACTUALLY PUBLISHED.
+# GitHub's CDN can keep serving a previous upload for a while, and tar embeds mtimes, so a
+# locally recomputed hash is not necessarily the hash users will download. Describe reality.
 brew-formula: $(TARBALL)
-	@sha=$$(shasum -a 256 $(TARBALL) | awk '{print $$1}'); \
+	@sha=$${SHA256_OVERRIDE:-$$(shasum -a 256 $(TARBALL) | awk '{print $$1}')}; \
 	sed -e 's|@@VERSION@@|$(VERSION)|g' -e "s|@@SHA256@@|$$sha|g" -e 's|@@REPO@@|$(REPO)|g' \
 	    Formula/claude-account.rb.in > Formula/claude-account.rb; \
 	echo "Formula/claude-account.rb -> $(VERSION) ($$sha)"
@@ -246,14 +249,17 @@ release: check version dist
 	@$(GH) release view "v$(VERSION)" >/dev/null 2>&1 \
 	  && $(GH) release upload "v$(VERSION)" $(TARBALL) --clobber \
 	  || $(GH) release create "v$(VERSION)" $(TARBALL) --title "claude-account $(VERSION)" --generate-notes
-	@echo "verifying the PUBLISHED bytes match the tarball the formula will describe..."
-	@want=$$(shasum -a 256 $(TARBALL) | awk '{print $$1}'); \
-	 got=$$(curl -sSL "$(ASSET_URL)" | shasum -a 256 | awk '{print $$1}'); \
-	 test "$$want" = "$$got" || { \
-	   echo "  ✗ SHA MISMATCH — the formula would fail for every user"; \
-	   echo "    local     $$want"; echo "    published $$got"; exit 1; }; \
-	 echo "  ✓ published asset matches ($$want)"
-	@$(MAKE) brew-publish
+	@echo "checking the published asset's CONTENTS against the local build..."
+	@rm -rf $(DIST)/_pub $(DIST)/_loc && mkdir -p $(DIST)/_pub $(DIST)/_loc
+	@curl -sSL "$(ASSET_URL)" | tar xz -C $(DIST)/_pub
+	@tar xzf $(TARBALL) -C $(DIST)/_loc
+	@diff -r $(DIST)/_pub $(DIST)/_loc >/dev/null || { \
+	  echo "  ✗ the published asset does NOT contain this build — re-upload it"; \
+	  diff -rq $(DIST)/_pub $(DIST)/_loc; exit 1; }
+	@rm -rf $(DIST)/_pub $(DIST)/_loc
+	@published=$$(curl -sSL "$(ASSET_URL)" | shasum -a 256 | awk '{print $$1}'); \
+	 echo "  ✓ contents match; pinning the formula to the published sha $$published"; \
+	 $(MAKE) --no-print-directory brew-publish SHA256_OVERRIDE=$$published
 	@$(MAKE) npm-publish
 	@echo "✓ released $(VERSION)"
 	@echo "    brew install $(TAPSHORT)/claude-account"
