@@ -4,6 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
+CA_VERSION="1.0.1"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -1036,6 +1037,7 @@ case "${1:-list}" in
   profiles|logins)   cmd_profiles ;;
   label)  shift; cmd_label "$@" ;;
   verify) cmd_verify ;;
+  --version|-V|version) echo "claude-account $CA_VERSION" ;;
   doctor) cmd_doctor ;;
   setup)  cmd_setup ;;
   rename) shift; cmd_rename "$@" ;;
@@ -1063,6 +1065,7 @@ INSPECT
                                        (alias: logins)
   claude-account verify                same data framed per path
   claude-account doctor                health check: plumbing, rules, logins, keychain
+  claude-account --version             print the installed version
   claude-account setup                 wire up PATH + VS Code after a package install
   claude-account refresh [name|--all]  renew expired access tokens (default: all)
   claude-account usage [name|path]     live quota: session, weekly, resets (omit = global)
