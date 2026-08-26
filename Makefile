@@ -125,19 +125,29 @@ version:
 	 fi
 	@echo "version -> $(VERSION)"
 
-dist: clean
+# ⚠️ A FILE TARGET, NOT A PHONY REBUILD. This used to be `dist: clean`, so every reference
+# rebuilt the tarball — and tar embeds mtimes, so each rebuild has a DIFFERENT sha256. During
+# a release that meant `dist` uploaded one tarball and `brew-formula` then hashed a freshly
+# rebuilt one, publishing a formula whose checksum did not match the asset users download.
+# Every `brew install` would have failed verification. Build once, reuse, and rebuild only
+# when a source file actually changes.
+SOURCES := $(shell find bin libexec templates -type f 2>/dev/null) README.md LICENSE VERSION
+
+$(TARBALL): $(SOURCES)
 	@mkdir -p $(DIST)
 	@tar --exclude='./dist' --exclude='./.git' --exclude='./node_modules' \
 	     -czf $(TARBALL) bin libexec templates README.md LICENSE VERSION
 	@echo "$(TARBALL)"
 	@shasum -a 256 $(TARBALL) | awk '{print "sha256: "$$1}'
 
+dist: $(TARBALL)
+
 clean: ; @rm -rf $(DIST)
 
 # ── HOMEBREW ─────────────────────────────────────────────────────────────────────────────────────
 # The formula points at a GitHub release tarball, so `make release` must tag and upload BEFORE
 # the formula is regenerated — otherwise the sha256 is of a file nobody else can download.
-brew-formula: dist
+brew-formula: $(TARBALL)
 	@sha=$$(shasum -a 256 $(TARBALL) | awk '{print $$1}'); \
 	sed -e 's|@@VERSION@@|$(VERSION)|g' -e "s|@@SHA256@@|$$sha|g" -e 's|@@REPO@@|$(REPO)|g' \
 	    Formula/claude-account.rb.in > Formula/claude-account.rb; \
@@ -160,7 +170,7 @@ brew-publish: brew-formula
 	  git -C $(TAPDIR) fetch --quiet origin; \
 	  git -C $(TAPDIR) rev-parse --verify --quiet origin/HEAD >/dev/null \
 	    && git -C $(TAPDIR) reset --quiet --hard origin/HEAD || true; \
-	else rm -rf $(TAPDIR) && git clone https://github.com/$(TAP).git $(TAPDIR); fi
+	else rm -rf $(TAPDIR) && git clone git@github.com:$(TAP).git $(TAPDIR); fi
 	@mkdir -p $(TAPDIR)/Formula
 	@cp Formula/claude-account.rb $(TAPDIR)/Formula/
 	@# `git push` alone fails on a brand-new EMPTY tap: the clone has an unborn branch with
@@ -236,10 +246,13 @@ release: check version dist
 	@$(GH) release view "v$(VERSION)" >/dev/null 2>&1 \
 	  && $(GH) release upload "v$(VERSION)" $(TARBALL) --clobber \
 	  || $(GH) release create "v$(VERSION)" $(TARBALL) --title "claude-account $(VERSION)" --generate-notes
-	@echo "verifying the asset is actually downloadable before pointing a formula at it..."
-	@code=$$(curl -sSL -o /dev/null -w '%{http_code}' "$(ASSET_URL)"); \
-	  test "$$code" = "200" || { echo "asset URL returned $$code, not 200 — stopping."; exit 1; }
-	@echo "  ✓ $(ASSET_URL) is live"
+	@echo "verifying the PUBLISHED bytes match the tarball the formula will describe..."
+	@want=$$(shasum -a 256 $(TARBALL) | awk '{print $$1}'); \
+	 got=$$(curl -sSL "$(ASSET_URL)" | shasum -a 256 | awk '{print $$1}'); \
+	 test "$$want" = "$$got" || { \
+	   echo "  ✗ SHA MISMATCH — the formula would fail for every user"; \
+	   echo "    local     $$want"; echo "    published $$got"; exit 1; }; \
+	 echo "  ✓ published asset matches ($$want)"
 	@$(MAKE) brew-publish
 	@$(MAKE) npm-publish
 	@echo "✓ released $(VERSION)"
