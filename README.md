@@ -38,14 +38,21 @@ git clone git@github.com:reddeer-tech/claude-account.git
 cd claude-account && ./install.sh
 ```
 
-### After installing
+### After installing — required
 
 ```sh
 claude-account setup
 ```
 
-Links the routing shims, checks that they win on your `PATH`, and prints the one line VS Code
-needs. Then `claude-account doctor` verifies the result.
+**This step is not optional.** Until it runs, typing `claude` still starts the real binary and
+no rule you add has any effect. It links the routing shims, checks they win on your `PATH`, and
+prints the one line VS Code needs — VS Code launches its binary by absolute path, so a `PATH`
+shim alone never reaches it.
+
+It only *reports* on `PATH` order and VS Code rather than changing them: both mean editing files
+you own — your shell profile, and a `settings.json` that is JSONC with comments.
+
+Then `claude-account doctor` verifies the result.
 
 ## Use
 

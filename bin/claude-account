@@ -824,6 +824,14 @@ cmd_list(){
   dim "  Shared everywhere: plugins, MCP servers, memory, settings, hooks, history."
 }
 
+# Is routing ACTUALLY live — does a `claude` typed in the user's LOGIN shell reach our shim?
+# Checking the shell this script happens to run in is a different question, and answering that
+# one instead is what produced a false all-clear in doctor once already.
+_routing_live(){
+  local first; first=$("$SHELL" -lc 'command -v claude' 2>/dev/null | tail -1)
+  [ -n "$first" ] && [ -r "$first" ] && grep -q 'claude-accounts' "$first" 2>/dev/null
+}
+
 cmd_add(){
   local path="${1:-}" name="${2:-}"
   [ -z "$path" ] && { red "usage: claude-account add <project-path> [profile-name]"; exit 2; }
@@ -872,6 +880,15 @@ cmd_add(){
   printf '%s\t%s\n' "$path" "$name" >> "$MAP"
   grn "Added: $path  ->  profile '$name'"
   echo
+  # A rule is inert until the shim is on PATH ahead of the real claude. Adding one without
+  # saying so lets you configure routing that silently never runs.
+  if ! _routing_live; then
+    yel "⚠  This rule will NOT take effect yet — the routing shim is not active."
+    echo "   Typing 'claude' still runs the real binary, so nothing is routed."
+    echo
+    echo "       claude-account setup      # links the shims and checks your PATH"
+    echo
+  fi
   if [ -e "$PROFILES/$name/.login-attempted" ]; then
     dim "Profile '$name' has already been signed in — nothing else to do."
     dim "Check it with:  claude-account verify"
