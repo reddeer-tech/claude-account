@@ -259,13 +259,13 @@ release: check version dist
 	fi
 	@echo "checking the published asset's CONTENTS against the local build..."
 	@rm -rf $(DIST)/_pub $(DIST)/_loc && mkdir -p $(DIST)/_pub $(DIST)/_loc
-	@curl -sSL --retry 8 --retry-delay 4 --retry-all-errors "$(ASSET_URL)" | tar xz -C $(DIST)/_pub
+	@curl -sSLf --retry 10 --retry-delay 5 --retry-all-errors "$(ASSET_URL)" | tar xz -C $(DIST)/_pub
 	@tar xzf $(TARBALL) -C $(DIST)/_loc
 	@diff -r $(DIST)/_pub $(DIST)/_loc >/dev/null || { \
 	  echo "  ✗ the published asset does NOT contain this build — re-upload it"; \
 	  diff -rq $(DIST)/_pub $(DIST)/_loc; exit 1; }
 	@rm -rf $(DIST)/_pub $(DIST)/_loc
-	@published=$$(curl -sSL --retry 8 --retry-delay 4 --retry-all-errors "$(ASSET_URL)" | shasum -a 256 | awk '{print $$1}'); \
+	@published=$$(curl -sSLf --retry 10 --retry-delay 5 --retry-all-errors "$(ASSET_URL)" | shasum -a 256 | awk '{print $$1}'); \
 	 echo "  ✓ contents match; pinning the formula to the published sha $$published"; \
 	 $(MAKE) --no-print-directory brew-publish SHA256_OVERRIDE=$$published
 	@$(MAKE) npm-publish
