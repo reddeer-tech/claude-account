@@ -246,18 +246,26 @@ release: check version dist
 	@$(MAKE) --no-print-directory preflight
 	@git tag -a "v$(VERSION)" -m "claude-account $(VERSION)" 2>/dev/null || echo "tag v$(VERSION) already exists"
 	@git push origin "v$(VERSION)"
-	@$(GH) release view "v$(VERSION)" >/dev/null 2>&1 \
-	  && $(GH) release upload "v$(VERSION)" $(TARBALL) --clobber \
-	  || $(GH) release create "v$(VERSION)" $(TARBALL) --title "claude-account $(VERSION)" --generate-notes
+	@# ⚠️ NEVER `--clobber` HERE. It leaves a metadata record whose backing blob is gone:
+	@# the API reports state=uploaded with the right size while every download returns 404
+	@# BlobNotFound. Delete the asset outright, then upload a fresh one.
+	@if $(GH) release view "v$(VERSION)" >/dev/null 2>&1; then \
+	  id=$$($(GH) api repos/$(REPO)/releases/tags/v$(VERSION) \
+	        --jq '.assets[]|select(.name=="claude-account-$(VERSION).tar.gz")|.id' 2>/dev/null); \
+	  [ -n "$$id" ] && $(GH) api -X DELETE repos/$(REPO)/releases/assets/$$id >/dev/null 2>&1 || true; \
+	  $(GH) release upload "v$(VERSION)" $(TARBALL); \
+	else \
+	  $(GH) release create "v$(VERSION)" $(TARBALL) --title "claude-account $(VERSION)" --generate-notes; \
+	fi
 	@echo "checking the published asset's CONTENTS against the local build..."
 	@rm -rf $(DIST)/_pub $(DIST)/_loc && mkdir -p $(DIST)/_pub $(DIST)/_loc
-	@curl -sSL "$(ASSET_URL)" | tar xz -C $(DIST)/_pub
+	@curl -sSL --retry 8 --retry-delay 4 --retry-all-errors "$(ASSET_URL)" | tar xz -C $(DIST)/_pub
 	@tar xzf $(TARBALL) -C $(DIST)/_loc
 	@diff -r $(DIST)/_pub $(DIST)/_loc >/dev/null || { \
 	  echo "  ✗ the published asset does NOT contain this build — re-upload it"; \
 	  diff -rq $(DIST)/_pub $(DIST)/_loc; exit 1; }
 	@rm -rf $(DIST)/_pub $(DIST)/_loc
-	@published=$$(curl -sSL "$(ASSET_URL)" | shasum -a 256 | awk '{print $$1}'); \
+	@published=$$(curl -sSL --retry 8 --retry-delay 4 --retry-all-errors "$(ASSET_URL)" | shasum -a 256 | awk '{print $$1}'); \
 	 echo "  ✓ contents match; pinning the formula to the published sha $$published"; \
 	 $(MAKE) --no-print-directory brew-publish SHA256_OVERRIDE=$$published
 	@$(MAKE) npm-publish
