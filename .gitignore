@@ -1,0 +1,8 @@
+dist/
+.DS_Store
+
+# never commit credentials — a publish token can push code to every machine
+# that installs this package
+.npmrc
+.env
+.env.*

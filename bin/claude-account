@@ -1,0 +1,1125 @@
+#!/bin/bash
+# Manage per-path Claude account routing.
+# Only the ACCOUNT is routed — plugins, MCP servers, memory, settings, hooks and
+# history always stay shared from ~/.claude.
+# Docs: https://github.com/reddeer-tech/claude-account
+set -uo pipefail
+MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
+PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
+# Locate resolve.sh: an explicit override, then next to this script (installed
+# layout: bin/../libexec), then the per-user config dir. Keeps a from-source run,
+# a Homebrew install and an npm install all working from one file.
+_ca_self="${BASH_SOURCE[0]:-$0}"
+_ca_dir="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)"
+for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
+          "$_ca_dir/../libexec/resolve.sh" \
+          "$_ca_dir/../lib/claude-account/resolve.sh" \
+          "$HOME/.config/claude-accounts/resolve.sh"; do
+  [ -n "$_c" ] && [ -f "$_c" ] && { RESOLVE="$_c"; break; }
+done
+RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
+# Where paths.map snapshots go before every mutation. This was hardcoded to the author's
+# lab folder, which would have created ~/workspace/_lab/... on every installed machine.
+# Keep an existing lab dir if it is already there, so nobody's history moves under them.
+if [ -n "${CLAUDE_ACCOUNTS_BACKUPS:-}" ]; then BK="$CLAUDE_ACCOUNTS_BACKUPS"
+elif [ -d "$HOME/workspace/_lab/Claude/backups" ]; then BK="$HOME/workspace/_lab/Claude/backups"
+else BK="$HOME/.config/claude-accounts/backups"; fi
+
+red(){ printf '\033[31m%s\033[0m\n' "$*"; }
+grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
+yel(){ printf '\033[33m%s\033[0m\n' "$*"; }
+dim(){ printf '\033[2m%s\033[0m\n' "$*"; }
+
+real_claude(){ local d self; self="$HOME/bin/claude"
+  IFS=: read -ra p <<< "$PATH"
+  for d in "${p[@]}" "$HOME/.local/bin"; do
+    [ -x "$d/claude" ] || continue
+    [ "$(cd "$d" && pwd)/claude" = "$self" ] && continue
+    printf '%s\n' "$(cd "$d" && pwd)/claude"; return 0
+  done; return 1; }
+
+
+# Real identity of whoever a profile dir authenticates as.
+# `claude auth status` is read-only, fast, and honours CLAUDE_SECURESTORAGE_CONFIG_DIR.
+# Parses the Keychain credential blob; prints only non-secret, per-profile fields.
+read -r -d "" ACCT_PY <<'ACCTPY' || true
+import json,sys,datetime
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("UNREADABLE"); raise SystemExit
+o = d.get("claudeAiOauth") or {}
+if not o:
+    print("NOT LOGGED IN"); raise SystemExit
+exp = o.get("expiresAt"); when = ""
+if exp:
+    t = datetime.datetime.fromtimestamp(exp/1000)
+    now = datetime.datetime.now()
+    mins = (t - now).total_seconds() / 60
+    if mins < 0:      when = " EXPIRED " + t.strftime("%m-%d %H:%M")
+    elif mins < 60:   when = " EXPIRES IN %dm " % int(mins) + t.strftime("%H:%M")
+    else:             when = " exp " + t.strftime("%m-%d %H:%M")
+plan = o.get("subscriptionType", "?"); tier = o.get("rateLimitTier", "?")
+print(plan + " | " + tier + when)
+ACCTPY
+
+acct_identity(){ # <profile-dir or "" for global>
+  # Report only what is genuinely PER-PROFILE. The OAuth token in the Keychain
+  # carries subscriptionType / rateLimitTier / expiry; email and org do NOT live
+  # there — they are cached in ~/.claude.json, which is SHARED because
+  # CLAUDE_CONFIG_DIR is deliberately shared. Reporting the email per profile was
+  # wrong: it always echoed whichever account was globally signed in.
+  local svc="Claude Code-credentials"
+  if [ -n "${1:-}" ]; then
+    svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
+  fi
+  local blob; blob=$(security find-generic-password -s "$svc" -w 2>/dev/null)
+  local out
+  if [ -z "$blob" ]; then out="NOT LOGGED IN"
+  else out=$(printf '%s' "$blob" | python3 -c "$ACCT_PY"); fi
+  if _use_colour; then
+    case "$out" in
+      "NOT LOGGED IN"|*EXPIRED*) printf '\033[31m%s\033[0m\n' "$out" ;;   # red
+      *"EXPIRES IN"*)            printf '\033[38;5;208m%s\033[0m\n' "$out" ;;  # orange
+      *)                         printf '%s\n' "$out" ;;
+    esac
+  else printf '%s\n' "$out"; fi
+}
+
+cmd_verify(){
+  echo "WHICH ACCOUNT EACH PATH ACTUALLY USES"; echo
+  printf '  %-46s %s\n' "PATH" "PLAN | RATE-LIMIT TIER (from the token)"
+  printf '  '; printf '─%.0s' $(seq 1 108); echo
+  local any=0
+  while IFS=$'\t' read -r prefix name state _r; do
+    case "$prefix" in ''|\#*) continue;; esac; [ -z "${name:-}" ] && continue
+    any=1
+    if [ "${state:-}" = "paused" ]; then
+      printf '  %-46s %s\n' "${prefix/#$HOME/~}" "PAUSED (global in use; login for '$name' kept)"; continue; fi
+    printf '  %-46s %s\n' "${prefix/#$HOME/~}" "$(acct_identity "$PROFILES/$name")"
+  done < "$MAP"
+  [ "$any" = 0 ] && dim "  (no path rules)"
+  printf '  %-46s %s\n' "everything else (global)" "$(acct_identity "")"
+  echo
+  dim "  Source: the per-profile OAuth token in the Keychain. Plan and rate-limit tier"
+  dim "  are the fields that genuinely differ per profile. Email/org are deliberately"
+  dim "  NOT shown: they live in the SHARED ~/.claude.json and echo the global account."
+}
+
+# Accept EITHER a project path or a profile name, and refuse anything else.
+# Without this, `claude-account login /some/path` silently created a nested junk
+# profile dir named after the whole path.
+to_profile(){ # <arg> -> profile name on stdout, or fails with a listing
+  local a="${1:-}"
+  [ -z "$a" ] && { red "missing argument" >&2; return 2; }
+  case "$a" in
+    /*|~*|./*|../*)
+      local pth; pth=$(norm "$a") || pth="${a%/}"
+      local n; n=$(awk -F'\t' -v p="$pth" '$1==p{print $2}' "$MAP" 2>/dev/null | head -1)
+      [ -z "$n" ] && n=$("$RESOLVE" "$pth" 2>/dev/null | cut -f1)
+      if [ -z "$n" ]; then
+        red "no Claude account rule covers: $pth" >&2
+        dim "  add one first:  claude-account add '$pth'" >&2; return 1; fi
+      printf '%s\n' "$n"; return 0 ;;
+  esac
+  a=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+  if ! printf '%s' "$a" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$'; then
+    red "not a valid profile name or path: $a" >&2; return 2; fi
+  if awk -F'\t' -v n="$a" '$2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null || [ -d "$PROFILES/$a" ]; then
+    printf '%s\n' "$a"; return 0; fi
+  red "unknown profile: $a" >&2
+  echo "known profiles:" >&2; { awk -F'\t' '$1!~/^#/&&NF>=2{print "  "$2}' "$MAP" 2>/dev/null; ls "$PROFILES" 2>/dev/null | sed 's/^/  /'; } | sort -u >&2
+  return 1
+}
+
+backup(){ mkdir -p "$BK"; cp "$MAP" "$BK/paths.map.$(date +%Y%m%d-%H%M%S)${1:+-$1}" 2>/dev/null; }
+
+norm(){ local p="$1"; case "$p" in "~"*) p="$HOME${p#\~}";; esac
+  p="${p%/}"; case "$p" in /*) ;; *) p="$(cd "$p" 2>/dev/null && pwd)" || return 1;; esac
+  printf '%s\n' "$p"; }
+
+# pause/resume: keep the rule AND the login, but stop routing so the path falls
+# back to the global account. Nothing is deleted, so resume needs no re-auth.
+set_state(){ # <path> <state|"">
+  local tmp; tmp=$(mktemp)
+  awk -F'\t' -v OFS='\t' -v t="$1" -v st="$2" '
+    /^[ \t]*#/ || NF==0 { print; next }
+    $1==t { if (st=="") print $1,$2; else print $1,$2,st; next }
+    { print }' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
+}
+
+# Every path a path-or-name argument refers to, one per line.
+paths_for(){ # <path|name>
+  local a="${1:-}"
+  case "$a" in
+    /*|~*|./*|../*) local p; p=$(norm "$a") || p="${a%/}"
+      awk -F'\t' -v t="$p" '$1==t{print $1}' "$MAP" 2>/dev/null ;;
+    *) local n; n=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+      awk -F'\t' -v n="$n" '$2==n{print $1}' "$MAP" 2>/dev/null ;;
+  esac
+}
+
+cmd_pause(){
+  [ -z "${1:-}" ] && { red "usage: claude-account pause <path|profile-name>"; exit 2; }
+  local hits; hits=$(paths_for "$1")
+  [ -z "$hits" ] && { red "no rule matches: $1"; dim "  see:  claude-account list"; exit 1; }
+  backup "pause"
+  local n=0
+  while IFS= read -r pth; do [ -z "$pth" ] && continue
+    set_state "$pth" paused; n=$((n+1)); echo "  paused   $pth"; done <<< "$hits"
+  grn "Paused $n path(s) — they now use your GLOBAL account."
+  dim "Profile and login untouched. Re-enable with:  claude-account resume $1"
+}
+
+cmd_resume(){
+  [ -z "${1:-}" ] && { red "usage: claude-account resume <path|profile-name>"; exit 2; }
+  local hits; hits=$(paths_for "$1")
+  [ -z "$hits" ] && { red "no rule matches: $1"; exit 1; }
+  backup "resume"
+  local n=0
+  while IFS= read -r pth; do [ -z "$pth" ] && continue
+    set_state "$pth" ""; n=$((n+1)); echo "  resumed  $pth"; done <<< "$hits"
+  grn "Resumed $n path(s) — routing active again, no re-authentication needed."
+  # Cheap local check (no request): surface a dead token now rather than mid-task.
+  local nm2; nm2=$(awk -F'\t' -v t="$(printf '%s' "$hits" | head -1)" '$1==t{print $2}' "$MAP" 2>/dev/null | head -1)
+  if [ -n "$nm2" ]; then
+    local id2; id2=$(acct_identity "$PROFILES/$nm2")
+    case "$id2" in
+      *"NOT LOGGED IN"*) yel "  '$nm2' is not signed in — those paths will use your GLOBAL account."
+                         dim "    claude-account login $nm2" ;;
+      *EXPIRED*)         yel "  '$nm2' has an expired access token — it will renew itself on first use."
+                         dim "    or renew it now:  claude-account refresh $nm2" ;;
+    esac
+  fi
+}
+
+# The OAuth token has no identity in it, but Claude Code caches the account of the
+# MOST RECENT login in the shared ~/.claude.json. So capture it right after a login
+# and label the profile. Recorded-at-login, not live — labelled as such everywhere.
+capture_label(){ # <profile-dir>
+  local out; out=$(python3 - <<'CAPPY'
+import json,os
+try:
+    d=json.load(open(os.path.expanduser("~/.claude.json")))
+    a=d.get("oauthAccount") or {}
+    e=a.get("emailAddress"); o=a.get("organizationName")
+    print(f"{e} ({o})" if e and o else (e or ""))
+except Exception:
+    print("")
+CAPPY
+)
+  [ -n "$out" ] && printf '%s\n' "$out" > "$1/.account"
+}
+
+profile_label(){ # <profile-dir> -> recorded email, or empty
+  [ -f "$1/.account" ] && head -1 "$1/.account"
+}
+
+cmd_label(){
+  [ -z "${1:-}" ] && { red "usage: claude-account label <profile|path|global> [email]  (omit email to clear)"; exit 2; }
+  if [ "$1" = "global" ]; then
+    mkdir -p "$PROFILES"
+    if [ -z "${2:-}" ]; then rm -f "$PROFILES/.global-account"; grn "Cleared the recorded global account."
+    else shift; printf '%s\n' "$*" > "$PROFILES/.global-account"; grn "Recorded the global account as: $*"; fi
+    dim "This is a label you set — it is not verified against the stored token."
+    return 0
+  fi
+  local name; name=$(to_profile "$1") || exit $?
+  local pdir="$PROFILES/$name"; mkdir -p "$pdir"
+  if [ "${2:-}" = "--auto" ]; then
+    # Repair path after an in-session /login: ~/.claude.json holds the account of
+    # the MOST RECENT sign-in, whichever profile it was for. Only meaningful
+    # immediately after that login — it is not proof of what the token holds.
+    capture_label "$pdir"
+    local got; got=$(profile_label "$pdir")
+    if [ -n "$got" ]; then grn "Recorded '$name' as: $got"
+      dim "Taken from the most recent sign-in cached in ~/.claude.json — check it is right."
+    else red "Nothing cached in ~/.claude.json to read."; exit 1; fi
+  elif [ -z "${2:-}" ]; then rm -f "$pdir/.account"; grn "Cleared the recorded account for '$name'."
+  else shift; printf '%s\n' "$*" > "$pdir/.account"; grn "Recorded '$name' as: $*"; fi
+  dim "This is a label you set — it is not verified against the stored token."
+}
+
+# Colour helpers. Padding must happen BEFORE colouring: printf's %-Ns counts the
+# escape bytes, so a coloured string silently breaks column alignment.
+# Honour NO_COLOR and skip colour when stdout is not a terminal.
+# Decide ONCE, at startup, while stdout is still the terminal. status_cell runs
+# inside $( ) where stdout is a pipe, so testing [ -t 1 ] there is always false —
+# which silently disabled colour everywhere.
+if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then CA_COLOUR=1; else CA_COLOUR=0; fi
+_use_colour(){ [ "$CA_COLOUR" = 1 ]; }
+status_cell(){ # <state> <width>
+  local st txt pad
+  if [ "${1:-}" = "paused" ]; then txt="PAUSED"; else txt="ACTIVE"; fi
+  printf -v pad '%-*s' "${2:-7}" "$txt"
+  if _use_colour; then
+    if [ "$txt" = "PAUSED" ]; then printf '\033[38;5;208m%s\033[0m' "$pad"   # orange
+    else printf '\033[32m%s\033[0m' "$pad"; fi                               # green
+  else printf '%s' "$pad"; fi
+}
+
+# Usage for one credential store. Calls Anthropic's own /api/oauth/usage with that
+# profile's access token — the same endpoint the in-session /usage command reads.
+# Read-only; the token goes only to the service that issued it.
+read -r -d "" USAGE_PY <<'USAGEPY' || true
+import json,sys,datetime,os
+
+COLOUR = os.environ.get("CA_COLOUR") == "1"
+# Five bands rather than three: the interesting range is the top quarter, where
+# "nearly out" and "out" need to look different at a glance.
+def band(p):
+    if p >= 100: return "\033[1;31m"      # bold red    — exhausted
+    if p >=  90: return "\033[31m"        # red         — about to run out
+    if p >=  75: return "\033[38;5;208m"  # orange      — plan ahead
+    if p >=  50: return "\033[33m"        # yellow      — half gone
+    return "\033[32m"                     # green       — comfortable
+def paint(t, p):
+    return band(p) + t + "\033[0m" if COLOUR else t
+
+try: d=json.load(sys.stdin)
+except Exception: print("  could not parse the usage response"); raise SystemExit
+
+def when(ts):
+    if not ts: return ""
+    try:
+        t=datetime.datetime.fromisoformat(ts.replace("Z","+00:00")).astimezone()
+        s=(t-datetime.datetime.now(t.tzinfo)).total_seconds()
+        h,m=int(s//3600),int((s%3600)//60)
+        rel=f"in {h}h {m}m" if h>0 else (f"in {m}m" if m>0 else "now")
+        return f"resets {t.strftime('%a %H:%M')} ({rel})"
+    except Exception: return f"resets {ts}"
+
+def bar(p):
+    filled=int(round((p or 0)/5))
+    return paint("█"*filled, p) + "\033[2m" * COLOUR + "░"*(20-filled) + "\033[0m" * COLOUR
+
+rows=[]
+for L in (d.get("limits") or []):
+    kind=L.get("kind",""); pct=L.get("percent")
+    if pct is None: continue
+    sc=(L.get("scope") or {}).get("model") or {}
+    label=sc.get("display_name") or ""
+    name={"session":"Session (5h)","weekly_all":"Weekly (all models)",
+          "weekly_scoped":f"Weekly ({label})" if label else "Weekly (scoped)"}.get(kind, kind)
+    rows.append((name,float(pct),when(L.get("resets_at")),L.get("severity","")))
+
+if not rows:
+    NICE={"five_hour":"Session (5h)","seven_day":"Weekly","seven_day_opus":"Weekly (Opus)"}
+    for k,v in d.items():
+        if isinstance(v,dict) and v.get("utilization") is not None:
+            rows.append((NICE.get(k,k),float(v["utilization"]),when(v.get("resets_at")),""))
+
+if not rows: print("  no usage buckets reported for this account")
+for name,pct,w,sev in rows:
+    flag=" ⚠" if sev=="critical" else ""
+    print(f"  {name:<22} {paint(f'{pct:5.1f}%', pct)}  [{bar(pct)}]  {w}{flag}")
+
+ex=d.get("extra_usage") or {}
+if ex.get("is_enabled"):
+    u=float(ex.get("utilization") or 0)
+    print(f"  {'extra usage':<22} {paint(f'{u:5.1f}%', u)}  [{bar(u)}]  used {ex.get('used_credits')}/{ex.get('monthly_limit')}")
+USAGEPY
+
+# Never replace paths.map with something implausible. Two incidents on 2026-08-25
+# (a truncate-before-read, and an invalid heredoc producing an empty file) each
+# wiped every rule. Any rewrite goes through here.
+write_map(){ # <tmpfile> <min-rules-expected>
+  local n; n=$(grep -v '^#' "$1" 2>/dev/null | grep -c . || true); n=${n:-0}
+  if [ "$n" -lt "${2:-0}" ]; then
+    red "refusing to write paths.map: result has $n rule(s), expected at least ${2:-0}" >&2
+    dim "  the map was left untouched; nothing was lost" >&2
+    rm -f "$1"; return 1
+  fi
+  mv "$1" "$MAP"
+}
+
+cmd_rename(){
+  [ -z "${1:-}" ] || [ -z "${2:-}" ] && { red "usage: claude-account rename <old> <new>"; exit 2; }
+  local old; old=$(to_profile "$1") || exit $?
+  local new; new=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+  printf '%s' "$new" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$' || { red "invalid profile name: $2"; exit 2; }
+  [ "$old" = "$new" ] && { yel "Already called '$new'."; exit 0; }
+  [ -e "$PROFILES/$new" ] && { red "profile '$new' already exists"; exit 1; }
+  backup "rename-$old-to-$new"
+
+  local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
+  local tmp; tmp=$(mktemp)
+  python3 - "$MAP" "$old" "$new" "$tmp" <<'RNPY'
+import sys
+m,old,new,tmp=sys.argv[1:5]
+lines=open(m).readlines()                      # READ FIRST
+out=[]
+for l in lines:
+    f=l.rstrip("\n").split("\t")
+    if len(f)>=2 and f[1]==old:
+        f[1]=new; out.append("\t".join(f)+"\n")
+    else: out.append(l)
+open(tmp,"w").writelines(out)
+RNPY
+  write_map "$tmp" "$before" || exit 1
+  mv "$PROFILES/$old" "$PROFILES/$new"
+
+  # The Keychain entry is keyed by sha256(profile_dir), so renaming the directory
+  # orphans it. Copy the secret across, then delete the old entry.
+  local osvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$old" | shasum -a 256 | cut -c1-8)"
+  local nsvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$new" | shasum -a 256 | cut -c1-8)"
+  local secret; secret=$(security find-generic-password -s "$osvc" -w 2>/dev/null)
+  if [ -n "$secret" ]; then
+    if security add-generic-password -s "$nsvc" -a "$USER" -w "$secret" -U >/dev/null 2>&1; then
+      security delete-generic-password -s "$osvc" >/dev/null 2>&1
+      dim "Moved its stored login to the new name."
+    else
+      yel "Could not copy the credential — sign in again:  claude-account login $new"
+    fi
+  fi
+  grn "Renamed profile '$old' -> '$new'."
+}
+
+cmd_export(){
+  # Rules + labels only. Credentials are NEVER exported — they are OS-keychain
+  # secrets and are re-created by signing in on the new machine.
+  echo "# claude-account export"
+  echo "# generated $(date '+%Y-%m-%d %H:%M:%S')  host $(hostname -s)"
+  echo "# restore with:  claude-account import <file>"
+  echo "# NOTE: logins are NOT included — run 'claude-account login <name>' for each."
+  while IFS=$'\t' read -r pth nm st _r; do
+    case "$pth" in ''|\#*) continue;; esac; [ -z "${nm:-}" ] && continue
+    printf 'rule\t%s\t%s\t%s\n' "$pth" "$nm" "${st:-active}"
+  done < "$MAP"
+  for d in "$PROFILES"/*/; do
+    [ -d "$d" ] || continue
+    local nm lbl; nm=$(basename "$d"); lbl=$(profile_label "${d%/}")
+    [ -n "$lbl" ] && printf 'label\t%s\t%s\n' "$nm" "$lbl"
+  done
+}
+
+cmd_import(){
+  local f="${1:-}"
+  [ -z "$f" ] && { red "usage: claude-account import <file>"; exit 2; }
+  [ -f "$f" ] || { red "no such file: $f"; exit 2; }
+  backup "import"
+  local rules=0 labels=0 skipped=0
+  while IFS=$'\t' read -r kind a b c; do
+    case "$kind" in
+      rule)
+        if awk -F'\t' -v p="$a" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
+          skipped=$((skipped+1)); continue; fi
+        mkdir -p "$PROFILES/$b"
+        if [ "${c:-active}" = "paused" ]; then printf '%s\t%s\tpaused\n' "$a" "$b" >> "$MAP"
+        else printf '%s\t%s\n' "$a" "$b" >> "$MAP"; fi
+        rules=$((rules+1)) ;;
+      label) mkdir -p "$PROFILES/$a"; printf '%s\n' "$b" > "$PROFILES/$a/.account"; labels=$((labels+1)) ;;
+    esac
+  done < "$f"
+  grn "Imported $rules rule(s) and $labels label(s)."
+  [ "$skipped" -gt 0 ] && dim "Skipped $skipped path(s) that already had a rule."
+  dim "Credentials are not importable — sign in on this machine:"
+  claude-account profiles 2>/dev/null | awk '/NOT LOGGED IN/{print "    claude-account login "$1}'
+}
+
+cmd_setup(){
+  # Opt-in wiring. A package install deliberately does NOT do this: linking `claude` ahead of the
+  # real binary hijacks it for every caller, and npm/brew must never do that behind your back.
+  #
+  # TWO different directories, and conflating them is the bug this comment exists to prevent:
+  #   srcdir  where the shims SHIP  — inside the Cellar / node_modules, never on PATH
+  #   bindir  where they must LAND  — a dir you own and control the PATH order of
+  # Resolving the symlink gives the first; it must not be used as the second.
+  local self srcdir bindir
+  self="${BASH_SOURCE[0]:-$0}"
+  while [ -L "$self" ]; do
+    local t; t="$(readlink "$self")"
+    case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac
+  done
+  srcdir="$(cd "$(dirname "$self")" && pwd)"
+  bindir="${BINDIR:-$HOME/bin}"
+
+  mkdir -p "$bindir"
+  if [ ! -f "$srcdir/claude-shim" ]; then
+    # A source install deploys the shim under its FINAL name, so there is no claude-shim to
+    # copy — that is a finished install, not a broken one. Only complain if neither exists.
+    if grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null; then
+      dim "Shims already deployed in $bindir — nothing to link."
+    else
+      red "cannot find claude-shim next to $srcdir, and $bindir/claude is not ours." >&2
+      red "run ./install.sh from a source checkout, or reinstall the package." >&2
+      return 1
+    fi
+  elif [ "$srcdir" = "$bindir" ]; then
+    dim "Shims already in place ($bindir) — nothing to link."
+  else
+    install -m 0755 "$srcdir/claude-shim"           "$bindir/claude"
+    install -m 0755 "$srcdir/claude-vscode-wrapper" "$bindir/claude-vscode-wrapper"
+    grn "Linked the routing shims into $bindir."
+  fi
+
+  local first; first=$("$SHELL" -lc 'command -v claude' 2>/dev/null | tail -1)
+  if [ "$first" = "$bindir/claude" ]; then
+    grn "PATH ok — the shim wins in your login shell."
+  else
+    yel "PATH: your login shell resolves claude to '${first:-<not found>}', not $bindir/claude."
+    echo "      add this to your shell profile, then open a new terminal:"
+    echo "        export PATH=\"$bindir:\$PATH\""
+  fi
+
+  local vs="$HOME/Library/Application Support/Code/User/settings.json"
+  if [ ! -f "$vs" ]; then
+    dim "VS Code not found — skipping its wrapper."
+  elif grep -q 'claudeCode.claudeProcessWrapper' "$vs"; then
+    grn "VS Code wrapper already configured."
+  else
+    # WHY not edit it for them: it is JSONC with comments, and a rewrite risks their settings.
+    yel "VS Code: add this line to $vs, then restart VS Code once:"
+    echo "        \"claudeCode.claudeProcessWrapper\": \"$bindir/claude-vscode-wrapper\","
+  fi
+  echo; dim "then:  claude-account doctor"
+}
+
+cmd_doctor(){
+  local prob=0 warn=0
+  bad(){ red "  ✗ $*"; prob=$((prob+1)); }
+  wrn(){ yel "  ! $*"; warn=$((warn+1)); }
+  ok_(){ grn "  ✓ $*"; }
+  echo "CLAUDE ACCOUNT DOCTOR"; echo
+
+  echo "routing plumbing"
+  [ -x "$HOME/bin/claude" ] && ok_ "terminal shim present" || bad "missing shim ~/bin/claude"
+  # Check the shell the USER actually gets (login shell), not whatever PATH this
+  # process happens to have inherited — a tool-spawned shell may lack ~/bin and
+  # would report a false failure.
+  local login_first; login_first=$("$SHELL" -lc 'command -v claude' 2>/dev/null | tail -1)
+  local here_first;  here_first=$(bash -c 'command -v claude' 2>/dev/null)
+  if [ "$login_first" = "$HOME/bin/claude" ]; then ok_ "shim wins PATH in your login shell"
+  elif [ -n "$login_first" ]; then bad "login shell resolves claude to '$login_first', not the shim — terminal routing is bypassed"
+  else bad "claude not found on your login shell's PATH"; fi
+  if [ "$here_first" != "$HOME/bin/claude" ]; then
+    wrn "this shell resolves claude to '${here_first:-<not found>}' — fine for a tool-spawned shell, but scripts run from here are unrouted"
+  fi
+  [ -x "$HOME/bin/claude-vscode-wrapper" ] && ok_ "VS Code wrapper present" || bad "missing VS Code wrapper"
+  grep -q 'claudeProcessWrapper' "$HOME/Library/Application Support/Code/User/settings.json" 2>/dev/null \
+    && ok_ "VS Code setting points at the wrapper" || bad "claudeCode.claudeProcessWrapper not set — VS Code is unrouted"
+  local cc; cc=$(grep -c 'CLAUDE_CONFIG_DIR' "$HOME/bin/claude" "$HOME/bin/claude-vscode-wrapper" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+  [ "$cc" = 0 ] && ok_ "CLAUDE_CONFIG_DIR never set (config stays shared)" || bad "CLAUDE_CONFIG_DIR is set somewhere — profiles would lose plugins/MCP/memory"
+  [ -x "$RESOLVE" ] && ok_ "resolver present" || bad "missing $RESOLVE"
+
+  echo; echo "rules"
+  local nrules; nrules=$(grep -v '^#' "$MAP" 2>/dev/null | grep -c . || true)
+  ok_ "$nrules rule(s) in paths.map"
+  while IFS=$'\t' read -r pth nm st _r; do
+    case "$pth" in ''|\#*) continue;; esac; [ -z "${nm:-}" ] && continue
+    [ -d "$pth" ] || wrn "path no longer exists on disk: ${pth/#$HOME/~}"
+    [ -d "$PROFILES/$nm" ] || wrn "rule points at a profile with no directory: $nm"
+  done < "$MAP"
+
+  echo; echo "profiles"
+  for d in "$PROFILES"/*/; do
+    [ -d "$d" ] || continue
+    local nm; nm=$(basename "$d")
+    local svc="Claude Code-credentials-$(printf '%s' "${d%/}" | shasum -a 256 | cut -c1-8)"
+    local used; used=$(awk -F'\t' -v n="$nm" '$2==n{c++} END{print c+0}' "$MAP" 2>/dev/null)
+    local id; id=$(acct_identity "${d%/}")
+    if [ "$id" = "NOT LOGGED IN" ]; then
+      if [ "$used" -gt 0 ]; then wrn "$nm: $used rule(s) but NOT signed in — those paths use global + warn"
+      else wrn "$nm: no login and no rules (orphan) — claude-account forget $nm"; fi
+    else
+      case "$id" in
+        *EXPIRED*)    wrn "$nm: access token EXPIRED — claude-account refresh $nm  (a paused profile is never used, so it drifts)";;
+        *"EXPIRES IN"*) wrn "$nm: credential expires within the hour — claude-account login $nm";;
+        *) [ "$used" -gt 0 ] && ok_ "$nm: signed in, $used rule(s)" || wrn "$nm: signed in but no rule uses it (orphan)";; esac
+    fi
+  done
+
+  echo; echo "keychain"
+  local known="" stray=0
+  for d in "$PROFILES"/*/; do [ -d "$d" ] || continue
+    known="$known Claude Code-credentials-$(printf '%s' "${d%/}" | shasum -a 256 | cut -c1-8)"; done
+  while read -r svc; do
+    [ -z "$svc" ] && continue
+    [ "$svc" = "Claude Code-credentials" ] && continue
+    case " $known " in *" $svc "*) ;; *) wrn "unreachable credential: $svc (no profile hashes to it)"; stray=$((stray+1));; esac
+  done < <(security dump-keychain 2>/dev/null | grep -o '"Claude Code-credentials[^"]*"' | tr -d '"' | sort -u)
+  [ "$stray" = 0 ] && ok_ "no unreachable credentials"
+
+  echo
+  [ "$prob" = 0 ] && [ "$warn" = 0 ] && grn "all good" \
+    || echo "$( [ "$prob" -gt 0 ] && printf '%s problem(s) ' "$prob"; [ "$warn" -gt 0 ] && printf '%s warning(s)' "$warn")"
+  [ "$prob" -gt 0 ] && return 1 || return 0
+}
+
+cmd_switch(){
+  [ -z "${1:-}" ] || [ -z "${2:-}" ] && { red "usage: claude-account switch <path|profile> <target-profile|global>"; exit 2; }
+  # "switch X global" means "stop routing these paths" — which is exactly pause:
+  # the rule and the login are kept, and the paths fall back to the global account.
+  if [ "$2" = "global" ]; then
+    cmd_pause "$1"
+    dim "  (that is a pause — rule and login kept. Route it again with:  claude-account switch $1 <profile>)"
+    return 0
+  fi
+  local target; target=$(to_profile "$2") || exit $?
+  local hits; hits=$(paths_for "$1")
+  if [ -z "$hits" ]; then red "no rule matches: $1"; dim "  see:  claude-account list"; exit 1; fi
+  local from; from=$(awk -F'\t' -v t="$(printf '%s' "$hits" | head -1)" '$1==t{print $2}' "$MAP" 2>/dev/null | head -1)
+  if [ "$from" = "$target" ]; then
+    # Same profile: a no-op UNLESS the rows are paused, in which case the intent is
+    # plainly "use this profile again" — so resume rather than silently doing nothing.
+    if awk -F'\t' -v n="$target" '$2==n && $3=="paused"{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
+      cmd_resume "$1"; return 0
+    fi
+    yel "Those paths already use '$target' — nothing to do."; exit 0
+  fi
+  backup "switch-$from-to-$target"
+
+  local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
+  local tmp; tmp=$(mktemp)
+  # Paths come in as ARGV, not stdin: the heredoc already owns stdin, and using
+  # both silently fed the path list to python as its program.
+  # Repointing also clears any paused state — switching means "use this account now".
+  python3 - "$MAP" "$target" "$tmp" $hits <<'SWPY'
+import sys
+m,target,tmp=sys.argv[1],sys.argv[2],sys.argv[3]
+paths=set(sys.argv[4:])
+lines=open(m).readlines()                      # READ FIRST — open(...,"w") truncates
+out=[]
+for l in lines:
+    f=l.rstrip("\n").split("\t")
+    out.append(f"{f[0]}\t{target}\n" if len(f)>=2 and f[0] in paths else l)
+open(tmp,"w").writelines(out)
+SWPY
+  write_map "$tmp" "$before" || exit 1
+
+  local n; n=$(printf '%s' "$hits" | grep -c .)
+  grn "Switched $n path(s) from '$from' to '$target' (and un-paused them):"
+  printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
+  local svc="Claude Code-credentials-$(printf '%s' "$PROFILES/$target" | shasum -a 256 | cut -c1-8)"
+  if ! security find-generic-password -s "$svc" >/dev/null 2>&1; then
+    yel "  '$target' is not signed in — those paths will use your GLOBAL account and warn."
+    dim  "  claude-account login $target"
+  fi
+  dim "  '$from' keeps its login; switch back with:  claude-account switch $1 $from"
+}
+
+cmd_logout(){
+  # "logout global" reads the same way as every other verb-first command;
+  # "global logout" still works. Keep both.
+  if [ "${1:-}" = "global" ]; then cmd_global logout; return $?; fi
+  [ -z "${1:-}" ] && { red "usage: claude-account logout <name|path> [--keep-active]"; exit 2; }
+  local name; name=$(to_profile "$1") || exit $?
+  local pdir="$PROFILES/$name" keep=0
+  shift; [ "${1:-}" = "--keep-active" ] && keep=1
+  local svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
+  if ! security find-generic-password -s "$svc" >/dev/null 2>&1; then
+    yel "Profile '$name' is not signed in — nothing to log out."; exit 0; fi
+
+  local rc; rc=$(real_claude) || { red "real claude not found"; exit 127; }
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
+      CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir" "$rc" auth logout >/dev/null 2>&1
+  security delete-generic-password -s "$svc" >/dev/null 2>&1   # belt and braces
+  rm -f "$pdir/.login-attempted"
+  grn "Signed out of profile '$name'. The path rules and the label are kept."
+
+  # A routed path with no credential FAILS ("Not logged in") — it does not fall
+  # back. So pause its paths, which is what "use the global account for now"
+  # actually means. --keep-active opts out and leaves them broken on purpose.
+  local hits; hits=$(paths_for "$name")
+  if [ -n "$hits" ]; then
+    if [ "$keep" = 1 ]; then
+      yel "  --keep-active: these paths stay routed to a profile with no login, so they"
+      yel "  will fail with 'Not logged in' until you sign in again:"
+      printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
+    else
+      while IFS= read -r pth; do [ -z "$pth" ] && continue; set_state "$pth" paused; done <<< "$hits"
+      echo "  paused its paths so they use your GLOBAL account instead of failing:"
+      printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
+    fi
+  fi
+  echo
+  dim "  sign in again : claude-account login $name   (then: claude-account resume $name)"
+  dim "  drop the paths: claude-account remove <path>     (or: remove $name)"
+  dim "  delete it all : claude-account forget $name"
+}
+
+# Renew a profile's access token if it has expired. Claude refreshes via the stored
+# refreshToken, but only when it actually makes a request — so a PAUSED profile,
+# never used, drifts into expiry. One throwaway request does it; auth happens before
+# rate limiting, so this works even on an account that is out of quota (verified).
+# We deliberately do NOT call the OAuth token endpoint ourselves: it is undocumented,
+# the client_id is hardcoded, and refresh tokens rotate — a botched write would
+# invalidate the credential and force a real re-login. Letting Claude do it cannot
+# corrupt anything.
+refresh_token_if_needed(){ # <profile-dir or "" for global> ; 0=ok 1=still bad 2=not needed
+  local pdir="${1:-}" svc="Claude Code-credentials"
+  [ -n "$pdir" ] && svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
+  local blob; blob=$(security find-generic-password -s "$svc" -w 2>/dev/null)
+  [ -z "$blob" ] && return 3                      # no credential at all
+  local exp rexp
+  exp=$(printf '%s' "$blob"  | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('expiresAt',0))" 2>/dev/null)
+  rexp=$(printf '%s' "$blob" | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('refreshTokenExpiresAt',0) or 0)" 2>/dev/null)
+  [ -z "$exp" ] || [ "$exp" = 0 ] && return 1
+  local now0; now0=$(python3 -c 'import time;print(int(time.time()*1000))')
+  # If the REFRESH token itself has expired, no amount of refreshing helps.
+  [ -n "$rexp" ] && [ "$rexp" != 0 ] && [ "$rexp" -lt "$now0" ] && return 4
+  local now; now=$(python3 -c 'import time;print(int(time.time()*1000))')
+  [ "$exp" -gt "$now" ] && return 2      # still valid
+  local rc2; rc2=$(real_claude) || return 1
+  ( cd / && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+      ${pdir:+CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"} "$rc2" -p "hi" >/dev/null 2>&1 ) || true
+  local exp2; exp2=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+      | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('expiresAt',0))" 2>/dev/null)
+  [ -n "$exp2" ] && [ "$exp2" -gt "$now" ] && return 0 || return 1
+}
+
+cmd_refresh(){
+  local targets=""
+  case "${1:-}" in
+    ""|--all) targets="global $(ls "$PROFILES" 2>/dev/null)" ;;
+    global)   targets="global" ;;
+    *)        targets=$(to_profile "$1") || exit $? ;;
+  esac
+  local did=0
+  for t in $targets; do
+    local pdir=""; [ "$t" != "global" ] && pdir="$PROFILES/$t"
+    refresh_token_if_needed "$pdir"
+    case $? in
+      0) grn "  $t: refreshed"; did=1 ;;
+      2) dim "  $t: still valid" ;;
+      3) yel "  $t: no credential stored — claude-account login $t"; did=1 ;;
+      4) red "  $t: the REFRESH token has expired too — you must sign in again:"
+         echo  "        claude-account login $t"; did=1 ;;
+      *) red "  $t: could not refresh — sign in again:"
+         echo  "        claude-account login $t"; did=1 ;;
+    esac
+  done
+  [ "$did" = 0 ] && dim "  nothing needed refreshing."
+}
+
+cmd_usage(){
+  # --all: every profile plus global, refreshing any expired token on the way.
+  if [ "${1:-}" = "--all" ] || [ "${1:-}" = "-a" ]; then
+    local first=1
+    for t in global $(ls "$PROFILES" 2>/dev/null); do
+      [ "$first" = 1 ] || echo
+      first=0
+      cmd_usage "$t" || true
+    done
+    return 0
+  fi
+  local name pdir label
+  if [ -z "${1:-}" ] || [ "$1" = "global" ]; then
+    name="(global)"; pdir=""
+  else
+    name=$(to_profile "$1") || exit $?
+    pdir="$PROFILES/$name"; label=$(profile_label "$pdir")
+  fi
+  local svc="Claude Code-credentials"
+  [ -n "$pdir" ] && svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
+  local tok; tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+      | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
+  if [ -z "$tok" ]; then red "No login for '$name'."; dim "  claude-account login $name"; exit 1; fi
+  echo "USAGE — $name${label:+  ($label)}"
+  echo
+  local body; body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
+      -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+
+  # An expired access token returns 401 authentication_error. Claude only refreshes
+  # it when it actually makes a request, so a PAUSED profile — never used — drifts
+  # into expiry and this endpoint stops answering.
+  if printf '%s' "$body" | grep -q 'authentication_error\|token has expired'; then
+    dim "  access token expired — refreshing…"
+    if refresh_token_if_needed "$pdir"; then
+      tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+            | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
+      body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
+             -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+    fi
+    printf '%s' "$body" | grep -q 'authentication_error' && { red "  could not refresh — sign in again:  claude-account login $name"; exit 1; }
+  fi
+  if [ -z "$body" ] || ! printf '%s' "$body" | head -c1 | grep -q '{'; then
+    red "  could not reach the usage endpoint"; dim "  ${body:0:120}"; exit 1; fi
+  printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" python3 -c "$USAGE_PY"
+  echo
+  dim "  Live from api.anthropic.com/api/oauth/usage — the same source as /usage in-session."
+}
+
+cmd_global(){
+  local rc; rc=$(real_claude) || { red "real claude not found"; exit 127; }
+  case "${1:-status}" in
+    status) env -u CLAUDE_SECURESTORAGE_CONFIG_DIR "$rc" auth status ;;
+    login)
+      if [ ! -t 0 ] || [ ! -t 1 ]; then
+        yel "Interactive — run in your own terminal:"; echo; echo "    claude-account global login"; exit 3; fi
+      env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN "$rc" auth login --claudeai
+      mkdir -p "$PROFILES"
+      python3 - <<'GLPY' > "$PROFILES/.global-account" 2>/dev/null || true
+import json,os
+try:
+    a=(json.load(open(os.path.expanduser("~/.claude.json"))).get("oauthAccount") or {})
+    e,o=a.get("emailAddress"),a.get("organizationName")
+    print(f"{e} ({o})" if e and o else (e or ""))
+except Exception: pass
+GLPY
+      [ -s "$PROFILES/.global-account" ] || rm -f "$PROFILES/.global-account"
+      echo; grn "Global account is now: $(acct_identity "")" ;;
+    logout) env -u CLAUDE_SECURESTORAGE_CONFIG_DIR "$rc" auth logout ;;
+    usage)  cmd_usage global ;;
+    *) red "usage: claude-account global [status|login|logout|usage]"; exit 2 ;;
+  esac
+}
+
+cmd_profiles(){
+  echo "PROFILES — every stored login  (one row per credential, incl. unused ones)"; echo
+  printf '  %-13s %-52s %s\n' PROFILE "ACCOUNT (recorded at login) · plan | tier" "USED BY"
+  printf '  '; printf '─%.0s' $(seq 1 86); echo
+  local any=0 nm
+  for d in "$PROFILES"/*/; do
+    [ -d "$d" ] || continue
+    nm=$(basename "$d"); any=1
+    local id; id=$(acct_identity "${d%/}")
+    local lbl; lbl=$(profile_label "${d%/}")
+    if [ -n "$lbl" ]; then
+      case "$id" in
+        *"NOT LOGGED IN"*) id="$id  (last: $lbl)" ;;   # historical, not current
+        *) id="$lbl  ·  $id" ;;
+      esac
+    fi
+    local used; used=$(awk -F'\t' -v n="$nm" '$2==n{ print $1"\t"($3=="paused"?"paused":"active") }' "$MAP" 2>/dev/null \
+        | while IFS=$'\t' read -r pp ss; do printf '%s  [%s]\n' "$pp" "$(status_cell "$ss" 6)"; done)
+    if [ -z "$used" ]; then used="— no path uses it (orphan)"; fi
+    printf '  %-13s %-52s %s\n' "$nm" "$id" "$(printf '%s' "$used" | head -1 | sed "s|$HOME|~|")"
+    printf '%s\n' "$used" | tail -n +2 | sed "s|$HOME|~|" | sed 's/^/                                                     /'
+  done
+  [ "$any" = 0 ] && dim "  (no profiles yet)"
+  echo
+  local gid; gid=$(acct_identity "")
+  local glbl; glbl=$(cat "$PROFILES/.global-account" 2>/dev/null | head -1)
+  [ -n "$glbl" ] && gid="$glbl  ·  $gid"
+  printf '  %-13s %-52s %s\n' "(global)" "$gid" "every path with no rule"
+  echo
+  dim "  The email is RECORDED AT LOGIN (from ~/.claude.json, which reflects the most"
+  dim "  recent sign-in) — the token itself carries no identity. Set one by hand with:"
+  dim "      claude-account label <profile> <email>"
+}
+
+cmd_list(){
+  echo "PATH RULES — what each project path does  (one row per rule)"; echo
+  printf '  %-40s %-12s %-7s %s\n' PATH PROFILE STATUS "SIGNED IN AS (plan | tier)"
+  printf '  '; printf '─%.0s' $(seq 1 108); echo
+  local any=0
+  while IFS=$'\t' read -r prefix name state _r; do
+    case "$prefix" in ''|\#*) continue;; esac; [ -z "${name:-}" ] && continue
+    any=1
+    local pdir="$PROFILES/$name" st="no"      # must precede the paused branch:
+    if [ "${state:-}" = "paused" ]; then      # it leaked the previous row's pdir
+      local plbl; plbl=$(profile_label "$pdir"); [ -n "$plbl" ] && plbl="$plbl · "
+      local pid; pid=$(acct_identity "$pdir")
+      local note="login kept"; [ "$pid" = "NOT LOGGED IN" ] && note="not signed in"
+      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell paused 7)" "using global — ${note}: ${plbl}${pid}"; continue; fi
+    [ -d "$pdir" ] || st="no profile dir"
+    st=$(acct_identity "$pdir"); lbl=$(profile_label "$pdir"); [ -n "$lbl" ] && st="$lbl  ·  $st"
+    printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell active 7)" "$st"
+  done < "$MAP"
+  [ "$any" = 0 ] && dim "  (no rules — every path uses your global account)"
+  echo; dim "  Anything not listed uses the account you signed in with globally."
+  dim "  A profile with no path rule is not shown here — see: claude-account profiles"
+  dim "  Shared everywhere: plugins, MCP servers, memory, settings, hooks, history."
+}
+
+cmd_add(){
+  local path="${1:-}" name="${2:-}"
+  [ -z "$path" ] && { red "usage: claude-account add <project-path> [profile-name]"; exit 2; }
+  path=$(norm "$path") || { red "no such directory: ${1}"; exit 2; }
+  [ -d "$path" ] || { red "not a directory: $path"; exit 2; }
+  local derived=0
+  if [ -z "$name" ]; then
+    name=$(basename "$path" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-'); derived=1
+  else name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]'); fi   # 'TL' -> 'tl'
+  if ! printf '%s' "$name" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$'; then
+    red "invalid profile name '$name' (lowercase letters, digits, . _ -)"; exit 2; fi
+  local existing; existing=$(awk -F'\t' -v p="$path" '$1==p{print $2}' "$MAP" 2>/dev/null | head -1)
+  if [ -n "$existing" ]; then
+    yel "That exact path already routes to profile '$existing'."
+    dim "  change it:  claude-account remove '$path'  then add again"; exit 1; fi
+  # Two paths MAY share one profile (same client, two checkouts) — but only on
+  # purpose. A DERIVED name that collides is almost always an accident: two folders
+  # with the same basename would silently share one account and one quota.
+  local owners; owners=$(awk -F'\t' -v n="$name" '$2==n{print "  "$1}' "$MAP" 2>/dev/null)
+  if [ -n "$owners" ]; then
+    if [ "$derived" = 1 ]; then
+      red "Profile name '$name' (derived from the folder) is already used by:"
+      printf '%s\n' "$owners"
+      dim "  Sharing one account across paths must be deliberate. Either pick a name:"
+      dim "      claude-account add '$path' <other-name>"
+      dim "  or reuse it on purpose by passing it explicitly:"
+      dim "      claude-account add '$path' $name"
+      exit 1
+    fi
+    yel "Profile '$name' already exists — this path will SHARE its account and login with:"
+    printf '%s\n' "$owners"
+    dim "  (that is what passing the name explicitly means)"
+    # pause is stored per ROW, so a new row starts ACTIVE even if its siblings are
+    # paused. Surprising when the profile was paused for a depleted quota.
+    if awk -F'\t' -v n="$name" '$2==n && $3=="paused"{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
+      yel "  NOTE: other paths on '$name' are PAUSED, but this new one starts ACTIVE."
+      dim  "        pause covers the rows that existed when you ran it. To pause them all:"
+      dim  "            claude-account pause $name"
+    fi
+  fi
+
+  local cur; cur=$("$RESOLVE" "$path" 2>/dev/null | cut -f1)
+  [ -n "$cur" ] && yel "note: '$path' currently inherits profile '$cur' from a parent rule; this adds a more specific one."
+  backup "add-$name"
+  mkdir -p "$PROFILES/$name"
+  printf '%s\t%s\n' "$path" "$name" >> "$MAP"
+  grn "Added: $path  ->  profile '$name'"
+  echo
+  if [ -e "$PROFILES/$name/.login-attempted" ]; then
+    dim "Profile '$name' has already been signed in — nothing else to do."
+    dim "Check it with:  claude-account verify"
+  else
+    echo "Next, authenticate it — IN YOUR OWN TERMINAL (it opens a browser):"
+    echo
+    echo "    claude-account login $name"
+    echo
+    dim "Only the account changes; plugins, MCP servers, memory and settings stay shared."
+  fi
+}
+
+cmd_remove(){
+  local path="${1:-}"
+  [ -z "$path" ] && { red "usage: claude-account remove <project-path|profile-name>"; exit 2; }
+  case "$path" in
+    /*|~*|./*|../*) path=$(norm "$path") || path="${1%/}" ;;
+    *) # a profile name: resolve to its path(s)
+       local hits; hits=$(awk -F'\t' -v n="$path" '$2==n{print $1}' "$MAP" 2>/dev/null)
+       local cnt; cnt=$(printf '%s' "$hits" | grep -c .)
+       if [ "$cnt" = 0 ]; then red "no rule for profile or path: $path"; exit 1
+       elif [ "$cnt" -gt 1 ] && [ "${2:-}" != "--all" ]; then
+            red "profile '$path' covers several paths — name one, or use --all:"
+            printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
+            dim "    claude-account remove $path --all"
+            exit 1
+       elif [ "$cnt" -gt 1 ]; then
+            backup "remove-all-$path"
+            local n=0
+            while IFS= read -r pth; do [ -z "$pth" ] && continue
+              python3 - "$MAP" "$pth" <<'RMPY'
+import sys
+m,p=sys.argv[1],sys.argv[2]
+lines=open(m).readlines()                      # READ FIRST — open(m,"w") truncates
+open(m,'w').writelines([l for l in lines if l.rstrip('\n').split('\t')[0]!=p])
+RMPY
+              n=$((n+1)); echo "  removed  ${pth/#$HOME/~}"
+            done <<< "$hits"
+            grn "Removed $n rule(s) — those paths use your GLOBAL account again."
+            dim "The profile and its login are kept. Delete them with: claude-account forget $path"
+            return 0
+       else path="$hits"; fi ;;
+  esac
+  awk -F'\t' -v p="$path" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null || { yel "no rule for: $path"; exit 1; }
+  local name; name=$(awk -v p="$path" '$1==p{print $2}' "$MAP" | head -1)
+  backup "remove-$name"
+  python3 - "$MAP" "$path" <<'PY'
+import sys
+m,p=sys.argv[1],sys.argv[2]
+out=[l for l in open(m) if not (l.rstrip('\n').split('\t')[0]==p)]
+open(m,'w').writelines(out)
+PY
+  grn "Removed: $path  ->  now uses your GLOBAL account again."
+  dim "Profile dir kept at $PROFILES/$name (its login still works if you re-add it)."
+  dim "To forget the login too:  claude-account forget $name"
+}
+
+cmd_login(){
+  # "login global" reads the same way as every other verb-first command;
+  # "global login" still works. Keep both.
+  if [ "${1:-}" = "global" ]; then cmd_global login; return $?; fi
+  [ -z "${1:-}" ] && { red "usage: claude-account login <profile-name|project-path>"; exit 2; }
+  local name; name=$(to_profile "$1") || exit $?
+  local pdir="$PROFILES/$name"; mkdir -p "$pdir"
+  local rc; rc=$(real_claude) || { red "real claude binary not found"; exit 127; }
+
+  # OAuth needs a real terminal and a browser. An agent's Bash tool has no TTY, so
+  # launching there would hang with no way to finish. Detect it and hand the user
+  # the command instead of pretending.
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    yel "Authentication is interactive — it opens a browser and needs a real terminal."
+    echo
+    echo "Run this yourself in a terminal (not through Claude):"
+    echo
+    echo "    claude-account login $name"
+    echo
+    dim "Then come back and run:  claude-account verify"
+    exit 3
+  fi
+
+  echo "Signing in to Claude profile '$name'."
+  dim "A browser will open. Sign in with the account that owns this project."
+  echo
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
+      CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir" "$rc" auth login --claudeai
+  : > "$pdir/.login-attempted"
+  capture_label "$pdir"
+  echo
+  local acct; acct=$(acct_identity "$pdir")
+  if [ "$acct" = "NOT LOGGED IN" ]; then
+    yel "Still not logged in for '$name'. Re-run:  claude-account login $name"
+  else
+    grn "Profile '$name' is now: $acct"
+    dim "Note: Claude's in-app Account panel will now show THIS account's email in every"
+    dim "      window, routed or not, until the next sign-in elsewhere. Only the email and"
+    dim "      organisation are affected — Plan and the usage bars stay correct per session."
+    local paths; paths=$(awk -F'\t' -v n="$name" '$2==n{print "  "$1}' "$MAP" 2>/dev/null)
+    [ -n "$paths" ] && { echo "Applies to:"; printf '%s\n' "$paths"; }
+    dim "Restart VS Code once so the extension picks it up."
+  fi
+}
+
+cmd_forget(){
+  [ -z "${1:-}" ] && { red "usage: claude-account forget <profile-name|project-path>"; exit 2; }
+  local name; name=$(to_profile "$1") || exit $?
+  local pdir="$PROFILES/$name"
+  local still; still=$(awk -F'\t' -v n="$name" '$2==n{print "    "$1}' "$MAP" 2>/dev/null)
+  if [ -n "$still" ]; then
+    if [ "${2:-}" = "--force" ]; then
+      backup "forget-force-$name"
+      yel "Removing $(printf '%s' "$still" | grep -c .) rule(s) as well (--force):"
+      printf '%s\n' "$still" | sed "s|$HOME|~|"
+      python3 - "$MAP" "$name" <<'FGPY'
+import sys
+m,n=sys.argv[1],sys.argv[2]
+def keep(l):
+    f=l.rstrip('\n').split('\t')
+    return not (len(f)>=2 and f[1]==n)
+lines=open(m).readlines()                      # READ FIRST — open(m,"w") truncates
+open(m,'w').writelines([l for l in lines if keep(l)])
+FGPY
+    else
+      yel "Paths still route to '$name':"; printf '%s\n' "$still" | sed "s|$HOME|~|"
+      red "Remove them first, or cascade:"
+      dim "    claude-account remove $name --all      # keep the login"
+      dim "    claude-account forget $name --force    # delete everything"
+      exit 1
+    fi
+  fi
+  # Delete the credential too. The Keychain entry is keyed by a hash of the profile
+  # DIR PATH, so leaving it behind means a later profile of the same name silently
+  # inherits the old login — observed 2026-08-25 as a "ghost" tier on a fresh profile.
+  local svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
+  if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+    security delete-generic-password -s "$svc" >/dev/null 2>&1 \
+      && dim "Deleted its Keychain credential." \
+      || yel "Could not delete the Keychain entry '$svc' — remove it by hand."
+  fi
+  rm -rf "$pdir"
+  grn "Removed profile '$name' (directory and stored login)."
+}
+
+# Wrapped in a function and invoked on the last line so bash parses the ENTIRE
+# dispatch before running any of it. Without this, editing this file while a
+# long command (e.g. `login`, which waits on a browser) is running makes bash
+# resume reading at a stale byte offset and execute garbage — observed on
+# 2026-08-25 as "USAGE: command not found" plus a bogus "Still not logged in".
+main(){
+  # Accept "claude-account <profile> <verb>" as well as "<verb> <profile>".
+  # Reads naturally either way; only swap when arg1 is a real profile/path and
+  # arg2 is a verb that takes one.
+  if [ $# -ge 2 ]; then
+    case "$2" in
+      usage|login|logout|pause|resume|remove|forget|label|verify)
+        if awk -F'\t' -v n="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" '$2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null \
+           || [ -d "$PROFILES/$1" ] || [ -d "$1" ]; then
+          set -- "$2" "$1" "${@:3}"
+        fi ;;
+    esac
+  fi
+case "${1:-list}" in
+  list|ls|-l|--list) shift || true; cmd_list "${1:-}" ;;
+  profiles|logins)   cmd_profiles ;;
+  label)  shift; cmd_label "$@" ;;
+  verify) cmd_verify ;;
+  doctor) cmd_doctor ;;
+  setup)  cmd_setup ;;
+  rename) shift; cmd_rename "$@" ;;
+  export) cmd_export ;;
+  import) shift; cmd_import "$@" ;;
+  usage)  shift; cmd_usage "$@" ;;
+  refresh) shift; cmd_refresh "$@" ;;
+  logout) shift; cmd_logout "$@" ;;
+  switch) shift; cmd_switch "$@" ;;
+  global) shift; cmd_global "$@" ;;
+  status) shift; if [ "${1:-global}" = "global" ]; then cmd_global status; else cmd_verify; fi ;;
+  pause)  shift; cmd_pause "$@" ;;
+  resume) shift; cmd_resume "$@" ;;
+  add)    shift; cmd_add "$@" ;;
+  remove|rm) shift; cmd_remove "$@" ;;
+  login)  shift; cmd_login "$@" ;;
+  forget) shift; cmd_forget "$@" ;;
+  -h|--help|help) cat <<USAGE
+claude-account — route Claude subscriptions per project path
+
+INSPECT
+  claude-account list                  path rules: what each project path does
+                                       (aliases: ls, -l, --list)
+  claude-account profiles              every stored login, incl. unused ones
+                                       (alias: logins)
+  claude-account verify                same data framed per path
+  claude-account doctor                health check: plumbing, rules, logins, keychain
+  claude-account setup                 wire up PATH + VS Code after a package install
+  claude-account refresh [name|--all]  renew expired access tokens (default: all)
+  claude-account usage [name|path]     live quota: session, weekly, resets (omit = global)
+  claude-account usage --all           every profile + global (refreshes expired tokens)
+  claude-account <name> usage          same thing, read the other way round
+  claude-whoami [dir]                  which account applies in a directory, and why
+
+SET UP                                 <path> = /abs/path   <name> = profile name
+  claude-account add <path> [name]     bind a path to a profile
+                                       name defaults to the folder, lowercased
+  claude-account login <name|path>     sign in to a profile  (YOUR TERMINAL — opens a browser)
+  claude-account label <name|path> <t> record which account it holds ("" clears)
+  claude-account label <name> --auto   read it from the most recent sign-in
+  claude-account rename <old> <new>    rename a profile, moving its stored login
+  claude-account logout <name|path>    sign out; keeps the rules, pauses them so
+                                       those paths use the global account
+                                       (--keep-active leaves them routed = failing)
+
+PAUSE / RESUME                         paused = that path falls back to the global account
+  claude-account pause  <name>         pause EVERY path on that profile
+  claude-account pause  <path>         pause only that one path
+  claude-account resume <name>         resume every path on that profile
+  claude-account resume <path>         resume only that one path
+  claude-account switch <name> <to>    move EVERY path from one profile to another
+  claude-account switch <path> <to>    move just that path (both un-pause it)
+  claude-account switch <x> global     stop routing it — same as pause
+
+GLOBAL ACCOUNT                         the one used by every unrouted path
+                                       "global" works as a target of the normal verbs
+  claude-account login global          sign in globally (YOUR TERMINAL)
+  claude-account logout global         sign out globally
+  claude-account status global         who you are signed in as globally
+  claude-account usage global          global quota
+                                       (the older "claude-account global <verb>" form
+                                        still works and does the same thing)
+
+PORTABILITY                            rules + labels only; logins never leave the Keychain
+  claude-account export > file.tsv     dump rules and labels
+  claude-account import <file>         restore them on another machine
+
+TEAR DOWN
+  claude-account remove <path|name>    delete one rule; keeps the login
+                                       (by name: only when it has a single path)
+  claude-account remove <name> --all   delete EVERY rule on that profile
+  claude-account forget <name|path>    delete the profile and its login
+                                       (refuses while rules exist; --force cascades)
+
+NOTES
+  Only the ACCOUNT is routed. Plugins, MCP servers, memory, settings, hooks and
+  session history are always shared from ~/.claude.
+  Changes apply to NEW sessions immediately; already-open sessions keep their account.
+  Docs: https://github.com/reddeer-tech/claude-account
+USAGE
+    exit 0 ;;
+  *) red "unknown command: $1" >&2
+     dim "  try:  claude-account --help" >&2
+     exit 2 ;;
+esac
+}
+main "$@"

@@ -1,0 +1,37 @@
+#!/bin/bash
+# Which Claude account applies here, and why.
+# Locate resolve.sh: an explicit override, then next to this script (installed
+# layout: bin/../libexec), then the per-user config dir. Keeps a from-source run,
+# a Homebrew install and an npm install all working from one file.
+_ca_self="${BASH_SOURCE[0]:-$0}"
+_ca_dir="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)"
+for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
+          "$_ca_dir/../libexec/resolve.sh" \
+          "$_ca_dir/../lib/claude-account/resolve.sh" \
+          "$HOME/.config/claude-accounts/resolve.sh"; do
+  [ -n "$_c" ] && [ -f "$_c" ] && { RESOLVE="$_c"; break; }
+done
+RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
+MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
+dir=${1:-$PWD}
+echo "directory     : $dir"
+line=$([ -x "$RESOLVE" ] && "$RESOLVE" "$dir" 2>/dev/null)
+if [ -n "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ]; then
+  echo "account       : (explicit override in env)"
+  echo "profile dir   : $CLAUDE_SECURESTORAGE_CONFIG_DIR"
+elif [ -z "$line" ]; then
+  echo "matched rule  : none"
+  echo "account       : GLOBAL — whatever you signed in with (VS Code \"Switch account\")"
+else
+  name=$(printf '%s' "$line" | cut -f1); pdir=$(printf '%s' "$line" | cut -f2); pre=$(printf '%s' "$line" | cut -f3)
+  echo "matched rule  : $pre"
+  echo "account       : $name"
+  echo "profile dir   : $pdir"
+  # Do NOT guess the Keychain entry name. A credentials-only profile writes no
+  # files, and the service-name hash format is an implementation detail — a wrong
+  # guess would make this diagnostic lie, which is worse than saying nothing.
+  echo "login         : not checked here — run  claude-account list --probe  to verify for real"
+  echo "                (if Claude says \"Not logged in\", run: claude-account login $name)"
+fi
+echo "shared        : plugins, MCP servers, memory, settings, hooks, history (from ~/.claude)"
+echo "terminal claude resolves to: $(command -v claude)"

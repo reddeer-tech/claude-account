@@ -1,0 +1,51 @@
+#!/bin/bash
+# VS Code `claudeCode.claudeProcessWrapper` target.
+# The extension calls:  <wrapper> <real-native-binary> <claude args...>
+# (verified in extension.js: pathToClaudeCodeExecutable=wrapper, executableArgs=[binary])
+# Routes the Claude ACCOUNT by workspace folder; changes nothing else.
+# Docs: https://github.com/reddeer-tech/claude-account
+# Locate resolve.sh: an explicit override, then next to this script (installed
+# layout: bin/../libexec), then the per-user config dir. Keeps a from-source run,
+# a Homebrew install and an npm install all working from one file.
+_ca_self="${BASH_SOURCE[0]:-$0}"
+_ca_dir="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)"
+for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
+          "$_ca_dir/../libexec/resolve.sh" \
+          "$_ca_dir/../lib/claude-account/resolve.sh" \
+          "$HOME/.config/claude-accounts/resolve.sh"; do
+  [ -n "$_c" ] && [ -f "$_c" ] && { RESOLVE="$_c"; break; }
+done
+RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
+real="$1"
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  echo "claude-vscode-wrapper: expected the real claude binary as argv[1] (got '${real:-<empty>}')" >&2
+  exit 127
+fi
+shift
+if [ -z "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -x "$RESOLVE" ]; then
+  line=$("$RESOLVE" "$PWD" 2>/dev/null)
+  if [ -n "$line" ]; then
+    pdir=$(printf '%s' "$line" | cut -f2)
+    mkdir -p "$pdir" 2>/dev/null
+    if [ -e "$pdir/.login-attempted" ]; then :; fi
+    # A routed profile with no credential would fail with "Not logged in". Fall back
+    # to the global account instead, but say so LOUDLY — silence here would mean a
+    # client's work quietly billed to the personal plan (or the reverse).
+    # CLAUDE_ACCOUNTS_STRICT=1 restores the old fail-fast behaviour.
+    svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
+    if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+      export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"
+    else
+      pname=$(printf '%s' "$line" | cut -f1)
+      if [ -n "${CLAUDE_ACCOUNTS_STRICT:-}" ]; then
+        printf 'claude: profile %s has no login; refusing to fall back (CLAUDE_ACCOUNTS_STRICT).\n' "'$pname'" >&2
+        printf '        run:  claude-account login %s\n' "$pname" >&2
+        export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"
+      else
+        printf 'claude: profile %s is not signed in — USING YOUR GLOBAL ACCOUNT for this session.\n' "'$pname'" >&2
+        printf '        run:  claude-account login %s     (or: claude-account pause %s)\n' "$pname" "$pname" >&2
+      fi
+    fi
+  fi
+fi
+exec "$real" "$@"
