@@ -93,16 +93,12 @@ restart the session — `claude -c` resumes it with full context.
   usage bars come from the session's real token. Trust those, or run `claude-account verify`.
 - Each account needs its own valid subscription. This routes credentials; it does not share them.
 
-## Development
+## Contributing
 
-```sh
-make check        # syntax + smoke, no network, no state change
-make install      # deploy this repo onto your machine
-make check-sync   # fail if the installed copy has drifted from the repo
-make release-dry  # show what a release would do
-```
+The routing logic is `libexec/resolve.sh`; everything else is a thin shim around it.
+`claude-account doctor` is the fastest way to see whether a change broke the plumbing.
 
-Release process: [RELEASING.md](RELEASING.md)
+Issues and pull requests: <https://github.com/reddeer-tech/claude-account>
 
 ## License
 

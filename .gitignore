@@ -6,3 +6,9 @@ dist/
 .npmrc
 .env
 .env.*
+
+# release tooling: kept on this machine, deliberately not published.
+# these build and ship the package, they are not part of it.
+Makefile
+RELEASING.md
+Formula/

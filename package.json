@@ -13,8 +13,5 @@
     "claude-account": "bin/claude-account",
     "claude-whoami": "bin/claude-whoami"
   },
-  "files": ["bin/", "libexec/", "templates/", "install.sh", "README.md", "LICENSE", "VERSION"],
-  "scripts": {
-    "test": "make check"
-  }
+  "files": ["bin/", "libexec/", "templates/", "install.sh", "README.md", "LICENSE"]
 }
