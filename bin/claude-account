@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.12"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.13"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -99,15 +99,15 @@ cmd_verify(){
     any=1
     if [ "${state:-}" = "paused" ]; then
       if [ "${why:-}" = "global" ]; then
-        printf '  %-46s %s\n' "${prefix/#$HOME/~}" "ON GLOBAL by request (login for '$name' kept)"
+        printf '  %-46s → %s · switched   (login for %s kept)\n' "${prefix/#$HOME/~}" "$(gtag)" "'$name'"
       else
-        printf '  %-46s %s\n' "${prefix/#$HOME/~}" "PAUSED (global in use; login for '$name' kept)"
+        printf '  %-46s → %s · paused     (login for %s kept)\n' "${prefix/#$HOME/~}" "$(gtag)" "'$name'"
       fi
       continue; fi
     printf '  %-46s %s\n' "${prefix/#$HOME/~}" "$(acct_identity "$PROFILES/$name")"
   done < "$MAP"
   [ "$any" = 0 ] && dim "  (no path rules)"
-  printf '  %-46s %s\n' "everything else (global)" "$(acct_identity "")"
+  printf '  %s %s\n' "$(gcell "everything else — $CA_GTAG" 46)" "$(acct_identity "")"
   echo
   dim "  Source: the per-profile OAuth token in the Keychain. Plan and rate-limit tier"
   dim "  are the fields that genuinely differ per profile. Email/org are deliberately"
@@ -314,6 +314,38 @@ cmd_label(){
 # which silently disabled colour everywhere.
 if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then CA_COLOUR=1; else CA_COLOUR=0; fi
 _use_colour(){ [ "$CA_COLOUR" = 1 ]; }
+# ONE token and ONE colour for the global account, used everywhere it is named, so it
+# can never read as "a profile that happens to be called global". The parentheses do the
+# real work: a profile name must match ^[a-z0-9][a-z0-9._-]*$, so "(global)" is not a
+# legal profile name and cannot be confused for one. Cyan sets it apart from the green
+# (routing normally) and orange (not routing) that describe rule state — this is not a
+# state, it is an account.
+CA_GTAG="(global)"
+CA_CYAN=$'\033[36m'
+CA_OFF=$'\033[0m'
+
+gtag(){   # inline, unpadded
+  if _use_colour; then printf '%s%s%s' "$CA_CYAN" "$CA_GTAG" "$CA_OFF"; else printf '%s' "$CA_GTAG"; fi
+}
+
+# For a PADDED column. Pad FIRST, then colour: printf's %-Ns counts the escape bytes, so
+# colouring before padding silently breaks the column alignment (the bug this file already
+# learned once with status_cell).
+gcell(){ # <text> <width>
+  local pad; printf -v pad '%-*s' "${2:-12}" "$1"
+  case "$1" in
+    *"$CA_GTAG"*) if _use_colour; then printf '%s%s%s' "$CA_CYAN" "$pad" "$CA_OFF"; return; fi ;;
+  esac
+  printf '%s' "$pad"
+}
+
+# "using (global):" — the tag in the global colour, the words around it dimmed so the
+# account that follows is what the eye lands on.
+using_gtag(){
+  if _use_colour; then printf '\033[2musing %s%s%s%s\033[2m:%s' "$CA_OFF" "$CA_CYAN" "$CA_GTAG" "$CA_OFF" "$CA_OFF"
+  else printf 'using %s:' "$CA_GTAG"; fi
+}
+
 status_cell(){ # <state> <width>   — list's STATUS column: active | paused
   local txt pad
   if [ "${1:-}" = "paused" ]; then txt="PAUSED"; else txt="ACTIVE"; fi
@@ -330,16 +362,15 @@ status_cell(){ # <state> <width>   — list's STATUS column: active | paused
 # never what happened. The profile is untouched — signed in, own quota — and only its
 # path stopped routing to it. Say where the PATH goes.
 usedby_cell(){ # <state>   active | paused | global
-  local txt
+  local why
   case "${1:-}" in
-    paused) txt="→ global (paused)" ;;
-    global) txt="→ global (switched)" ;;
-    *)      txt="ACTIVE" ;;
+    paused) why="paused" ;;
+    global) why="switched" ;;
+    *)      if _use_colour; then printf '\033[32mACTIVE\033[0m'; else printf 'ACTIVE'; fi; return ;;
   esac
-  if _use_colour; then
-    if [ "$txt" = "ACTIVE" ]; then printf '\033[32m%s\033[0m' "$txt"
-    else printf '\033[38;5;208m%s\033[0m' "$txt"; fi
-  else printf '%s' "$txt"; fi
+  # orange for "not routing to this profile", but the tag itself keeps the global colour
+  if _use_colour; then printf '\033[38;5;208m→ %s%s\033[38;5;208m · %s%s' "$CA_OFF" "$(gtag)" "$why" "$CA_OFF"
+  else printf '→ %s · %s' "$CA_GTAG" "$why"; fi
 }
 
 # Usage for one credential store. Calls Anthropic's own /api/oauth/usage with that
@@ -821,7 +852,7 @@ cmd_usage(){
   fi
   local name pdir label
   if [ -z "${1:-}" ] || [ "$1" = "global" ]; then
-    name="(global)"; pdir=""
+    name="$CA_GTAG"; pdir=""
   else
     name=$(to_profile "$1") || exit $?
     pdir="$PROFILES/$name"; label=$(profile_label "$pdir")
@@ -963,7 +994,7 @@ cmd_profiles(){
   [ "$any" = 0 ] && dim "  (no profiles yet)"
   echo
   load_global_identity
-  printf '  %-13s %-52s %s\n' "(global)" "$CA_GLOBAL_ID" "every path with no rule"
+  printf '  %s %-52s %s\n' "$(gcell "$CA_GTAG" 13)" "$CA_GLOBAL_ID" "every path with no rule"
   echo
   dim "  The email is RECORDED AT LOGIN (from ~/.claude.json, which reflects the most"
   dim "  recent sign-in) — the token itself carries no identity. Set one by hand with:"
@@ -1006,26 +1037,25 @@ cmd_list(){
       # `global`, plus the aside naming the binding — not the status word.
       local col pre post stat
       if [ "${why:-}" = "global" ]; then
-        col="global"; pre=""; post="(still bound to '$name' — $note)"; stat="active"
+        col="$CA_GTAG"; pre=""; post="(still bound to '$name' — $note)"; stat="active"
       else
-        col="$name";  pre="using global:"; post="($note)";      stat="paused"
+        col="$name";    pre="$(using_gtag)"; post="($note)";     stat="paused"
       fi
       # Dim the connective words so the ACCOUNT is what the eye lands on — that is the
       # payload of this column. "(login kept)" is an aside and dims too; "NOT signed in"
       # is a warning and goes red. Safe to colour here: this is the last column, so no
       # %-Ns padding is counting these escape bytes.
       if _use_colour; then
-        [ -n "$pre" ] && pre=$'\033[2m'"$pre"$'\033[0m'
         if [ "$note" = "login kept" ]; then post=$'\033[2m'"$post"$'\033[0m'
         else post=$'\033[31m'"$post"$'\033[0m'; fi
       fi
-      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$col" "$(status_cell "$stat" 7)" "${pre:+$pre }$CA_GLOBAL_ID   $post"; continue; fi
+      printf '  %-40s %s %s %s\n' "${prefix/#$HOME/~}" "$(gcell "$col" 12)" "$(status_cell "$stat" 7)" "${pre:+$pre }$CA_GLOBAL_ID   $post"; continue; fi
     [ -d "$pdir" ] || st="no profile dir"
     st=$(acct_identity "$pdir"); lbl=$(profile_label "$pdir"); [ -n "$lbl" ] && st="$lbl  ·  $st"
-    printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell active 7)" "$st"
+    printf '  %-40s %s %s %s\n' "${prefix/#$HOME/~}" "$(gcell "$name" 12)" "$(status_cell active 7)" "$st"
   done < "$MAP"
   [ "$any" = 0 ] && dim "  (no rules — every path uses your global account)"
-  echo; dim "  Anything not listed uses the account you signed in with globally."
+  echo; printf '\033[2m  Anything not listed uses %s\033[2m — the account you signed in with.\033[0m\n' "$(gtag)"
   dim "  A profile with no path rule is not shown here — see: claude-account profiles"
   dim "  Shared everywhere: plugins, MCP servers, memory, settings, hooks, history."
 }

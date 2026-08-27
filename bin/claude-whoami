@@ -14,14 +14,32 @@ done
 RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 dir=${1:-$PWD}
+# Same global token and colour the CLI uses, so the two never disagree about what
+# "global" looks like. Colour only to a terminal, and never when NO_COLOR is set.
+CA_GTAG="(global)"
+if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then GT=$'\033[36m'"$CA_GTAG"$'\033[0m'; else GT="$CA_GTAG"; fi
 echo "directory     : $dir"
 line=$([ -x "$RESOLVE" ] && "$RESOLVE" "$dir" 2>/dev/null)
 if [ -n "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ]; then
   echo "account       : (explicit override in env)"
   echo "profile dir   : $CLAUDE_SECURESTORAGE_CONFIG_DIR"
 elif [ -z "$line" ]; then
-  echo "matched rule  : none"
-  echo "account       : GLOBAL — whatever you signed in with (VS Code \"Switch account\")"
+  # resolve.sh skips a PAUSED rule, so a bare "none" is a half-truth: there IS a rule here,
+  # it is simply not routing. Saying "none" sends you looking for a rule you already have.
+  # Same class of half-truth as the list/profiles wording bugs — report what is really there.
+  parked=$(awk -F'\t' -v d="$dir/" '
+    $1 ~ /^#/ || NF < 2 { next }
+    { p=$1; sub(/\/$/, "", p)
+      if (index(d, p "/") == 1 && length(p) > L) { L=length(p); P=p; N=$2; W=($4=="global" ? "switched to global" : "paused") } }
+    END { if (N) printf "%s\t%s\t%s\n", P, N, W }' "$MAP" 2>/dev/null)
+  if [ -n "$parked" ]; then
+    echo "matched rule  : $(printf '%s' "$parked" | cut -f1)"
+    echo "                ...but it is $(printf '%s' "$parked" | cut -f3), so it is NOT routing"
+    echo "account       : $GT — resume it with:  claude-account resume $(printf '%s' "$parked" | cut -f2)"
+  else
+    echo "matched rule  : none"
+    echo "account       : $GT — whatever you signed in with (VS Code \"Switch account\")"
+  fi
 else
   name=$(printf '%s' "$line" | cut -f1); pdir=$(printf '%s' "$line" | cut -f2); pre=$(printf '%s' "$line" | cut -f3)
   echo "matched rule  : $pre"
@@ -37,7 +55,7 @@ else
   if security find-generic-password -s "$svc" >/dev/null 2>&1; then
     echo "login         : signed in"
   else
-    echo "login         : NOT signed in — this folder falls back to your GLOBAL account"
+    echo "login         : NOT signed in — this folder falls back to $GT"
     echo "                run:  claude-account login $name   (or: claude-account pause $name)"
   fi
 fi
