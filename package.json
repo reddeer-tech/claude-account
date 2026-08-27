@@ -1,9 +1,10 @@
 {
   "name": "claude-account",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Route Claude Code subscriptions per project path on macOS — different account per folder, everything else shared.",
   "keywords": ["claude", "claude-code", "anthropic", "cli", "macos", "accounts", "profiles"],
   "license": "MIT",
+  "author": "RedDeer",
   "homepage": "https://github.com/reddeer-tech/claude-account#readme",
   "repository": { "type": "git", "url": "git+https://github.com/reddeer-tech/claude-account.git" },
   "bugs": { "url": "https://github.com/reddeer-tech/claude-account/issues" },
