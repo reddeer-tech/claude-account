@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.2"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.3"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -778,7 +778,51 @@ GLPY
   esac
 }
 
+# Is the stored ACCESS token past its expiry? Reads the credential directly rather than
+# string-matching acct_identity's output, which is display text and carries colour codes.
+acct_is_expired(){ # <profile-dir or "" for global> ; 0 = expired
+  local svc="Claude Code-credentials"
+  [ -n "${1:-}" ] && svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
+  local blob; blob=$(security find-generic-password -s "$svc" -w 2>/dev/null)
+  [ -z "$blob" ] && return 1
+  printf '%s' "$blob" | python3 -c "
+import json,sys,time
+try: d=json.load(sys.stdin).get('claudeAiOauth') or {}
+except Exception: sys.exit(1)
+e=d.get('expiresAt')
+sys.exit(0 if e and e/1000 <= time.time() else 1)
+" 2>/dev/null
+}
+
+# Refresh EXPIRED access tokens before an inspection command reports on them, so it shows
+# reality instead of a stale EXPIRED that one refresh would have fixed. A PAUSED profile is
+# never used, so it drifts into expiry and looks broken when it is merely idle.
+#
+# Only expired credentials are touched: with everything valid this makes no network call at
+# all. It is NOT done for pause/switch/add — those are state changes, and a command that
+# mutates routing should not also quietly rewrite credentials.
+refresh_expired_all(){
+  [ "${CA_NO_REFRESH:-0}" = "1" ] && return 0
+  local d n any=0
+  for d in "$PROFILES"/*/; do
+    [ -d "$d" ] || continue
+    if acct_is_expired "${d%/}"; then
+      n=$(basename "$d")
+      [ "$any" = 0 ] && { dim "refreshing expired token(s)…"; any=1; }
+      if ! refresh_token_if_needed "${d%/}" >/dev/null 2>&1; then
+        yel "  $n: refresh failed — sign in again:  claude-account login $n"
+      fi
+    fi
+  done
+  if acct_is_expired ""; then
+    [ "$any" = 0 ] && dim "refreshing expired token(s)…"
+    refresh_token_if_needed "" >/dev/null 2>&1 ||       yel "  global: refresh failed — sign in again:  claude-account login global"
+  fi
+}
+
 cmd_profiles(){
+  case " $* " in *" --no-refresh "*) CA_NO_REFRESH=1 ;; esac
+  refresh_expired_all
   echo "PROFILES — every stored login  (one row per credential, incl. unused ones)"; echo
   printf '  %-13s %-52s %s\n' PROFILE "ACCOUNT (recorded at login) · plan | tier" "USED BY"
   printf '  '; printf '─%.0s' $(seq 1 86); echo
@@ -813,6 +857,8 @@ cmd_profiles(){
 }
 
 cmd_list(){
+  case " $* " in *" --no-refresh "*) CA_NO_REFRESH=1 ;; esac
+  refresh_expired_all
   echo "PATH RULES — what each project path does  (one row per rule)"; echo
   printf '  %-40s %-12s %-7s %s\n' PATH PROFILE STATUS "SIGNED IN AS (plan | tier)"
   printf '  '; printf '─%.0s' $(seq 1 108); echo
@@ -1095,6 +1141,8 @@ INSPECT
   claude-account verify                same data framed per path
   claude-account doctor                health check: plumbing, rules, logins, keychain
   claude-account --version             print the installed version
+
+  --no-refresh on list/profiles skips renewing expired tokens (offline / faster)
   claude-account setup                 wire up PATH + VS Code after a package install
   claude-account refresh [name|--all]  renew expired access tokens (default: all)
   claude-account usage [name|path]     live quota: session, weekly, resets (omit = global)
