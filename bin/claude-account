@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.9"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.10"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -291,13 +291,23 @@ cmd_label(){
 # which silently disabled colour everywhere.
 if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then CA_COLOUR=1; else CA_COLOUR=0; fi
 _use_colour(){ [ "$CA_COLOUR" = 1 ]; }
-status_cell(){ # <state> <width>
-  local st txt pad
-  if [ "${1:-}" = "paused" ]; then txt="PAUSED"; else txt="ACTIVE"; fi
+status_cell(){ # <state> <width>   state: active | paused | global
+  local txt pad
+  case "${1:-}" in
+    paused) txt="PAUSED" ;;
+    # `switch <x> global`. Distinct from PAUSED because you did not park a profile,
+    # you named global — and saying PAUSED made `profiles` claim the profile was
+    # paused when the user had only switched it. Same orange: either way the
+    # profile's own account is not being used.
+    global) txt="ON GLOBAL" ;;
+    *)      txt="ACTIVE" ;;
+  esac
   printf -v pad '%-*s' "${2:-7}" "$txt"
   if _use_colour; then
-    if [ "$txt" = "PAUSED" ]; then printf '\033[38;5;208m%s\033[0m' "$pad"   # orange
-    else printf '\033[32m%s\033[0m' "$pad"; fi                               # green
+    case "$txt" in
+      ACTIVE) printf '\033[32m%s\033[0m' "$pad" ;;                # green
+      *)      printf '\033[38;5;208m%s\033[0m' "$pad" ;;          # orange
+    esac
   else printf '%s' "$pad"; fi
 }
 
@@ -907,7 +917,7 @@ cmd_profiles(){
         *) id="$lbl  ·  $id" ;;
       esac
     fi
-    local used; used=$(awk -F'\t' -v n="$nm" '$2==n{ print $1"\t"($3=="paused"?"paused":"active") }' "$MAP" 2>/dev/null \
+    local used; used=$(awk -F'\t' -v n="$nm" '$2==n{ print $1"\t"($4=="global"?"global":($3=="paused"?"paused":"active")) }' "$MAP" 2>/dev/null \
         | while IFS=$'\t' read -r pp ss; do printf '%s  [%s]\n' "$pp" "$(status_cell "$ss" 6)"; done)
     if [ -z "$used" ]; then used="— no path uses it (orphan)"; fi
     printf '  %-13s %-52s %s\n' "$nm" "$id" "$(printf '%s' "$used" | head -1 | sed "s|$HOME|~|")"
@@ -950,11 +960,18 @@ cmd_list(){
       local pid; pid=$(acct_identity "$pdir")
       local note="login kept"; [ "$pid" = "NOT LOGGED IN" ] && note="NOT signed in"
       load_global_identity
-      local col pre post
+      # STATUS describes whatever PROFILE names, or the row contradicts itself.
+      #   switch <x> global -> PROFILE is `global`, and global is genuinely the account
+      #                        doing the work, so the status is ACTIVE. Printing PAUSED
+      #                        beside it read as "global is paused", which is false.
+      #   pause <x>         -> PROFILE is the parked profile, and that one IS paused.
+      # What tells you the path is off its own account is the PROFILE column saying
+      # `global`, plus the aside naming the binding — not the status word.
+      local col pre post stat
       if [ "${why:-}" = "global" ]; then
-        col="global"; pre=""; post="(parked: '$name' — $note)"
+        col="global"; pre=""; post="(parked: '$name' — $note)"; stat="active"
       else
-        col="$name";  pre="using global:"; post="($note)"
+        col="$name";  pre="using global:"; post="($note)";      stat="paused"
       fi
       # Dim the connective words so the ACCOUNT is what the eye lands on — that is the
       # payload of this column. "(login kept)" is an aside and dims too; "NOT signed in"
@@ -965,7 +982,7 @@ cmd_list(){
         if [ "$note" = "login kept" ]; then post=$'\033[2m'"$post"$'\033[0m'
         else post=$'\033[31m'"$post"$'\033[0m'; fi
       fi
-      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$col" "$(status_cell paused 7)" "${pre:+$pre }$CA_GLOBAL_ID   $post"; continue; fi
+      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$col" "$(status_cell "$stat" 7)" "${pre:+$pre }$CA_GLOBAL_ID   $post"; continue; fi
     [ -d "$pdir" ] || st="no profile dir"
     st=$(acct_identity "$pdir"); lbl=$(profile_label "$pdir"); [ -n "$lbl" ] && st="$lbl  ·  $st"
     printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell active 7)" "$st"
