@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.14"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.15"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -52,14 +52,20 @@ except Exception:
 o = d.get("claudeAiOauth") or {}
 if not o:
     print("NOT LOGGED IN"); raise SystemExit
+# 12-hour with am/pm. %-I is not portable, so strip the leading zero by hand.
+def hm(t): return t.strftime("%I:%M %p").lstrip("0")
+
+# This is the ACCESS TOKEN's expiresAt, NOT a quota reset — different field, different
+# source, different meaning. `usage` reads resets_at from the API for the quota window.
+# "expires" is the correct word here; do not "fix" it to "resets".
 exp = o.get("expiresAt"); when = ""
 if exp:
     t = datetime.datetime.fromtimestamp(exp/1000)
     now = datetime.datetime.now()
     mins = (t - now).total_seconds() / 60
-    if mins < 0:      when = " EXPIRED " + t.strftime("%m-%d %H:%M")
-    elif mins < 60:   when = " EXPIRES IN %dm " % int(mins) + t.strftime("%H:%M")
-    else:             when = " exp " + t.strftime("%m-%d %H:%M")
+    if mins < 0:      when = " EXPIRED " + t.strftime("%m-%d ") + hm(t)
+    elif mins < 60:   when = " EXPIRES IN %dm " % int(mins) + hm(t)
+    else:             when = " exp " + t.strftime("%m-%d ") + hm(t)
 plan = o.get("subscriptionType", "?"); tier = o.get("rateLimitTier", "?")
 print(plan + " | " + tier + when)
 ACCTPY
@@ -432,7 +438,7 @@ def when(ts):
         s=(t-datetime.datetime.now(t.tzinfo)).total_seconds()
         h,m=int(s//3600),int((s%3600)//60)
         rel=f"in {h}h {m}m" if h>0 else (f"in {m}m" if m>0 else "now")
-        return f"resets {t.strftime('%a %H:%M')} ({rel})"
+        return f"resets {t.strftime('%a ')}{t.strftime('%I:%M %p').lstrip('0')} ({rel})"
     except Exception: return f"resets {ts}"
 
 def bar(p):
@@ -1045,6 +1051,8 @@ cmd_profiles(){
   dim "  The email is RECORDED AT LOGIN (from ~/.claude.json, which reflects the most"
   dim "  recent sign-in) — the token itself carries no identity. Set one by hand with:"
   dim "      claude-account label <profile> <email>"
+  dim "  The time is that ACCESS TOKEN's expiry — it renews itself on use, so it is not"
+  dim "  a quota reset. For quota and reset times:  claude-account usage [name|--all]"
 }
 
 cmd_list(){
@@ -1104,6 +1112,8 @@ cmd_list(){
   echo; printf '\033[2m  Anything not listed uses %s\033[2m — the account you signed in with.\033[0m\n' "$(gtag)"
   dim "  A profile with no path rule is not shown here — see: claude-account profiles"
   dim "  Shared everywhere: plugins, MCP servers, memory, settings, hooks, history."
+  dim "  The time is that ACCESS TOKEN's expiry — it renews itself on use, so it is not"
+  dim "  a quota reset. For quota and reset times:  claude-account usage [name|--all]"
 }
 
 # Is routing ACTUALLY live — does a `claude` typed in the user's LOGIN shell reach our shim?
