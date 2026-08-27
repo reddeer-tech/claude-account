@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.5"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.6"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -182,18 +182,32 @@ cmd_resume(){
   local n=0
   while IFS= read -r pth; do [ -z "$pth" ] && continue
     set_state "$pth" ""; n=$((n+1)); echo "  resumed  $pth"; done <<< "$hits"
-  grn "Resumed $n path(s) — routing active again, no re-authentication needed."
-  # Cheap local check (no request): surface a dead token now rather than mid-task.
+  # ⚠️ VERIFY, DO NOT ASSERT. This printed "no re-authentication needed" before checking
+  # anything, so it happily said that about a profile whose refresh token was dead — and you
+  # would only discover it mid-task. Resume is the moment you start depending on this
+  # credential again, so renew it here and report what actually happened.
+  #
+  # pause deliberately does NOT do this: parking a profile should not touch credentials, and
+  # you may well be pausing it precisely because it is spent.
   local nm2; nm2=$(awk -F'\t' -v t="$(printf '%s' "$hits" | head -1)" '$1==t{print $2}' "$MAP" 2>/dev/null | head -1)
+  local state="ok"
   if [ -n "$nm2" ]; then
-    local id2; id2=$(acct_identity "$PROFILES/$nm2")
-    case "$id2" in
-      *"NOT LOGGED IN"*) yel "  '$nm2' is not signed in — those paths will use your GLOBAL account."
-                         dim "    claude-account login $nm2" ;;
-      *EXPIRED*)         yel "  '$nm2' has an expired access token — it will renew itself on first use."
-                         dim "    or renew it now:  claude-account refresh $nm2" ;;
-    esac
+    local pdir="$PROFILES/$nm2"
+    if [ "$(acct_identity "$pdir")" = "NOT LOGGED IN" ]; then
+      state="nologin"
+    elif acct_is_expired "$pdir"; then
+      dim "  '$nm2': access token expired — renewing…"
+      if refresh_token_if_needed "$pdir" >/dev/null 2>&1; then state="renewed"; else state="dead"; fi
+    fi
   fi
+  case "$state" in
+    ok)      grn "Resumed $n path(s) — routing active again, credential valid." ;;
+    renewed) grn "Resumed $n path(s) — routing active again, credential renewed." ;;
+    nologin) yel "Resumed $n path(s), but '$nm2' is NOT signed in — those paths will use your GLOBAL account."
+             dim "    claude-account login $nm2" ;;
+    dead)    red "Resumed $n path(s), but '$nm2' could NOT be renewed — its refresh token is dead too."
+             red "    Sign in again before using those paths:  claude-account login $nm2" ;;
+  esac
 }
 
 # The OAuth token has no identity in it, but Claude Code caches the account of the
