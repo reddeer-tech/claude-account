@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.4"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.5"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -88,6 +88,8 @@ acct_identity(){ # <profile-dir or "" for global>
 }
 
 cmd_verify(){
+  case " $* " in *" --no-refresh "*) CA_NO_REFRESH=1 ;; esac
+  refresh_expired_all
   echo "WHICH ACCOUNT EACH PATH ACTUALLY USES"; echo
   printf '  %-46s %s\n' "PATH" "PLAN | RATE-LIMIT TIER (from the token)"
   printf '  '; printf '─%.0s' $(seq 1 108); echo
@@ -489,6 +491,12 @@ cmd_setup(){
 }
 
 cmd_doctor(){
+  # Renew first, then report. Otherwise doctor raises an EXPIRED alarm it could have fixed
+  # itself — and, worse, cannot distinguish "expired but renewable" from "the refresh token
+  # is dead too", which need completely different fixes. After this pass, anything still
+  # expired genuinely requires signing in again.
+  case " $* " in *" --no-refresh "*) CA_NO_REFRESH=1 ;; esac
+  refresh_expired_all
   local prob=0 warn=0
   bad(){ red "  ✗ $*"; prob=$((prob+1)); }
   wrn(){ yel "  ! $*"; warn=$((warn+1)); }
