@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.8"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.9"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -94,11 +94,16 @@ cmd_verify(){
   printf '  %-46s %s\n' "PATH" "PLAN | RATE-LIMIT TIER (from the token)"
   printf '  '; printf '─%.0s' $(seq 1 108); echo
   local any=0
-  while IFS=$'\t' read -r prefix name state _r; do
+  while IFS=$'\t' read -r prefix name state why; do
     case "$prefix" in ''|\#*) continue;; esac; [ -z "${name:-}" ] && continue
     any=1
     if [ "${state:-}" = "paused" ]; then
-      printf '  %-46s %s\n' "${prefix/#$HOME/~}" "PAUSED (global in use; login for '$name' kept)"; continue; fi
+      if [ "${why:-}" = "global" ]; then
+        printf '  %-46s %s\n' "${prefix/#$HOME/~}" "ON GLOBAL by request (login for '$name' kept)"
+      else
+        printf '  %-46s %s\n' "${prefix/#$HOME/~}" "PAUSED (global in use; login for '$name' kept)"
+      fi
+      continue; fi
     printf '  %-46s %s\n' "${prefix/#$HOME/~}" "$(acct_identity "$PROFILES/$name")"
   done < "$MAP"
   [ "$any" = 0 ] && dim "  (no path rules)"
@@ -143,13 +148,22 @@ norm(){ local p="$1"; case "$p" in "~"*) p="$HOME${p#\~}";; esac
 
 # pause/resume: keep the rule AND the login, but stop routing so the path falls
 # back to the global account. Nothing is deleted, so resume needs no re-auth.
-set_state(){ # <path> <state|"">
+# The THIRD field stays exactly "paused" whatever happens — resolve.sh skips on
+# `$3 == "paused"` and nothing else, so any other token there would silently keep
+# routing to the parked profile. An optional FOURTH field records HOW the row was
+# parked ("global" = you named global yourself, via `switch <x> global`). Every
+# existing reader ignores it: resolve.sh reads it into $_rest, and each awk tests $3.
+set_state(){ # <path> <state|""> [why]
   local tmp before
   before=$(grep -v '^#' "$MAP" 2>/dev/null | grep -c . || true)
   tmp=$(mktemp)
-  awk -F'\t' -v OFS='\t' -v t="$1" -v st="$2" '
+  awk -F'\t' -v OFS='\t' -v t="$1" -v st="$2" -v wy="${3:-}" '
     /^[ \t]*#/ || NF==0 { print; next }
-    $1==t { if (st=="") print $1,$2; else print $1,$2,st; next }
+    $1==t {
+      if (st=="")      print $1,$2
+      else if (wy=="") print $1,$2,st
+      else             print $1,$2,st,wy
+      next }
     { print }' "$MAP" > "$tmp" && write_map "$tmp" "$before"
 }
 
@@ -173,14 +187,15 @@ paths_for(){ # <path|name>
   esac
 }
 
-cmd_pause(){
+cmd_pause(){ # <path|name> [why]
   [ -z "${1:-}" ] && { red "usage: claude-account pause <path|profile-name>"; exit 2; }
   local hits; hits=$(paths_for "$1")
   [ -z "$hits" ] && { red "no rule matches: $1"; dim "  see:  claude-account list"; exit 1; }
   backup "pause"
+  local why="${2:-}"
   local n=0
   while IFS= read -r pth; do [ -z "$pth" ] && continue
-    set_state "$pth" paused; n=$((n+1)); echo "  paused   $pth"; done <<< "$hits"
+    set_state "$pth" paused "$why"; n=$((n+1)); echo "  paused   $pth"; done <<< "$hits"
   grn "Paused $n path(s) — they now use your GLOBAL account."
   dim "Profile and login untouched. Re-enable with:  claude-account resume $1"
 }
@@ -410,9 +425,9 @@ cmd_export(){
   echo "# generated $(date '+%Y-%m-%d %H:%M:%S')  host $(hostname -s)"
   echo "# restore with:  claude-account import <file>"
   echo "# NOTE: logins are NOT included — run 'claude-account login <name>' for each."
-  while IFS=$'\t' read -r pth nm st _r; do
+  while IFS=$'\t' read -r pth nm st why; do
     case "$pth" in ''|\#*) continue;; esac; [ -z "${nm:-}" ] && continue
-    printf 'rule\t%s\t%s\t%s\n' "$pth" "$nm" "${st:-active}"
+    printf 'rule\t%s\t%s\t%s\t%s\n' "$pth" "$nm" "${st:-active}" "${why:-}"
   done < "$MAP"
   for d in "$PROFILES"/*/; do
     [ -d "$d" ] || continue
@@ -427,14 +442,15 @@ cmd_import(){
   [ -f "$f" ] || { red "no such file: $f"; exit 2; }
   backup "import"
   local rules=0 labels=0 skipped=0
-  while IFS=$'\t' read -r kind a b c; do
+  while IFS=$'\t' read -r kind a b c d; do
     case "$kind" in
       rule)
         if awk -F'\t' -v p="$a" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
           skipped=$((skipped+1)); continue; fi
         mkdir -p "$PROFILES/$b"
         ensure_final_newline "$MAP"
-        if [ "${c:-active}" = "paused" ]; then printf '%s\t%s\tpaused\n' "$a" "$b" >> "$MAP"
+        if [ "${c:-active}" = "paused" ] && [ -n "${d:-}" ]; then printf '%s\t%s\tpaused\t%s\n' "$a" "$b" "$d" >> "$MAP"
+        elif [ "${c:-active}" = "paused" ]; then printf '%s\t%s\tpaused\n' "$a" "$b" >> "$MAP"
         else printf '%s\t%s\n' "$a" "$b" >> "$MAP"; fi
         rules=$((rules+1)) ;;
       label) mkdir -p "$PROFILES/$a"; printf '%s\n' "$b" > "$PROFILES/$a/.account"; labels=$((labels+1)) ;;
@@ -598,8 +614,11 @@ cmd_switch(){
   # "switch X global" means "stop routing these paths" — which is exactly pause:
   # the rule and the login are kept, and the paths fall back to the global account.
   if [ "$2" = "global" ]; then
-    cmd_pause "$1"
-    dim "  (that is a pause — rule and login kept. Route it again with:  claude-account switch $1 <profile>)"
+    # Same stored routing as `pause`, and it must stay identical — resolve.sh skips
+    # on the third field alone. The fourth records only that you named global
+    # yourself, so `list` shows `global` in PROFILE instead of the parked name.
+    cmd_pause "$1" global
+    dim "  (rule and login kept. Route it again with:  claude-account switch $1 <profile>)"
     return 0
   fi
   local target; target=$(to_profile "$2") || exit $?
@@ -911,22 +930,42 @@ cmd_list(){
   printf '  %-40s %-12s %-7s %s\n' PATH PROFILE STATUS "SIGNED IN AS (plan | tier)"
   printf '  '; printf '─%.0s' $(seq 1 108); echo
   local any=0
-  while IFS=$'\t' read -r prefix name state _r; do
+  while IFS=$'\t' read -r prefix name state why; do
     case "$prefix" in ''|\#*) continue;; esac; [ -z "${name:-}" ] && continue
     any=1
     local pdir="$PROFILES/$name" st="no"      # must precede the paused branch:
     if [ "${state:-}" = "paused" ]; then      # it leaked the previous row's pdir
-      # PROFILE keeps naming the BINDING: the rule still points there and that is what
-      # `resume` comes back to. What must NOT be the parked profile is the IDENTITY —
-      # a paused path spends the GLOBAL account. Printing the parked profile's own
+      # Whichever way the row got parked, the IDENTITY shown is the GLOBAL account's,
+      # because that is what the path spends. Printing the parked profile's own
       # plan|tier under a "SIGNED IN AS" header read as though that account were still
       # being spent: after `switch every global` the row said "team | default_raven"
-      # while the path was in fact on the personal max plan. Name the binding, state
-      # plainly which account is in use, and show THAT account's identity.
+      # while the path was in fact on the personal max plan.
+      #
+      # Only the PROFILE column differs, and it follows what you asked for:
+      #   pause <x>          -> you parked a profile, so the column keeps naming it
+      #                         and the row reads "using global: ..."
+      #   switch <x> global  -> you named global, so the column says global and the
+      #                         binding moves to the aside — it is what resume restores
+      # The routing is identical in both; only the wording is not.
       local pid; pid=$(acct_identity "$pdir")
       local note="login kept"; [ "$pid" = "NOT LOGGED IN" ] && note="NOT signed in"
       load_global_identity
-      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell paused 7)" "using global: $CA_GLOBAL_ID   ($note)"; continue; fi
+      local col pre post
+      if [ "${why:-}" = "global" ]; then
+        col="global"; pre=""; post="(parked: '$name' — $note)"
+      else
+        col="$name";  pre="using global:"; post="($note)"
+      fi
+      # Dim the connective words so the ACCOUNT is what the eye lands on — that is the
+      # payload of this column. "(login kept)" is an aside and dims too; "NOT signed in"
+      # is a warning and goes red. Safe to colour here: this is the last column, so no
+      # %-Ns padding is counting these escape bytes.
+      if _use_colour; then
+        [ -n "$pre" ] && pre=$'\033[2m'"$pre"$'\033[0m'
+        if [ "$note" = "login kept" ]; then post=$'\033[2m'"$post"$'\033[0m'
+        else post=$'\033[31m'"$post"$'\033[0m'; fi
+      fi
+      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$col" "$(status_cell paused 7)" "${pre:+$pre }$CA_GLOBAL_ID   $post"; continue; fi
     [ -d "$pdir" ] || st="no profile dir"
     st=$(acct_identity "$pdir"); lbl=$(profile_label "$pdir"); [ -n "$lbl" ] && st="$lbl  ·  $st"
     printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell active 7)" "$st"
@@ -1206,7 +1245,10 @@ case "${1:-list}" in
   remove|rm) shift; cmd_remove "$@" ;;
   login)  shift; cmd_login "$@" ;;
   forget) shift; cmd_forget "$@" ;;
-  -h|--help|help) cat <<USAGE
+  # QUOTED delimiter. Unquoted, bash expands $ and backticks inside the help text —
+  # a backtick added to one line ran as a command and printed "global: command not
+  # found" before the usage. The text is static; nothing here should ever expand.
+  -h|--help|help) cat <<'USAGE'
 claude-account — route Claude subscriptions per project path
 
 INSPECT
@@ -1244,7 +1286,8 @@ PAUSE / RESUME                         paused = that path falls back to the glob
   claude-account resume <path>         resume only that one path
   claude-account switch <name> <to>    move EVERY path from one profile to another
   claude-account switch <path> <to>    move just that path (both un-pause it)
-  claude-account switch <x> global     stop routing it — same as pause
+  claude-account switch <x> global     stop routing it — same routing as pause, but
+                                       list then shows PROFILE as global
 
 GLOBAL ACCOUNT                         the one used by every unrouted path
                                        "global" works as a target of the normal verbs
