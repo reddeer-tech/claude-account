@@ -12,7 +12,7 @@ PATH RULES — what each project path does  (one row per rule)
 
   PATH                  PROFILE    STATUS  SIGNED IN AS (plan | tier)
   /project/path         work       ACTIVE  you@company.com · team
-  /another/project      personal   PAUSED  using global — login kept: …
+  /another/project      global     PAUSED  you@personal.com · max   (parked: 'personal' — login kept)
 ```
 
 ## Install

@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.6"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.7"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -842,6 +842,19 @@ refresh_expired_all(){
   fi
 }
 
+# The GLOBAL account's identity, resolved at most once per run. Both the profiles
+# footer and every PAUSED row in `list` need it, and it cannot change mid-command.
+# Sets a variable rather than printing one: called inside $( ) the assignment would
+# happen in a subshell and the memo would never stick. cmd_list's loop reads from a
+# redirect, not a pipe, so the value survives across rows.
+CA_GLOBAL_ID=""
+load_global_identity(){
+  [ -n "$CA_GLOBAL_ID" ] && return 0
+  CA_GLOBAL_ID=$(acct_identity "")
+  local l; l=$(head -1 "$PROFILES/.global-account" 2>/dev/null)
+  [ -n "$l" ] && CA_GLOBAL_ID="$l  ·  $CA_GLOBAL_ID"
+}
+
 cmd_profiles(){
   case " $* " in *" --no-refresh "*) CA_NO_REFRESH=1 ;; esac
   refresh_expired_all
@@ -868,10 +881,8 @@ cmd_profiles(){
   done
   [ "$any" = 0 ] && dim "  (no profiles yet)"
   echo
-  local gid; gid=$(acct_identity "")
-  local glbl; glbl=$(cat "$PROFILES/.global-account" 2>/dev/null | head -1)
-  [ -n "$glbl" ] && gid="$glbl  ·  $gid"
-  printf '  %-13s %-52s %s\n' "(global)" "$gid" "every path with no rule"
+  load_global_identity
+  printf '  %-13s %-52s %s\n' "(global)" "$CA_GLOBAL_ID" "every path with no rule"
   echo
   dim "  The email is RECORDED AT LOGIN (from ~/.claude.json, which reflects the most"
   dim "  recent sign-in) — the token itself carries no identity. Set one by hand with:"
@@ -890,10 +901,17 @@ cmd_list(){
     any=1
     local pdir="$PROFILES/$name" st="no"      # must precede the paused branch:
     if [ "${state:-}" = "paused" ]; then      # it leaked the previous row's pdir
-      local plbl; plbl=$(profile_label "$pdir"); [ -n "$plbl" ] && plbl="$plbl · "
+      # PAUSED means this path uses the GLOBAL account — so PROFILE must say so, and
+      # the identity shown must be global's. Printing the parked profile's name and
+      # its plan|tier here read as though that account were still in use: after
+      # `switch every global` the row still said "every  ...  team | default_raven"
+      # while the path was in fact spending the personal max plan. Every row's last
+      # column is now the account that path ACTUALLY uses. The binding is kept, so
+      # the parked profile is named as an aside — that is what resume comes back to.
       local pid; pid=$(acct_identity "$pdir")
-      local note="login kept"; [ "$pid" = "NOT LOGGED IN" ] && note="not signed in"
-      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell paused 7)" "using global — ${note}: ${plbl}${pid}"; continue; fi
+      local note="login kept"; [ "$pid" = "NOT LOGGED IN" ] && note="NOT signed in"
+      load_global_identity
+      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "global" "$(status_cell paused 7)" "$CA_GLOBAL_ID   (parked: '$name' — $note)"; continue; fi
     [ -d "$pdir" ] || st="no profile dir"
     st=$(acct_identity "$pdir"); lbl=$(profile_label "$pdir"); [ -n "$lbl" ] && st="$lbl  ·  $st"
     printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell active 7)" "$st"
