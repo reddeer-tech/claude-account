@@ -12,3 +12,4 @@ dist/
 Makefile
 RELEASING.md
 Formula/
+ansible/
