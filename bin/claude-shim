@@ -35,7 +35,6 @@ if [ -x "$RESOLVE" ]; then
   if [ -n "$line" ]; then
     pdir=$(printf '%s' "$line" | cut -f2)
     mkdir -p "$pdir" 2>/dev/null
-    if [ -e "$pdir/.login-attempted" ]; then :; fi
     # A routed profile with no credential would fail with "Not logged in". Fall back
     # to the global account instead, but say so LOUDLY — silence here would mean a
     # client's work quietly billed to the personal plan (or the reverse).

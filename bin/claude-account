@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.7"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.8"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -144,11 +144,22 @@ norm(){ local p="$1"; case "$p" in "~"*) p="$HOME${p#\~}";; esac
 # pause/resume: keep the rule AND the login, but stop routing so the path falls
 # back to the global account. Nothing is deleted, so resume needs no re-auth.
 set_state(){ # <path> <state|"">
-  local tmp; tmp=$(mktemp)
+  local tmp before
+  before=$(grep -v '^#' "$MAP" 2>/dev/null | grep -c . || true)
+  tmp=$(mktemp)
   awk -F'\t' -v OFS='\t' -v t="$1" -v st="$2" '
     /^[ \t]*#/ || NF==0 { print; next }
     $1==t { if (st=="") print $1,$2; else print $1,$2,st; next }
-    { print }' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
+    { print }' "$MAP" > "$tmp" && write_map "$tmp" "$before"
+}
+
+# `add` and `import` append with >>. If the map does not end in a newline — after a
+# hand edit, or a restored backup — the appended rule is glued onto the last one and
+# BOTH are lost. Impossible to debug after the fact; cheap to guarantee before it.
+ensure_final_newline(){
+  [ -s "$1" ] || return 0
+  [ "$(tail -c1 "$1" | wc -l)" -eq 0 ] && printf '\n' >> "$1"
+  return 0
 }
 
 # Every path a path-or-name argument refers to, one per line.
@@ -422,6 +433,7 @@ cmd_import(){
         if awk -F'\t' -v p="$a" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
           skipped=$((skipped+1)); continue; fi
         mkdir -p "$PROFILES/$b"
+        ensure_final_newline "$MAP"
         if [ "${c:-active}" = "paused" ]; then printf '%s\t%s\tpaused\n' "$a" "$b" >> "$MAP"
         else printf '%s\t%s\n' "$a" "$b" >> "$MAP"; fi
         rules=$((rules+1)) ;;
@@ -606,13 +618,15 @@ cmd_switch(){
 
   local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
   local tmp; tmp=$(mktemp)
-  # Paths come in as ARGV, not stdin: the heredoc already owns stdin, and using
-  # both silently fed the path list to python as its program.
+  # Paths go in a FILE, never argv or stdin: the heredoc already owns stdin (using
+  # both silently fed the path list to python as its program and emptied the map),
+  # and unquoted argv would split a path containing a space — there are several here.
   # Repointing also clears any paused state — switching means "use this account now".
-  python3 - "$MAP" "$target" "$tmp" $hits <<'SWPY'
+  local plist; plist=$(mktemp); printf '%s\n' "$hits" > "$plist"
+  python3 - "$MAP" "$target" "$tmp" "$plist" <<'SWPY'
 import sys
-m,target,tmp=sys.argv[1],sys.argv[2],sys.argv[3]
-paths=set(sys.argv[4:])
+m,target,tmp,plist=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
+paths={l.rstrip("\n") for l in open(plist) if l.strip()}
 lines=open(m).readlines()                      # READ FIRST — open(...,"w") truncates
 out=[]
 for l in lines:
@@ -620,6 +634,7 @@ for l in lines:
     out.append(f"{f[0]}\t{target}\n" if len(f)>=2 and f[0] in paths else l)
 open(tmp,"w").writelines(out)
 SWPY
+  rm -f "$plist"
   write_map "$tmp" "$before" || exit 1
 
   local n; n=$(printf '%s' "$hits" | grep -c .)
@@ -901,17 +916,17 @@ cmd_list(){
     any=1
     local pdir="$PROFILES/$name" st="no"      # must precede the paused branch:
     if [ "${state:-}" = "paused" ]; then      # it leaked the previous row's pdir
-      # PAUSED means this path uses the GLOBAL account — so PROFILE must say so, and
-      # the identity shown must be global's. Printing the parked profile's name and
-      # its plan|tier here read as though that account were still in use: after
-      # `switch every global` the row still said "every  ...  team | default_raven"
-      # while the path was in fact spending the personal max plan. Every row's last
-      # column is now the account that path ACTUALLY uses. The binding is kept, so
-      # the parked profile is named as an aside — that is what resume comes back to.
+      # PROFILE keeps naming the BINDING: the rule still points there and that is what
+      # `resume` comes back to. What must NOT be the parked profile is the IDENTITY —
+      # a paused path spends the GLOBAL account. Printing the parked profile's own
+      # plan|tier under a "SIGNED IN AS" header read as though that account were still
+      # being spent: after `switch every global` the row said "team | default_raven"
+      # while the path was in fact on the personal max plan. Name the binding, state
+      # plainly which account is in use, and show THAT account's identity.
       local pid; pid=$(acct_identity "$pdir")
       local note="login kept"; [ "$pid" = "NOT LOGGED IN" ] && note="NOT signed in"
       load_global_identity
-      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "global" "$(status_cell paused 7)" "$CA_GLOBAL_ID   (parked: '$name' — $note)"; continue; fi
+      printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell paused 7)" "using global: $CA_GLOBAL_ID   ($note)"; continue; fi
     [ -d "$pdir" ] || st="no profile dir"
     st=$(acct_identity "$pdir"); lbl=$(profile_label "$pdir"); [ -n "$lbl" ] && st="$lbl  ·  $st"
     printf '  %-40s %-12s %s %s\n' "${prefix/#$HOME/~}" "$name" "$(status_cell active 7)" "$st"
@@ -975,6 +990,7 @@ cmd_add(){
   [ -n "$cur" ] && yel "note: '$path' currently inherits profile '$cur' from a parent rule; this adds a more specific one."
   backup "add-$name"
   mkdir -p "$PROFILES/$name"
+  ensure_final_newline "$MAP"
   printf '%s\t%s\n' "$path" "$name" >> "$MAP"
   grn "Added: $path  ->  profile '$name'"
   echo
@@ -1015,30 +1031,42 @@ cmd_remove(){
             exit 1
        elif [ "$cnt" -gt 1 ]; then
             backup "remove-all-$path"
-            local n=0
-            while IFS= read -r pth; do [ -z "$pth" ] && continue
-              python3 - "$MAP" "$pth" <<'RMPY'
+            local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
+            # Paths go in a FILE, never argv or stdin: the heredoc already owns stdin
+            # (a second redirect once fed python the path list as its program and
+            # emptied the map), and unquoted argv would split a path with a space.
+            local plist; plist=$(mktemp); printf '%s\n' "$hits" > "$plist"
+            local tmp; tmp=$(mktemp)
+            python3 - "$MAP" "$tmp" "$plist" <<'RMPY'
 import sys
-m,p=sys.argv[1],sys.argv[2]
-lines=open(m).readlines()                      # READ FIRST — open(m,"w") truncates
-open(m,'w').writelines([l for l in lines if l.rstrip('\n').split('\t')[0]!=p])
+m,tmp,plist=sys.argv[1],sys.argv[2],sys.argv[3]
+drop={l.rstrip("\n") for l in open(plist) if l.strip()}
+lines=open(m).readlines()                      # READ FIRST — open(...,"w") truncates
+open(tmp,"w").writelines([l for l in lines if l.rstrip("\n").split("\t")[0] not in drop])
 RMPY
-              n=$((n+1)); echo "  removed  ${pth/#$HOME/~}"
-            done <<< "$hits"
-            grn "Removed $n rule(s) — those paths use your GLOBAL account again."
+            rm -f "$plist"
+            write_map "$tmp" "$((before-cnt))" || exit 1
+            printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/  removed  /'
+            grn "Removed $cnt rule(s) — those paths use your GLOBAL account again."
             dim "The profile and its login are kept. Delete them with: claude-account forget $path"
             return 0
        else path="$hits"; fi ;;
   esac
   awk -F'\t' -v p="$path" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null || { yel "no rule for: $path"; exit 1; }
-  local name; name=$(awk -v p="$path" '$1==p{print $2}' "$MAP" | head -1)
+  # -F'\t' matters: without it a path containing a space (this machine has several)
+  # matches on its first word only, so $name came back empty and the messages below
+  # named the wrong profile dir. Last survivor of the tab migration.
+  local name; name=$(awk -F'\t' -v p="$path" '$1==p{print $2}' "$MAP" | head -1)
   backup "remove-$name"
-  python3 - "$MAP" "$path" <<'PY'
+  local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
+  local tmp; tmp=$(mktemp)
+  python3 - "$MAP" "$path" "$tmp" <<'PY'
 import sys
-m,p=sys.argv[1],sys.argv[2]
-out=[l for l in open(m) if not (l.rstrip('\n').split('\t')[0]==p)]
-open(m,'w').writelines(out)
+m,p,tmp=sys.argv[1],sys.argv[2],sys.argv[3]
+lines=open(m).readlines()                      # READ FIRST — open(...,"w") truncates
+open(tmp,'w').writelines([l for l in lines if l.rstrip('\n').split('\t')[0]!=p])
 PY
+  write_map "$tmp" "$((before-1))" || exit 1
   grn "Removed: $path  ->  now uses your GLOBAL account again."
   dim "Profile dir kept at $PROFILES/$name (its login still works if you re-add it)."
   dim "To forget the login too:  claude-account forget $name"
@@ -1099,15 +1127,19 @@ cmd_forget(){
       backup "forget-force-$name"
       yel "Removing $(printf '%s' "$still" | grep -c .) rule(s) as well (--force):"
       printf '%s\n' "$still" | sed "s|$HOME|~|"
-      python3 - "$MAP" "$name" <<'FGPY'
+      local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
+      local nrm; nrm=$(printf '%s' "$still" | grep -c .)
+      local tmp; tmp=$(mktemp)
+      python3 - "$MAP" "$name" "$tmp" <<'FGPY'
 import sys
-m,n=sys.argv[1],sys.argv[2]
+m,n,tmp=sys.argv[1],sys.argv[2],sys.argv[3]
 def keep(l):
     f=l.rstrip('\n').split('\t')
     return not (len(f)>=2 and f[1]==n)
-lines=open(m).readlines()                      # READ FIRST — open(m,"w") truncates
-open(m,'w').writelines([l for l in lines if keep(l)])
+lines=open(m).readlines()                      # READ FIRST — open(...,"w") truncates
+open(tmp,'w').writelines([l for l in lines if keep(l)])
 FGPY
+      write_map "$tmp" "$((before-nrm))" || exit 1
     else
       yel "Paths still route to '$name':"; printf '%s\n' "$still" | sed "s|$HOME|~|"
       red "Remove them first, or cascade:"
@@ -1148,12 +1180,16 @@ main(){
     esac
   fi
 case "${1:-list}" in
-  list|ls|-l|--list) shift || true; cmd_list "${1:-}" ;;
-  profiles|logins)   cmd_profiles ;;
+  list|ls|-l|--list) shift || true; cmd_list "$@" ;;
+  # ⚠️ FORWARD "$@". These arms used to call the function with no arguments, so the
+  # `case " $* "` --no-refresh guard inside each one saw an empty $* and the flag was
+  # silently swallowed — `verify --no-refresh` still fired a real `claude -p hi` per
+  # expired profile, spending quota on the very accounts you paused for being spent.
+  profiles|logins)   shift; cmd_profiles "$@" ;;
   label)  shift; cmd_label "$@" ;;
-  verify) cmd_verify ;;
+  verify) shift; cmd_verify "$@" ;;
   --version|-V|version) echo "claude-account $CA_VERSION" ;;
-  doctor) cmd_doctor ;;
+  doctor) shift; cmd_doctor "$@" ;;
   setup)  cmd_setup ;;
   rename) shift; cmd_rename "$@" ;;
   export) cmd_export ;;
@@ -1182,7 +1218,7 @@ INSPECT
   claude-account doctor                health check: plumbing, rules, logins, keychain
   claude-account --version             print the installed version
 
-  --no-refresh on list/profiles skips renewing expired tokens (offline / faster)
+  --no-refresh on list/profiles/verify/doctor skips renewing expired tokens
   claude-account setup                 wire up PATH + VS Code after a package install
   claude-account refresh [name|--all]  renew expired access tokens (default: all)
   claude-account usage [name|path]     live quota: session, weekly, resets (omit = global)

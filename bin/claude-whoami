@@ -27,11 +27,19 @@ else
   echo "matched rule  : $pre"
   echo "account       : $name"
   echo "profile dir   : $pdir"
-  # Do NOT guess the Keychain entry name. A credentials-only profile writes no
-  # files, and the service-name hash format is an implementation detail — a wrong
-  # guess would make this diagnostic lie, which is worse than saying nothing.
-  echo "login         : not checked here — run  claude-account list --probe  to verify for real"
-  echo "                (if Claude says \"Not logged in\", run: claude-account login $name)"
+  # The SAME live Keychain check the shim makes at launch, so this reports what will
+  # actually happen rather than only which rule matched. Printing "account: every"
+  # when 'every' has no credential is a lie: that session falls back to global and
+  # spends the wrong plan. (--probe, which this used to recommend, no longer exists.)
+  # This check is duplicated in claude-shim and claude-vscode-wrapper — keep the three
+  # in step, or lift it into resolve.sh.
+  svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
+  if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+    echo "login         : signed in"
+  else
+    echo "login         : NOT signed in — this folder falls back to your GLOBAL account"
+    echo "                run:  claude-account login $name   (or: claude-account pause $name)"
+  fi
 fi
 echo "shared        : plugins, MCP servers, memory, settings, hooks, history (from ~/.claude)"
 echo "terminal claude resolves to: $(command -v claude)"
