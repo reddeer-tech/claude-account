@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.1"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.2"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -449,6 +449,18 @@ cmd_setup(){
   elif [ "$srcdir" = "$bindir" ]; then
     dim "Shims already in place ($bindir) — nothing to link."
   else
+    # ⚠️ NEVER overwrite a claude we did not put there. This used to clobber it silently, so
+    # anyone keeping the real Claude Code binary in ~/bin lost it with no backup. Shadowing is
+    # done by winning PATH ORDER from a different directory — never by writing over the binary.
+    if [ -e "$bindir/claude" ] && ! grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null; then
+      red "$bindir/claude already exists and is not our shim — refusing to overwrite it." >&2
+      echo "  That looks like a real claude binary. The shim has to sit EARLIER on PATH than" >&2
+      echo "  it, in its own directory — putting it on top would destroy the binary." >&2
+      echo >&2
+      echo "      BINDIR=\"\$HOME/.local/bin\" claude-account setup" >&2
+      echo "      # then ensure that dir precedes $bindir in your shell profile" >&2
+      return 1
+    fi
     install -m 0755 "$srcdir/claude-shim"           "$bindir/claude"
     install -m 0755 "$srcdir/claude-vscode-wrapper" "$bindir/claude-vscode-wrapper"
     grn "Linked the routing shims into $bindir."
