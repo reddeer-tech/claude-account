@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.13"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.14"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -94,7 +94,7 @@ cmd_verify(){
   printf '  %-46s %s\n' "PATH" "PLAN | RATE-LIMIT TIER (from the token)"
   printf '  '; printf '─%.0s' $(seq 1 108); echo
   local any=0
-  while IFS=$'\t' read -r prefix name state why; do
+  while IFS=$'\t' read -r prefix name state why || [ -n "${prefix:-}" ]; do
     case "$prefix" in ''|\#*) continue;; esac; [ -z "${name:-}" ] && continue
     any=1
     if [ "${state:-}" = "paused" ]; then
@@ -133,7 +133,7 @@ to_profile(){ # <arg> -> profile name on stdout, or fails with a listing
   a=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
   if ! printf '%s' "$a" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$'; then
     red "not a valid profile name or path: $a" >&2; return 2; fi
-  if awk -F'\t' -v n="$a" '$2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null || [ -d "$PROFILES/$a" ]; then
+  if awk -F'\t' -v n="$a" '$1 !~ /^[ \t]*#/ && $2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null || [ -d "$PROFILES/$a" ]; then
     printf '%s\n' "$a"; return 0; fi
   red "unknown profile: $a" >&2
   echo "known profiles:" >&2; { awk -F'\t' '$1!~/^#/&&NF>=2{print "  "$2}' "$MAP" 2>/dev/null; ls "$PROFILES" 2>/dev/null | sed 's/^/  /'; } | sort -u >&2
@@ -148,6 +148,24 @@ to_profile(){ # <arg> -> profile name on stdout, or fails with a listing
 # the word. It then finds no credential, falls back to the real global, and warns on
 # every launch — the right destination reached by the wrong mechanism, which is exactly
 # the kind of quiet wrongness this tool exists to prevent. Refuse the name outright.
+# If a profile directory or rule named `global` exists — only reachable from a version
+# before 1.0.12, or from `import` — then every verb that special-cases the word is
+# ambiguous, and the destructive reading is the one that fires. MEASURED: with such a
+# profile present, `claude-account logout global` ran `claude auth logout` with
+# CLAUDE_SECURESTORAGE_CONFIG_DIR UNSET — deleting the REAL global credential — while the
+# profile it was aimed at kept its login and stayed listed. Refuse rather than guess.
+global_ambiguous(){ # <verb>
+  [ -d "$PROFILES/global" ] || awk -F'\t' '$1 !~ /^[ \t]*#/ && $2=="global"{f=1} END{exit !f}' "$MAP" 2>/dev/null || return 0
+  red "'global' is ambiguous here: a PROFILE named 'global' exists on this machine." >&2
+  dim "  It is not your global account — it is an ordinary profile that shares the word," >&2
+  dim "  and acting on the wrong one would sign you out of the account you did not mean." >&2
+  echo >&2
+  echo "      claude-account rename global <newname>     # recommended — removes the clash" >&2
+  echo "      claude-account global ${1:-status}                    # act on the GLOBAL account" >&2
+  echo "      claude-account ${1:-status} <path>                    # act on the PROFILE, by one of its paths" >&2
+  return 1
+}
+
 reserved_global(){ # <name> <verb>
   [ "$1" = "global" ] || return 0
   red "'global' cannot be a profile name — it means the ABSENCE of routing, not an account." >&2
@@ -206,7 +224,7 @@ paths_for(){ # <path|name>
     /*|~*|./*|../*) local p; p=$(norm "$a") || p="${a%/}"
       awk -F'\t' -v t="$p" '$1==t{print $1}' "$MAP" 2>/dev/null ;;
     *) local n; n=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
-      awk -F'\t' -v n="$n" '$2==n{print $1}' "$MAP" 2>/dev/null ;;
+      awk -F'\t' -v n="$n" '$1 !~ /^[ \t]*#/ && $2==n{print $1}' "$MAP" 2>/dev/null ;;
   esac
 }
 
@@ -216,11 +234,20 @@ cmd_pause(){ # <path|name> [why]
   [ -z "$hits" ] && { red "no rule matches: $1"; dim "  see:  claude-account list"; exit 1; }
   backup "pause"
   local why="${2:-}"
-  local n=0
+  local n=0 verb="paused"; [ "$why" = "global" ] && verb="moved "
   while IFS= read -r pth; do [ -z "$pth" ] && continue
-    set_state "$pth" paused "$why"; n=$((n+1)); echo "  paused   $pth"; done <<< "$hits"
-  grn "Paused $n path(s) — they now use your GLOBAL account."
-  dim "Profile and login untouched. Re-enable with:  claude-account resume $1"
+    set_state "$pth" paused "$why"; n=$((n+1)); echo "  $verb   $pth"; done <<< "$hits"
+  # The headline must match what `list` will say seconds later. Reusing pause's wording
+  # for `switch <x> global` announced "Paused" and then listed the row as ACTIVE on
+  # (global) — two of this tool's own surfaces disagreeing about the same command.
+  if [ "$why" = "global" ]; then
+    grn "Moved $n path(s) to your GLOBAL account."
+    dim "Profile and login untouched — the rule still points at it, so the path stays"
+    dim "listed under that profile. Undo with:  claude-account resume $1"
+  else
+    grn "Paused $n path(s) — they now use your GLOBAL account."
+    dim "Profile and login untouched. Re-enable with:  claude-account resume $1"
+  fi
 }
 
 cmd_resume(){
@@ -284,6 +311,7 @@ profile_label(){ # <profile-dir> -> recorded email, or empty
 cmd_label(){
   [ -z "${1:-}" ] && { red "usage: claude-account label <profile|path|global> [email]  (omit email to clear)"; exit 2; }
   if [ "$1" = "global" ]; then
+    global_ambiguous label || exit 1
     mkdir -p "$PROFILES"
     if [ -z "${2:-}" ]; then rm -f "$PROFILES/.global-account"; grn "Cleared the recorded global account."
     else shift; printf '%s\n' "$*" > "$PROFILES/.global-account"; grn "Recorded the global account as: $*"; fi
@@ -361,16 +389,19 @@ status_cell(){ # <state> <width>   — list's STATUS column: active | paused
 # "[ON GLOBAL]" on the `every` row read as "the profile every is on global", which is
 # never what happened. The profile is untouched — signed in, own quota — and only its
 # path stopped routing to it. Say where the PATH goes.
+# The column header is "PATHS BOUND TO IT", not "used by", because a parked path is
+# still bound here and is NOT using it. Saying "→ global (switched)" on the profile's own
+# row read as though the PROFILE had moved; it never does. Only the path stops routing.
 usedby_cell(){ # <state>   active | paused | global
   local why
   case "${1:-}" in
     paused) why="paused" ;;
     global) why="switched" ;;
-    *)      if _use_colour; then printf '\033[32mACTIVE\033[0m'; else printf 'ACTIVE'; fi; return ;;
+    *)      if _use_colour; then printf '\033[32min use\033[0m'; else printf 'in use'; fi; return ;;
   esac
-  # orange for "not routing to this profile", but the tag itself keeps the global colour
-  if _use_colour; then printf '\033[38;5;208m→ %s%s\033[38;5;208m · %s%s' "$CA_OFF" "$(gtag)" "$why" "$CA_OFF"
-  else printf '→ %s · %s' "$CA_GTAG" "$why"; fi
+  # orange for "bound but not routing", with the tag keeping the global colour
+  if _use_colour; then printf '\033[38;5;208mnot in use → %s%s\033[38;5;208m · %s%s' "$CA_OFF" "$(gtag)" "$why" "$CA_OFF"
+  else printf 'not in use → %s · %s' "$CA_GTAG" "$why"; fi
 }
 
 # Usage for one credential store. Calls Anthropic's own /api/oauth/usage with that
@@ -498,7 +529,7 @@ cmd_export(){
   echo "# generated $(date '+%Y-%m-%d %H:%M:%S')  host $(hostname -s)"
   echo "# restore with:  claude-account import <file>"
   echo "# NOTE: logins are NOT included — run 'claude-account login <name>' for each."
-  while IFS=$'\t' read -r pth nm st why; do
+  while IFS=$'\t' read -r pth nm st why || [ -n "${pth:-}" ]; do
     case "$pth" in ''|\#*) continue;; esac; [ -z "${nm:-}" ] && continue
     printf 'rule\t%s\t%s\t%s\t%s\n' "$pth" "$nm" "${st:-active}" "${why:-}"
   done < "$MAP"
@@ -514,23 +545,37 @@ cmd_import(){
   [ -z "$f" ] && { red "usage: claude-account import <file>"; exit 2; }
   [ -f "$f" ] || { red "no such file: $f"; exit 2; }
   backup "import"
-  local rules=0 labels=0 skipped=0
+  local rules=0 labels=0 skipped=0 rejected=0
   while IFS=$'\t' read -r kind a b c d; do
     case "$kind" in
       rule)
         if awk -F'\t' -v p="$a" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
           skipped=$((skipped+1)); continue; fi
+        # ⚠️ VALIDATE. import used to accept ANY profile name straight from the file and
+        # `mkdir -p` it, so it re-created exactly what `add` and `rename` refuse — including
+        # a profile called `global`, and `a/b` as a nested directory. The migration path
+        # cannot be the hole in the guard the interactive commands enforce.
+        if ! printf '%s' "$b" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$'; then
+          yel "  rejected: invalid profile name '$b' (from $a)"; rejected=$((rejected+1)); continue; fi
+        if [ "$b" = "global" ]; then
+          yel "  rejected: '$a' names the reserved profile 'global'"
+          dim "    a path with no rule already uses your global account — import nothing for it"
+          rejected=$((rejected+1)); continue; fi
         mkdir -p "$PROFILES/$b"
         ensure_final_newline "$MAP"
         if [ "${c:-active}" = "paused" ] && [ -n "${d:-}" ]; then printf '%s\t%s\tpaused\t%s\n' "$a" "$b" "$d" >> "$MAP"
         elif [ "${c:-active}" = "paused" ]; then printf '%s\t%s\tpaused\n' "$a" "$b" >> "$MAP"
         else printf '%s\t%s\n' "$a" "$b" >> "$MAP"; fi
         rules=$((rules+1)) ;;
-      label) mkdir -p "$PROFILES/$a"; printf '%s\n' "$b" > "$PROFILES/$a/.account"; labels=$((labels+1)) ;;
+      label)
+        printf '%s' "$a" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$' || { yel "  skipped label: invalid profile name '$a'"; continue; }
+        [ "$a" = "global" ] && { yel "  skipped label: 'global' is reserved"; continue; }
+        mkdir -p "$PROFILES/$a"; printf '%s\n' "$b" > "$PROFILES/$a/.account"; labels=$((labels+1)) ;;
     esac
   done < "$f"
   grn "Imported $rules rule(s) and $labels label(s)."
-  [ "$skipped" -gt 0 ] && dim "Skipped $skipped path(s) that already had a rule."
+  [ "$skipped" -gt 0 ]  && dim "Skipped $skipped path(s) that already had a rule."
+  [ "$rejected" -gt 0 ] && yel "Rejected $rejected row(s) — see the reasons above."
   dim "Credentials are not importable — sign in on this machine:"
   claude-account profiles 2>/dev/null | awk '/NOT LOGGED IN/{print "    claude-account login "$1}'
 }
@@ -641,7 +686,7 @@ cmd_doctor(){
   echo; echo "rules"
   local nrules; nrules=$(grep -v '^#' "$MAP" 2>/dev/null | grep -c . || true)
   ok_ "$nrules rule(s) in paths.map"
-  while IFS=$'\t' read -r pth nm st _r; do
+  while IFS=$'\t' read -r pth nm st _r || [ -n "${pth:-}" ]; do
     case "$pth" in ''|\#*) continue;; esac; [ -z "${nm:-}" ] && continue
     [ -d "$pth" ] || wrn "path no longer exists on disk: ${pth/#$HOME/~}"
     [ -d "$PROFILES/$nm" ] || wrn "rule points at a profile with no directory: $nm"
@@ -652,7 +697,7 @@ cmd_doctor(){
     [ -d "$d" ] || continue
     local nm; nm=$(basename "$d")
     local svc="Claude Code-credentials-$(printf '%s' "${d%/}" | shasum -a 256 | cut -c1-8)"
-    local used; used=$(awk -F'\t' -v n="$nm" '$2==n{c++} END{print c+0}' "$MAP" 2>/dev/null)
+    local used; used=$(awk -F'\t' -v n="$nm" '$1 !~ /^[ \t]*#/ && $2==n{c++} END{print c+0}' "$MAP" 2>/dev/null)
     local id; id=$(acct_identity "${d%/}")
     if [ "$id" = "NOT LOGGED IN" ]; then
       if [ "$used" -gt 0 ]; then wrn "$nm: $used rule(s) but NOT signed in — those paths use global + warn"
@@ -748,7 +793,7 @@ SWPY
 cmd_logout(){
   # "logout global" reads the same way as every other verb-first command;
   # "global logout" still works. Keep both.
-  if [ "${1:-}" = "global" ]; then cmd_global logout; return $?; fi
+  if [ "${1:-}" = "global" ]; then global_ambiguous logout || exit 1; cmd_global logout; return $?; fi
   [ -z "${1:-}" ] && { red "usage: claude-account logout <name|path> [--keep-active]"; exit 2; }
   local name; name=$(to_profile "$1") || exit $?
   local pdir="$PROFILES/$name" keep=0
@@ -819,7 +864,7 @@ cmd_refresh(){
   local targets=""
   case "${1:-}" in
     ""|--all) targets="global $(ls "$PROFILES" 2>/dev/null)" ;;
-    global)   targets="global" ;;
+    global)   global_ambiguous refresh || exit 1; targets="global" ;;
     *)        targets=$(to_profile "$1") || exit $? ;;
   esac
   local did=0
@@ -851,6 +896,7 @@ cmd_usage(){
     return 0
   fi
   local name pdir label
+  if [ "${1:-}" = "global" ]; then global_ambiguous usage || exit 1; fi
   if [ -z "${1:-}" ] || [ "$1" = "global" ]; then
     name="$CA_GTAG"; pdir=""
   else
@@ -971,7 +1017,7 @@ cmd_profiles(){
   case " $* " in *" --no-refresh "*) CA_NO_REFRESH=1 ;; esac
   refresh_expired_all
   echo "PROFILES — every stored login  (one row per credential, incl. unused ones)"; echo
-  printf '  %-13s %-52s %s\n' PROFILE "ACCOUNT (recorded at login) · plan | tier" "USED BY"
+  printf '  %-13s %-52s %s\n' PROFILE "ACCOUNT (recorded at login) · plan | tier" "PATHS BOUND TO IT"
   printf '  '; printf '─%.0s' $(seq 1 86); echo
   local any=0 nm
   for d in "$PROFILES"/*/; do
@@ -985,7 +1031,7 @@ cmd_profiles(){
         *) id="$lbl  ·  $id" ;;
       esac
     fi
-    local used; used=$(awk -F'\t' -v n="$nm" '$2==n{ print $1"\t"($4=="global"?"global":($3=="paused"?"paused":"active")) }' "$MAP" 2>/dev/null \
+    local used; used=$(awk -F'\t' -v n="$nm" '$1 !~ /^[ \t]*#/ && $2==n{ print $1"\t"($4=="global"?"global":($3=="paused"?"paused":"active")) }' "$MAP" 2>/dev/null \
         | while IFS=$'\t' read -r pp ss; do printf '%s  [%s]\n' "$pp" "$(usedby_cell "$ss")"; done)
     if [ -z "$used" ]; then used="— no path uses it (orphan)"; fi
     printf '  %-13s %-52s %s\n' "$nm" "$id" "$(printf '%s' "$used" | head -1 | sed "s|$HOME|~|")"
@@ -1008,7 +1054,7 @@ cmd_list(){
   printf '  %-40s %-12s %-7s %s\n' PATH PROFILE STATUS "SIGNED IN AS (plan | tier)"
   printf '  '; printf '─%.0s' $(seq 1 108); echo
   local any=0
-  while IFS=$'\t' read -r prefix name state why; do
+  while IFS=$'\t' read -r prefix name state why || [ -n "${prefix:-}" ]; do
     case "$prefix" in ''|\#*) continue;; esac; [ -z "${name:-}" ] && continue
     any=1
     local pdir="$PROFILES/$name" st="no"      # must precede the paused branch:
@@ -1087,7 +1133,9 @@ cmd_add(){
   # Two paths MAY share one profile (same client, two checkouts) — but only on
   # purpose. A DERIVED name that collides is almost always an accident: two folders
   # with the same basename would silently share one account and one quota.
-  local owners; owners=$(awk -F'\t' -v n="$name" '$2==n{print "  "$1}' "$MAP" 2>/dev/null)
+  # the shipped template's example lines are TAB separated too, so without this guard a
+  # fresh install refuses to add a folder whose derived name matches a commented example
+  local owners; owners=$(awk -F'\t' -v n="$name" '$1 !~ /^[ \t]*#/ && $2==n{print "  "$1}' "$MAP" 2>/dev/null)
   if [ -n "$owners" ]; then
     if [ "$derived" = 1 ]; then
       red "Profile name '$name' (derived from the folder) is already used by:"
@@ -1145,7 +1193,7 @@ cmd_remove(){
   case "$path" in
     /*|~*|./*|../*) path=$(norm "$path") || path="${1%/}" ;;
     *) # a profile name: resolve to its path(s)
-       local hits; hits=$(awk -F'\t' -v n="$path" '$2==n{print $1}' "$MAP" 2>/dev/null)
+       local hits; hits=$(awk -F'\t' -v n="$path" '$1 !~ /^[ \t]*#/ && $2==n{print $1}' "$MAP" 2>/dev/null)
        local cnt; cnt=$(printf '%s' "$hits" | grep -c .)
        if [ "$cnt" = 0 ]; then red "no rule for profile or path: $path"; exit 1
        elif [ "$cnt" -gt 1 ] && [ "${2:-}" != "--all" ]; then
@@ -1199,7 +1247,7 @@ PY
 cmd_login(){
   # "login global" reads the same way as every other verb-first command;
   # "global login" still works. Keep both.
-  if [ "${1:-}" = "global" ]; then cmd_global login; return $?; fi
+  if [ "${1:-}" = "global" ]; then global_ambiguous login || exit 1; cmd_global login; return $?; fi
   [ -z "${1:-}" ] && { red "usage: claude-account login <profile-name|project-path>"; exit 2; }
   local name; name=$(to_profile "$1") || exit $?
   local pdir="$PROFILES/$name"; mkdir -p "$pdir"
@@ -1323,7 +1371,7 @@ case "${1:-list}" in
   logout) shift; cmd_logout "$@" ;;
   switch) shift; cmd_switch "$@" ;;
   global) shift; cmd_global "$@" ;;
-  status) shift; if [ "${1:-global}" = "global" ]; then cmd_global status; else cmd_verify; fi ;;
+  status) shift; if [ "${1:-global}" = "global" ]; then global_ambiguous status || exit 1; cmd_global status; else cmd_verify; fi ;;
   pause)  shift; cmd_pause "$@" ;;
   resume) shift; cmd_resume "$@" ;;
   add)    shift; cmd_add "$@" ;;

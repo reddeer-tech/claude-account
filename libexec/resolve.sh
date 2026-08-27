@@ -10,7 +10,7 @@ case "$dir" in /*) ;; *) dir=$(cd "$dir" 2>/dev/null && pwd) || exit 0 ;; esac
 [ -f "$MAP" ] || exit 0
 best_len=0; best_name=""; best_prefix=""
 # TAB-separated so project paths may contain spaces ("Apps & Games").
-while IFS=$'\t' read -r prefix name state _rest; do
+while IFS=$'\t' read -r prefix name state _rest || [ -n "${prefix:-}" ]; do
   case "$prefix" in ''|\#*) continue ;; esac
   [ -z "$name" ] && continue
   # A third field of "paused" keeps the rule (and its login) but stops routing,
