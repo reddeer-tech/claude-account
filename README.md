@@ -45,14 +45,35 @@ claude-account setup
 ```
 
 **This step is not optional.** Until it runs, typing `claude` still starts the real binary and
-no rule you add has any effect. It links the routing shims, checks they win on your `PATH`, and
-prints the one line VS Code needs — VS Code launches its binary by absolute path, so a `PATH`
-shim alone never reaches it.
+no rule you add has any effect. It installs the routing shims and the resolver into directories
+you own (`~/bin`, `~/.config/claude-accounts`), checks the shim wins on your `PATH`, and prints
+the one line each editor needs — VS Code, Cursor, Windsurf and VSCodium all launch the Claude
+binary by absolute path, so a `PATH` shim alone never reaches them. It is the same extension in
+every one of them; only the `settings.json` it reads differs, and `setup` names each file.
 
-It only *reports* on `PATH` order and VS Code rather than changing them: both mean editing files
-you own — your shell profile, and a `settings.json` that is JSONC with comments.
+It only *reports* on `PATH` order and editor settings rather than changing them: both mean
+editing files you own — your shell profile, and a `settings.json` that is JSONC with comments.
 
 Then `claude-account doctor` verifies the result.
+
+### Updating
+
+```sh
+brew upgrade claude-account        # Homebrew
+npm update -g claude-account       # npm
+git pull && ./install.sh           # from source
+```
+
+then, whichever way you installed:
+
+```sh
+claude-account setup               # refreshes the shims and resolver in ~/bin and ~/.config
+claude-account doctor              # confirms every piece matches this version
+```
+
+`setup` is part of every update, not just the first install: the shims and the resolver live in
+directories you own, so a package upgrade cannot touch them. It changes nothing unless the
+shipped copies moved on, and `doctor` flags them whenever they are older than the CLI.
 
 ## Use
 

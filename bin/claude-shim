@@ -7,6 +7,14 @@
 # layout: bin/../libexec), then the per-user config dir. Keeps a from-source run,
 # a Homebrew install and an npm install all working from one file.
 _ca_self="${BASH_SOURCE[0]:-$0}"
+# Follow symlinks FIRST. Homebrew links /opt/homebrew/bin/claude-account -> ../Cellar/…/bin/,
+# and npm links into node_modules; dirname of the LINK is a directory with no libexec beside
+# it, so every candidate below missed and the lookup fell through to ~/.config — a file only
+# a source install creates. MEASURED: the brew build was running the ~/.config resolver.
+while [ -L "$_ca_self" ]; do
+  _t="$(readlink "$_ca_self")"
+  case "$_t" in /*) _ca_self="$_t" ;; *) _ca_self="$(dirname "$_ca_self")/$_t" ;; esac
+done
 _ca_dir="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)"
 for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
           "$_ca_dir/../libexec/resolve.sh" \

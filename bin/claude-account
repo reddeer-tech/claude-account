@@ -4,13 +4,21 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.21"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.22"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
 # layout: bin/../libexec), then the per-user config dir. Keeps a from-source run,
 # a Homebrew install and an npm install all working from one file.
 _ca_self="${BASH_SOURCE[0]:-$0}"
+# Follow symlinks FIRST. Homebrew links /opt/homebrew/bin/claude-account -> ../Cellar/…/bin/,
+# and npm links into node_modules; dirname of the LINK is a directory with no libexec beside
+# it, so every candidate below missed and the lookup fell through to ~/.config — a file only
+# a source install creates. MEASURED: the brew build was running the ~/.config resolver.
+while [ -L "$_ca_self" ]; do
+  _t="$(readlink "$_ca_self")"
+  case "$_t" in /*) _ca_self="$_t" ;; *) _ca_self="$(dirname "$_ca_self")/$_t" ;; esac
+done
 _ca_dir="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)"
 for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
           "$_ca_dir/../libexec/resolve.sh" \
@@ -673,6 +681,29 @@ cmd_import(){
   cmd_profiles --no-refresh 2>/dev/null | awk '/NOT LOGGED IN/{print "    claude-account login "$1}'
 }
 
+# The Claude Code extension is one extension that runs in every VS Code-family editor, and
+# `claudeCode.claudeProcessWrapper` is read from whichever editor's OWN settings.json — so a
+# Cursor user with the setting in VS Code's file is unrouted in Cursor. Enumerate the editors
+# present here. Prints  label ⇥ settings.json ⇥ extension-dir  for each one found (settings
+# dir or extensions dir present), so setup and doctor can speak about each by name.
+editors(){
+  local spec label sdir xdir
+  for spec in \
+    "VS Code|Code|.vscode" \
+    "VS Code Insiders|Code - Insiders|.vscode-insiders" \
+    "Cursor|Cursor|.cursor" \
+    "Windsurf|Windsurf|.windsurf" \
+    "VSCodium|VSCodium|.vscode-oss"; do
+    label="${spec%%|*}"; sdir="${spec#*|}"; sdir="${sdir%%|*}"; xdir="${spec##*|}"
+    local sp="$HOME/Library/Application Support/$sdir/User/settings.json" xp="$HOME/$xdir/extensions"
+    if [ -d "$HOME/Library/Application Support/$sdir" ] || [ -d "$xp" ]; then
+      printf '%s\t%s\t%s\n' "$label" "$sp" "$xp"
+    fi
+  done
+}
+# does that editor have the Claude Code extension installed?
+editor_has_claude(){ ls -d "$1"/anthropic.claude-code-* >/dev/null 2>&1; }
+
 cmd_setup(){
   # Opt-in wiring. A package install deliberately does NOT do this: linking `claude` ahead of the
   # real binary hijacks it for every caller, and npm/brew must never do that behind your back.
@@ -691,7 +722,41 @@ cmd_setup(){
   bindir="${BINDIR:-$HOME/bin}"
 
   mkdir -p "$bindir"
-  if [ ! -f "$srcdir/claude-shim" ]; then
+  # The package's shipped copies. Source/npm keep the shims beside this script; Homebrew
+  # parks them unlinked in libexec/shims (so a package install can never hijack `claude`).
+  local pkg_shim="" pkg_wrap="" pkg_res=""
+  for c in "$srcdir/claude-shim" "$srcdir/../libexec/shims/claude-shim"; do [ -f "$c" ] && { pkg_shim="$c"; break; }; done
+  for c in "$srcdir/claude-vscode-wrapper" "$srcdir/../libexec/shims/claude-vscode-wrapper"; do [ -f "$c" ] && { pkg_wrap="$c"; break; }; done
+  for c in "$srcdir/../libexec/resolve.sh" "$srcdir/../lib/claude-account/resolve.sh"; do [ -f "$c" ] && { pkg_res="$c"; break; }; done
+
+  # The RESOLVER the shims run. They live in $bindir with no libexec beside them, so they
+  # find it at ~/.config/claude-accounts/resolve.sh — which only a source install used to
+  # create. A Homebrew-only machine therefore had NO resolver the shims could reach: rules
+  # were accepted and completely inert. Install it here, and refresh it on every setup so a
+  # `brew upgrade` cannot leave an old resolver under a new CLI.
+  local cfg="$HOME/.config/claude-accounts"
+  mkdir -p "$cfg" "$cfg/profiles"
+  if [ -n "$pkg_res" ]; then
+    if [ ! -f "$cfg/resolve.sh" ]; then
+      install -m 0755 "$pkg_res" "$cfg/resolve.sh"; grn "Installed the resolver into $cfg."
+    elif ! cmp -s "$pkg_res" "$cfg/resolve.sh"; then
+      install -m 0755 "$pkg_res" "$cfg/resolve.sh"; grn "Updated the resolver in $cfg to this version."
+    fi
+  else
+    yel "cannot find the package's libexec/resolve.sh next to $srcdir — the resolver was not installed."
+  fi
+  [ -f "$cfg/paths.map" ] || { for c in "$srcdir/../templates/paths.map" "$srcdir/../share/claude-account/templates/paths.map"; do
+      [ -f "$c" ] && { install -m 0600 "$c" "$cfg/paths.map"; break; }; done; }
+
+  # Shims already deployed and OURS: refresh them if the package's copy moved on.
+  if grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null && [ -n "$pkg_shim" ]; then
+    local upd=0
+    cmp -s "$pkg_shim" "$bindir/claude" || { install -m 0755 "$pkg_shim" "$bindir/claude"; upd=1; }
+    [ -n "$pkg_wrap" ] && { cmp -s "$pkg_wrap" "$bindir/claude-vscode-wrapper" 2>/dev/null || { install -m 0755 "$pkg_wrap" "$bindir/claude-vscode-wrapper"; upd=1; }; }
+    [ "$upd" = 1 ] && grn "Updated the routing shims in $bindir to this version."
+  fi
+
+  if [ ! -f "$srcdir/claude-shim" ] && [ -z "$pkg_shim" ]; then
     # A source install deploys the shim under its FINAL name, so there is no claude-shim to
     # copy — that is a finished install, not a broken one. Only complain if neither exists.
     if grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null; then
@@ -703,6 +768,8 @@ cmd_setup(){
     fi
   elif [ "$srcdir" = "$bindir" ]; then
     dim "Shims already in place ($bindir) — nothing to link."
+  elif grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null; then
+    dim "Shims already deployed in $bindir (refreshed above if the package copy changed)."
   else
     # ⚠️ NEVER overwrite a claude we did not put there. This used to clobber it silently, so
     # anyone keeping the real Claude Code binary in ~/bin lost it with no backup. Shadowing is
@@ -716,8 +783,8 @@ cmd_setup(){
       echo "      # then ensure that dir precedes $bindir in your shell profile" >&2
       return 1
     fi
-    install -m 0755 "$srcdir/claude-shim"           "$bindir/claude"
-    install -m 0755 "$srcdir/claude-vscode-wrapper" "$bindir/claude-vscode-wrapper"
+    install -m 0755 "$pkg_shim" "$bindir/claude"
+    install -m 0755 "$pkg_wrap" "$bindir/claude-vscode-wrapper"
     grn "Linked the routing shims into $bindir."
   fi
 
@@ -730,16 +797,20 @@ cmd_setup(){
     echo "        export PATH=\"$bindir:\$PATH\""
   fi
 
-  local vs="$HOME/Library/Application Support/Code/User/settings.json"
-  if [ ! -f "$vs" ]; then
-    dim "VS Code not found — skipping its wrapper."
-  elif grep -q 'claudeCode.claudeProcessWrapper' "$vs"; then
-    grn "VS Code wrapper already configured."
-  else
-    # WHY not edit it for them: it is JSONC with comments, and a rewrite risks their settings.
-    yel "VS Code: add this line to $vs, then restart VS Code once:"
-    echo "        \"claudeCode.claudeProcessWrapper\": \"$bindir/claude-vscode-wrapper\","
-  fi
+  local found=0 el es ex
+  while IFS=$'\t' read -r el es ex; do
+    [ -z "$el" ] && continue; found=1
+    if [ -f "$es" ] && grep -q 'claudeCode.claudeProcessWrapper' "$es"; then
+      grn "$el: wrapper already configured."
+    else
+      # WHY not edit it for them: it is JSONC with comments, and a rewrite risks their settings.
+      if editor_has_claude "$ex"; then yel "$el (Claude extension installed): add this line to its settings.json, then restart $el once:"
+      else dim "$el found: to route Claude sessions started from it, add this line to its settings.json and restart it once:"; fi
+      echo "        \"claudeCode.claudeProcessWrapper\": \"$bindir/claude-vscode-wrapper\","
+      dim "        file: $es"
+    fi
+  done < <(editors)
+  [ "$found" = 0 ] && dim "No VS Code-family editor found (VS Code, Cursor, Windsurf, VSCodium) — terminal routing still works."
   echo; dim "then:  claude-account doctor"
 }
 
@@ -770,11 +841,36 @@ cmd_doctor(){
     wrn "this shell resolves claude to '${here_first:-<not found>}' — fine for a tool-spawned shell, but scripts run from here are unrouted"
   fi
   [ -x "$HOME/bin/claude-vscode-wrapper" ] && ok_ "VS Code wrapper present" || bad "missing VS Code wrapper"
-  grep -q 'claudeProcessWrapper' "$HOME/Library/Application Support/Code/User/settings.json" 2>/dev/null \
-    && ok_ "VS Code setting points at the wrapper" || bad "claudeCode.claudeProcessWrapper not set — VS Code is unrouted"
+  # one line per editor: a problem only where the Claude extension is actually installed
+  local _ed=0 el es ex
+  while IFS=$'\t' read -r el es ex; do
+    [ -z "$el" ] && continue; _ed=1
+    if [ -f "$es" ] && grep -q 'claudeProcessWrapper' "$es"; then ok_ "$el: setting points at the wrapper"
+    elif editor_has_claude "$ex"; then bad "$el: Claude extension installed but claudeCode.claudeProcessWrapper not set — its sessions are unrouted (claude-account setup prints the line)"
+    else wrn "$el: found, wrapper setting not set — only matters if you run Claude from it"; fi
+  done < <(editors)
+  [ "$_ed" = 0 ] && dim "  (no VS Code-family editor found)"
   local cc; cc=$(grep -c 'CLAUDE_CONFIG_DIR' "$HOME/bin/claude" "$HOME/bin/claude-vscode-wrapper" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
   [ "$cc" = 0 ] && ok_ "CLAUDE_CONFIG_DIR never set (config stays shared)" || bad "CLAUDE_CONFIG_DIR is set somewhere — profiles would lose plugins/MCP/memory"
   [ -x "$RESOLVE" ] && ok_ "resolver present" || bad "missing $RESOLVE"
+  # The SHIMS do not use $RESOLVE (that is this CLI's own); they use the ~/.config copy.
+  # A Homebrew-only machine never had one until setup started installing it (1.0.22), and a
+  # brew upgrade left an old one behind — so check that copy exists and matches the package.
+  local _pkg_bin _pkg_res _pkg_shim _pkg_wrap _cfgres="$HOME/.config/claude-accounts/resolve.sh"
+  _pkg_bin="$_ca_dir"
+  for c in "$_pkg_bin/../libexec/resolve.sh" "$_pkg_bin/../lib/claude-account/resolve.sh"; do [ -f "$c" ] && { _pkg_res="$c"; break; }; done
+  for c in "$_pkg_bin/claude-shim" "$_pkg_bin/../libexec/shims/claude-shim"; do [ -f "$c" ] && { _pkg_shim="$c"; break; }; done
+  for c in "$_pkg_bin/claude-vscode-wrapper" "$_pkg_bin/../libexec/shims/claude-vscode-wrapper"; do [ -f "$c" ] && { _pkg_wrap="$c"; break; }; done
+  if [ ! -f "$_cfgres" ]; then
+    bad "the shims' resolver $_cfgres is missing — every rule is inert. run: claude-account setup"
+  elif [ -n "${_pkg_res:-}" ] && ! cmp -s "$_pkg_res" "$_cfgres"; then
+    bad "the shims' resolver $_cfgres differs from this version's — run: claude-account setup"
+  else ok_ "shims' resolver present and current"; fi
+  local _drift=0
+  [ -n "${_pkg_shim:-}" ] && [ -f "$HOME/bin/claude" ] && ! cmp -s "$_pkg_shim" "$HOME/bin/claude" && _drift=1
+  [ -n "${_pkg_wrap:-}" ] && [ -f "$HOME/bin/claude-vscode-wrapper" ] && ! cmp -s "$_pkg_wrap" "$HOME/bin/claude-vscode-wrapper" && _drift=1
+  if [ "$_drift" = 1 ]; then wrn "the ~/bin shims differ from this version's copies (stale after an upgrade?) — run: claude-account setup"
+  elif [ -n "${_pkg_shim:-}" ]; then ok_ "~/bin shims match this version"; fi
 
   # the machine-wide fallback, if any — a redirect this large must be loud here
   local fbraw=""; [ -f "$PROFILES/.fallback" ] && IFS= read -r fbraw < "$PROFILES/.fallback"
