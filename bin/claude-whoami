@@ -40,6 +40,32 @@ elif [ -z "$line" ]; then
     echo "matched rule  : none"
     echo "account       : $GT — whatever you signed in with (VS Code \"Switch account\")"
   fi
+elif [ "$(printf '%s' "$line" | cut -f3)" = "(fallback)" ]; then
+  # No rule matched — the machine-wide fallback applies. Never print "(fallback)" as if
+  # it were a matched rule: no rule matched, and saying otherwise sends you hunting for
+  # a rule that does not exist.
+  name=$(printf '%s' "$line" | cut -f1); pdir=$(printf '%s' "$line" | cut -f2)
+  parked=$(awk -F'\t' -v d="$dir/" '
+    $1 ~ /^#/ || NF < 2 { next }
+    { p=$1; sub(/\/$/, "", p)
+      if (index(d, p "/") == 1 && length(p) > L) { L=length(p); P=p; N=$2 } }
+    END { if (N) printf "%s\t%s\n", P, N }' "$MAP" 2>/dev/null)
+  if [ -n "$parked" ]; then
+    echo "matched rule  : $(printf '%s' "$parked" | cut -f1)"
+    echo "                ...but it is paused, so it is NOT routing"
+    echo "account       : $name — via the machine FALLBACK (resume the rule: claude-account resume $(printf '%s' "$parked" | cut -f2))"
+  else
+    echo "matched rule  : none — the machine FALLBACK applies"
+    echo "account       : $name  (clear with: claude-account fallback none)"
+  fi
+  echo "profile dir   : $pdir"
+  svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
+  if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+    echo "login         : signed in"
+  else
+    echo "login         : NOT signed in — this folder falls back to $GT"
+    echo "                run:  claude-account login $name   (or: claude-account fallback none)"
+  fi
 else
   name=$(printf '%s' "$line" | cut -f1); pdir=$(printf '%s' "$line" | cut -f2); pre=$(printf '%s' "$line" | cut -f3)
   echo "matched rule  : $pre"

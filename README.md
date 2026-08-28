@@ -70,6 +70,7 @@ Day to day you run nothing: open the project and work.
 | `list` / `profiles` / `verify` | what routes where, and which account each holds |
 | `usage [name\|--all]` | live session/weekly/model quotas and reset times |
 | `pause` / `resume` / `switch` | park a depleted account, or move paths to another one |
+| `fallback <name>` / `fallback none` | a machine-wide stand-in for an exhausted global account — unrouted paths use that profile until cleared; no credential is copied or replaced |
 | `login` / `logout` / `refresh` | credentials; `refresh` renews an expired access token |
 | `doctor` / `setup` | health check; and one-time PATH + VS Code wiring |
 | `export` / `import` | move rules and labels to another machine |

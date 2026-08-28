@@ -6,7 +6,9 @@
 # (e.g. "Apps & Games"). Do not re-space these lines by hand.
 #
 # Longest matching prefix wins. A path with no match uses whatever account you
-# are globally signed in with (VS Code "Switch account") — nothing is overridden.
+# are globally signed in with (VS Code "Switch account") — nothing is overridden —
+# unless a FALLBACK profile is set (claude-account fallback <name>), which stands in
+# for the global account machine-wide until you clear it (fallback none).
 #
 # Only the ACCOUNT changes. Plugins, MCP servers, memory, settings, hooks and
 # session history all stay shared from ~/.claude, because only
