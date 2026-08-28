@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.22"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.23"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -88,13 +88,20 @@ acct_identity(){ # <profile-dir or "" for global>
   if [ -n "${1:-}" ]; then
     svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
   fi
-  local blob; blob=$(security find-generic-password -s "$svc" -w 2>/dev/null)
+  local blob rc
+  blob=$(security find-generic-password -s "$svc" -w 2>/dev/null); rc=$?
   local out
-  if [ -z "$blob" ]; then out="NOT LOGGED IN"
+  if [ -z "$blob" ]; then
+    # exit 44 = errSecItemNotFound — genuinely no credential. Anything else is a PROBE
+    # failure (keychain locked/unavailable) and must not be reported as "not signed in":
+    # that reading is what would silently bill the wrong account. (chatmux's rule: never
+    # let a transient probe failure read as "absent".)
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 44 ]; then out="KEYCHAIN ERROR (security exit $rc)"
+    else out="NOT LOGGED IN"; fi
   else out=$(printf '%s' "$blob" | python3 -c "$ACCT_PY"); fi
   if _use_colour; then
     case "$out" in
-      "NOT LOGGED IN"|*EXPIRED*) printf '\033[31m%s\033[0m\n' "$out" ;;   # red
+      "NOT LOGGED IN"|*EXPIRED*|"KEYCHAIN ERROR"*) printf '\033[31m%s\033[0m\n' "$out" ;;   # red
       *"EXPIRES IN"*)            printf '\033[38;5;208m%s\033[0m\n' "$out" ;;  # orange
       *)                         printf '%s\n' "$out" ;;
     esac
@@ -222,7 +229,39 @@ reserved_global(){ # <name> <verb>
   return 2
 }
 
-backup(){ mkdir -p "$BK"; cp "$MAP" "$BK/paths.map.$(date +%Y%m%d-%H%M%S)${1:+-$1}" 2>/dev/null; }
+# F2 (from showrunner's IO_LOCK): write_map is atomic per writer, but two concurrent
+# mutating commands could still lose one writer's change between load and mv. mkdir is
+# the portable atomic primitive on macOS (no flock(1)). Taken once per process — every
+# mutating verb calls backup() first, and write_map/appenders re-take it defensively.
+CA_MAP_LOCKED=0
+map_lock(){
+  [ "$CA_MAP_LOCKED" = 1 ] && return 0
+  local lock; lock="$(dirname "$MAP")/.map.lock"
+  local i=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    # a lock older than a minute is a crashed writer — break it
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+      rmdir "$lock" 2>/dev/null; continue
+    fi
+    i=$((i+1))
+    if [ "$i" -gt 60 ]; then
+      red "another claude-account holds the map lock ($lock) — retry, or rmdir it if stale" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+  CA_MAP_LOCKED=1
+  trap 'rmdir "$(dirname "$MAP")/.map.lock" 2>/dev/null' EXIT
+}
+
+# F6 (from chatmux): tmp + rename for every one-line state file, so a reader never
+# sees a partial write. The map already has this via write_map.
+write_line(){ # <file> <content>
+  local t; t=$(mktemp "$1.XXXXXX") || return 1
+  printf '%s\n' "$2" > "$t" && mv "$t" "$1"
+}
+
+backup(){ map_lock || exit 1; mkdir -p "$BK"; cp "$MAP" "$BK/paths.map.$(date +%Y%m%d-%H%M%S)${1:+-$1}" 2>/dev/null; }
 
 norm(){ local p="$1"; case "$p" in "~"*) p="$HOME${p#\~}";; esac
   p="${p%/}"; case "$p" in /*) ;; *) p="$(cd "$p" 2>/dev/null && pwd)" || return 1;; esac
@@ -357,7 +396,7 @@ except Exception:
     print("")
 CAPPY
 )
-  [ -n "$out" ] && printf '%s\n' "$out" > "$1/.account"
+  [ -n "$out" ] && write_line "$1/.account" "$out"
 }
 
 profile_label(){ # <profile-dir> -> recorded email, or empty
@@ -552,6 +591,7 @@ USAGEPY
 # (a truncate-before-read, and an invalid heredoc producing an empty file) each
 # wiped every rule. Any rewrite goes through here.
 write_map(){ # <tmpfile> <min-rules-expected>
+  map_lock || { rm -f "$1"; return 1; }
   local n; n=$(grep -v '^#' "$1" 2>/dev/null | grep -c . || true); n=${n:-0}
   if [ "$n" -lt "${2:-0}" ]; then
     red "refusing to write paths.map: result has $n rule(s), expected at least ${2:-0}" >&2
@@ -605,7 +645,7 @@ RNPY
   # the fallback names the profile by name — a rename must follow it, or every
   # unrouted path starts warning about a profile that no longer exists
   if [ "$(get_fallback 2>/dev/null)" = "$old" ]; then
-    printf '%s\n' "$new" > "$PROFILES/.fallback"
+    write_line "$PROFILES/.fallback" "$new"
     dim "Repointed the fallback to '$new'."
   fi
   grn "Renamed profile '$old' -> '$new'."
@@ -670,7 +710,7 @@ cmd_import(){
         case "$a" in global|none) yel "  rejected fallback: '$a' is reserved"; rejected=$((rejected+1)); continue ;; esac
         if [ -f "$PROFILES/.fallback" ]; then
           yel "  skipped fallback '$a' — one is already set"; skipped=$((skipped+1)); continue; fi
-        mkdir -p "$PROFILES/$a"; printf '%s\n' "$a" > "$PROFILES/.fallback"
+        mkdir -p "$PROFILES/$a"; write_line "$PROFILES/.fallback" "$a"
         grn "  fallback set: unrouted paths use '$a'  (clear: claude-account fallback none)" ;;
     esac
   done < "$f"
@@ -853,6 +893,31 @@ cmd_doctor(){
   local cc; cc=$(grep -c 'CLAUDE_CONFIG_DIR' "$HOME/bin/claude" "$HOME/bin/claude-vscode-wrapper" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
   [ "$cc" = 0 ] && ok_ "CLAUDE_CONFIG_DIR never set (config stays shared)" || bad "CLAUDE_CONFIG_DIR is set somewhere — profiles would lose plugins/MCP/memory"
   [ -x "$RESOLVE" ] && ok_ "resolver present" || bad "missing $RESOLVE"
+  # which claude the shim will exec, and where it came from — turns "works on my
+  # machine" diagnoses concrete (probe order borrowed from chatmux's upgrade resolver)
+  local rcb; rcb=$(real_claude 2>/dev/null) || rcb=""
+  if [ -n "$rcb" ]; then
+    local prov="unknown install method"
+    case "$rcb" in
+      "$HOME/.local/bin/claude") prov="native installer" ;;
+      /opt/homebrew/*|/usr/local/Cellar/*|/usr/local/opt/*) prov="Homebrew" ;;
+      *node_modules*) prov="npm" ;;
+      *mise*|*asdf*) prov="mise/asdf" ;;
+    esac
+    ok_ "real claude: ${rcb/#$HOME/~} — $prov"
+  else
+    bad "no real claude binary found on PATH"
+  fi
+  # direnv re-evaluates .envrc AFTER the shim ran, so a routed project whose .envrc
+  # touches PATH or CLAUDE_* can override routing (seen wrapping launches in chatmux)
+  if command -v direnv >/dev/null 2>&1; then
+    while IFS=$'\t' read -r pth nm st _r || [ -n "${pth:-}" ]; do
+      case "$pth" in ''|\#*) continue;; esac; [ -z "${nm:-}" ] && continue
+      if [ -f "$pth/.envrc" ] && grep -qE 'PATH=|CLAUDE_' "$pth/.envrc" 2>/dev/null; then
+        wrn "direnv: ${pth/#$HOME/~}/.envrc touches PATH or CLAUDE_* — direnv applies it AFTER the shim and can override routing"
+      fi
+    done < "$MAP"
+  fi
   # The SHIMS do not use $RESOLVE (that is this CLI's own); they use the ~/.config copy.
   # A Homebrew-only machine never had one until setup started installing it (1.0.22), and a
   # brew upgrade left an old one behind — so check that copy exists and matches the package.
@@ -1360,7 +1425,7 @@ cmd_fallback(){
     exit 1
   fi
   local prev=""; [ -f "$PROFILES/.fallback" ] && IFS= read -r prev < "$PROFILES/.fallback"
-  printf '%s\n' "$name" > "$PROFILES/.fallback"
+  write_line "$PROFILES/.fallback" "$name"
   grn "Fallback set: every path with NO rule now uses profile '$name' ($(acct_identity "$PROFILES/$name"))."
   [ -n "$prev" ] && [ "$prev" != "$name" ] && dim "  (was '$prev')"
   dim "Your global account's credential is untouched — it is simply not used for unrouted"
@@ -1431,6 +1496,80 @@ $fbrow"; fi
   dim "      claude-account label <profile> <email>"
   dim "  The time is that ACCESS TOKEN's expiry — it renews itself on use, so it is not"
   dim "  a quota reset. For quota and reset times:  claude-account usage [name|--all]"
+}
+
+# The usage fetch+render shared by cmd_usage and cmd_overview. Keep in step with
+# cmd_usage's inline error wording. Prints bars, a not-signed-in note, or a red line.
+usage_bars(){ # <profile-dir or "" for global>
+  local pdir="$1" svc="Claude Code-credentials" tok body
+  [ -n "$pdir" ] && svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
+  tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+      | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
+  if [ -z "$tok" ]; then dim "  (not signed in — no usage to fetch)"; return 0; fi
+  body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
+      -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+  if printf '%s' "$body" | grep -q 'authentication_error\|token has expired'; then
+    if refresh_token_if_needed "$pdir" >/dev/null 2>&1; then
+      tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+            | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
+      body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
+             -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+    fi
+    printf '%s' "$body" | grep -q 'authentication_error' && { red "  could not refresh — sign in again"; return 0; }
+  fi
+  if [ -z "$body" ] || ! printf '%s' "$body" | head -c1 | grep -q '{'; then
+    red "  could not reach the usage endpoint"; return 0; fi
+  printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" python3 -c "$USAGE_PY"
+}
+
+# One command for the whole picture: what `list` + `profiles` + `usage --all` each show,
+# merged into one card per credential. The three stay available separately.
+cmd_overview(){
+  case " $* " in *" --no-refresh "*) CA_NO_REFRESH=1 ;; esac
+  refresh_expired_all
+  echo "CLAUDE ACCOUNTS — the whole picture  (one card per credential; details: list / profiles / usage)"; echo
+  fallback_banner
+  local fb; fb=$(get_fallback) || fb=""
+  # ── the global card first: it is what every unrouted path spends ──
+  load_global_identity
+  printf '  %s %s\n' "$(gcell "$CA_GTAG" 12)" "$CA_GLOBAL_ID"
+  if [ -n "$fb" ]; then dim "               paths : — none while fallback '$fb' is set"
+  else dim "               paths : every path with no rule"; fi
+  usage_bars "" | sed 's/^  /               /'
+  echo
+  local d nm
+  for d in "$PROFILES"/*/; do
+    [ -d "$d" ] || continue
+    nm=$(basename "$d")
+    local id; id=$(acct_identity "${d%/}")
+    local lbl; lbl=$(profile_label "${d%/}")
+    if [ -n "$lbl" ]; then
+      case "$id" in *"NOT LOGGED IN"*) id="$id  (last: $lbl)" ;; *) id="$lbl  ·  $id" ;; esac
+    fi
+    printf '  %s %s\n' "$(gcell "$nm" 12)" "$id"
+    local used; used=$(awk -F'\t' -v n="$nm" '$1 !~ /^[ \t]*#/ && $2==n{ print $1"\t"($4=="global"?"global":($3=="paused"?"paused":"active")) }' "$MAP" 2>/dev/null \
+        | while IFS=$'\t' read -r pp ss; do printf '%s  [%s]\n' "$pp" "$(usedby_cell "$ss")"; done)
+    if [ "$nm" = "$fb" ]; then
+      local fbrow="<every unrouted path>  [$( if _use_colour; then printf '\033[38;5;208min use · FALLBACK\033[0m'; else printf 'in use · FALLBACK'; fi )]"
+      if [ -z "$used" ]; then used="$fbrow"; else used="$used
+$fbrow"; fi
+    fi
+    if [ -z "$used" ]; then
+      dim "               paths : — no path uses it (orphan)"
+    else
+      local first=1 ln
+      while IFS= read -r ln; do [ -z "$ln" ] && continue
+        if [ "$first" = 1 ]; then
+          if _use_colour; then printf '\033[2m               paths :\033[0m %s\n' "$ln"; else printf '               paths : %s\n' "$ln"; fi
+          first=0
+        else printf '                       %s\n' "$ln"; fi
+      done <<< "$(printf '%s\n' "$used" | sed "s|$HOME|~|")"
+    fi
+    usage_bars "${d%/}" | sed 's/^  /               /'
+    echo
+  done
+  dim "  Bars are live from the usage API. The time beside plan|tier is the ACCESS TOKEN's"
+  dim "  expiry (renews itself on use). Detail views:  claude-account list · profiles · usage --all"
 }
 
 cmd_list(){
@@ -1793,6 +1932,7 @@ case "${1:-list}" in
   # silently swallowed — `verify --no-refresh` still fired a real `claude -p hi` per
   # expired profile, spending quota on the very accounts you paused for being spent.
   profiles|logins)   shift; cmd_profiles "$@" ;;
+  overview|ov)       shift; cmd_overview "$@" ;;
   label)  shift; cmd_label "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   --version|-V|version) echo "claude-account $CA_VERSION" ;;
@@ -1825,11 +1965,14 @@ INSPECT
                                        (aliases: ls, -l, --list)
   claude-account profiles              every stored login, incl. unused ones
                                        (alias: logins)
+  claude-account overview              the whole picture in one screen: every
+                                       credential, its paths, and live usage bars
+                                       (list + profiles + usage combined; alias: ov)
   claude-account verify                same data framed per path
   claude-account doctor                health check: plumbing, rules, logins, keychain
   claude-account --version             print the installed version
 
-  --no-refresh on list/profiles/verify/doctor skips renewing expired tokens
+  --no-refresh on list/profiles/verify/doctor/overview skips renewing expired tokens
 
   claude-account setup                 wire up PATH + VS Code after a package install
   claude-account refresh [name|--all]  renew expired access tokens (default: all)

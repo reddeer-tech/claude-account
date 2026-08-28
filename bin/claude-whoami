@@ -86,8 +86,11 @@ else
   # This check is duplicated in claude-shim and claude-vscode-wrapper — keep the three
   # in step, or lift it into resolve.sh.
   svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-  if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+  security find-generic-password -s "$svc" >/dev/null 2>&1; _src=$?
+  if [ "$_src" -eq 0 ]; then
     echo "login         : signed in"
+  elif [ "$_src" -ne 44 ]; then
+    echo "login         : could not verify (security exit $_src) — the shim routes to it anyway"
   else
     echo "login         : NOT signed in — this folder falls back to $GT"
     echo "                run:  claude-account login $name   (or: claude-account pause $name)"

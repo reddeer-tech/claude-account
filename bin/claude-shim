@@ -48,7 +48,16 @@ if [ -x "$RESOLVE" ]; then
     # client's work quietly billed to the personal plan (or the reverse).
     # CLAUDE_ACCOUNTS_STRICT=1 restores the old fail-fast behaviour.
     svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-    if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+    security find-generic-password -s "$svc" >/dev/null 2>&1; _src=$?
+    if [ "$_src" -eq 0 ]; then
+      export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"
+    elif [ "$_src" -ne 44 ]; then
+      # A PROBE failure (keychain locked/unavailable — anything but exit 44 "not found")
+      # is not "no credential". Fail TOWARD the rule: route as configured and let Claude
+      # error loudly if the credential truly cannot be read — silently billing the
+      # global account is the exact failure this tool exists to prevent.
+      pname=$(printf '%s' "$line" | cut -f1)
+      printf 'claude: could not verify profile %s (security exit %s) — routing to it anyway.\n' "'$pname'" "$_src" >&2
       export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"
     else
       pname=$(printf '%s' "$line" | cut -f1)

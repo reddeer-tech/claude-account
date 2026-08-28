@@ -88,6 +88,7 @@ Day to day you run nothing: open the project and work.
 
 | | |
 |---|---|
+| `overview` (alias `ov`) | the whole picture in one screen: every credential, its paths, live usage |
 | `list` / `profiles` / `verify` | what routes where, and which account each holds |
 | `usage [name\|--all]` | live session/weekly/model quotas and reset times |
 | `pause` / `resume` / `switch` | park a depleted account, or move paths to another one |
