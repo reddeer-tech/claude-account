@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.16"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.17"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -420,6 +420,21 @@ gcell(){ # <text> <width>
 using_gtag(){
   if _use_colour; then printf '\033[2musing %s%s%s%s\033[2m:%s' "$CA_OFF" "$CA_CYAN" "$CA_GTAG" "$CA_OFF" "$CA_OFF"
   else printf 'using %s:' "$CA_GTAG"; fi
+}
+
+# Colours the --help text WITHOUT touching the heredoc, which must stay quoted (an
+# unquoted one once executed a backtick from the help text — see CLAUDE.md). The text
+# stays static; this is a post-processor, applied only when stdout is a terminal, so
+# piped output (and NO_COLOR) is byte-identical plain text. [[:<:]]/[[:>:]] are BSD
+# sed word boundaries — fine here, this package is macOS-only.
+colorize_help(){
+  if ! _use_colour; then cat; return; fi
+  local G=$'\033[32m' C=$'\033[36m' B=$'\033[1m' D=$'\033[2m' O=$'\033[0m'
+  sed -E \
+    -e "s/^(GLOBAL ACCOUNT)/${B}${C}\1${O}/" \
+    -e "s/^(INSPECT|SET UP|PAUSE \/ RESUME|FALLBACK|PORTABILITY|TEAR DOWN|NOTES)/${B}\1${O}/" \
+    -e "s/claude-(account|whoami)/${G}&${O}/g" \
+    -e "s/[[:<:]]global[[:>:]]/${C}&${O}/g"
 }
 
 status_cell(){ # <state> <width>   — list's STATUS column: active | paused
@@ -1663,7 +1678,7 @@ case "${1:-list}" in
   # QUOTED delimiter. Unquoted, bash expands $ and backticks inside the help text —
   # a backtick added to one line ran as a command and printed "global: command not
   # found" before the usage. The text is static; nothing here should ever expand.
-  -h|--help|help) cat <<'USAGE'
+  -h|--help|help) colorize_help <<'USAGE'
 claude-account — route Claude subscriptions per project path
 
 INSPECT
@@ -1676,6 +1691,7 @@ INSPECT
   claude-account --version             print the installed version
 
   --no-refresh on list/profiles/verify/doctor skips renewing expired tokens
+
   claude-account setup                 wire up PATH + VS Code after a package install
   claude-account refresh [name|--all]  renew expired access tokens (default: all)
   claude-account usage [name|path]     live quota: session, weekly, resets (omit = global)

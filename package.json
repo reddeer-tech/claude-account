@@ -1,6 +1,6 @@
 {
   "name": "claude-account",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "Route Claude Code subscriptions per project path on macOS — different account per folder, everything else shared.",
   "keywords": ["claude", "claude-code", "anthropic", "cli", "macos", "accounts", "profiles"],
   "license": "MIT",
