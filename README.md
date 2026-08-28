@@ -90,6 +90,7 @@ Day to day you run nothing: open the project and work.
 |---|---|
 | `overview` (alias `ov`) | the whole picture in one screen: every credential, its paths, live usage |
 | `statusline` | the account this session is spending - wire it into Claude Code's `statusLine` setting |
+| `vscode-status install\|remove\|status` | the status bar item for VS Code/Cursor naming the account each window's folder uses (`setup` installs it) |
 | `undo` | restore `paths.map` from the newest automatic snapshot |
 | `list --json` | the whole state as one JSON object, for scripts |
 | `list` / `profiles` / `verify` | what routes where, and which account each holds |

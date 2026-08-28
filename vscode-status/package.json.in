@@ -1,0 +1,16 @@
+{
+  "name": "claude-account-status",
+  "displayName": "Claude Account status",
+  "description": "Shows which Claude account the current folder routes to, in the status bar.",
+  "version": "@@VERSION@@",
+  "publisher": "reddeer-tech",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "claudeAccountStatus.refresh", "title": "Claude Account: refresh status bar" }
+    ]
+  }
+}

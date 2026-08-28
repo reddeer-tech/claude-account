@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.25"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.26"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -832,6 +832,71 @@ editors(){
 # does that editor have the Claude Code extension installed?
 editor_has_claude(){ ls -d "$1"/anthropic.claude-code-* >/dev/null 2>&1; }
 
+# The companion VS Code status bar item. Deliberately OPT-IN and never installed by
+# `setup`: the project's rule is that a package install must not change things behind
+# your back (the same reason the formula parks the shims unlinked). Installed as a
+# plain folder — VS Code loads any well-formed extension directory at startup, so
+# there is no vsce, no npm and no `code` CLI dependency, and the same folder works for
+# Cursor/Windsurf/VSCodium.
+vscode_status_srcdir(){
+  local self srcdir
+  self="${BASH_SOURCE[0]:-$0}"
+  while [ -L "$self" ]; do local t; t="$(readlink "$self")"
+    case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac; done
+  srcdir="$(cd "$(dirname "$self")" && pwd)"
+  for c in "$srcdir/../vscode-status" "$srcdir/../share/claude-account/vscode-status" \
+           "$HOME/.config/claude-accounts/vscode-status"; do
+    [ -f "$c/extension.js" ] && { (cd "$c" && pwd); return 0; }
+  done
+  return 1
+}
+
+cmd_vscode_status(){
+  local src; src=$(vscode_status_srcdir) || { red "cannot find the vscode-status source next to this install"; exit 1; }
+  local dest_name="reddeer-tech.claude-account-status-$CA_VERSION"
+  local action="${1:-status}" gate="${2:-}" any=0 el es ex ea
+  case "$action" in
+    install|remove|status) ;;
+    *) red "usage: claude-account vscode-status [install|remove|status]"; exit 2 ;;
+  esac
+  while IFS=$'\t' read -r el es ex ea; do
+    [ -z "$el" ] && continue
+    [ -d "$ex" ] || continue
+    # setup passes --only-with-claude: skip editors that do not have the Claude extension
+    [ "$gate" = "--only-with-claude" ] && ! editor_has_claude "$ex" && continue
+    any=1
+    local installed; installed=$(ls -d "$ex"/reddeer-tech.claude-account-status-* 2>/dev/null | head -1)
+    case "$action" in
+      install)
+        [ -n "$installed" ] && rm -rf "$installed"
+        mkdir -p "$ex/$dest_name"
+        install -m 0644 "$src/extension.js" "$ex/$dest_name/extension.js"
+        sed "s/@@VERSION@@/$CA_VERSION/" "$src/package.json.in" > "$ex/$dest_name/package.json"
+        grn "$el: installed the Claude Account status bar item ($CA_VERSION)."
+        ;;
+      remove)
+        if [ -n "$installed" ]; then rm -rf "$installed"; grn "$el: removed the status bar item."
+        else dim "$el: not installed."; fi
+        ;;
+      status)
+        if [ -n "$installed" ]; then
+          local v="${installed##*claude-account-status-}"
+          if [ "$v" = "$CA_VERSION" ]; then grn "$el: installed ($v)"
+          else yel "$el: installed ($v) — this CLI is $CA_VERSION; re-run: claude-account vscode-status install"; fi
+        else dim "$el: not installed"; fi
+        ;;
+    esac
+  done < <(editors)
+  [ "$any" = 0 ] && { dim "No VS Code-family editor found."; return 0; }
+  case "$action" in
+    install) dim "Restart the editor once; the item appears at the right of the status bar,"
+             dim "naming the account THIS FOLDER routes to (the editor's own Account panel shows"
+             dim "one shared email in every window, so it cannot tell you that)."
+             dim "Don't want it?  claude-account vscode-status remove" ;;
+    remove)  dim "Restart the editor once to clear it from the status bar." ;;
+  esac
+}
+
 cmd_setup(){
   # Opt-in wiring. A package install deliberately does NOT do this: linking `claude` ahead of the
   # real binary hijacks it for every caller, and npm/brew must never do that behind your back.
@@ -873,11 +938,25 @@ cmd_setup(){
     elif ! cmp -s "$pkg_res" "$cfg/resolve.sh"; then
       install -m 0755 "$pkg_res" "$cfg/resolve.sh"; grn "Updated the resolver in $cfg to this version."
     fi
+  elif [ -f "$cfg/resolve.sh" ]; then
+    dim "Resolver already in place ($cfg) — this copy ships none beside it."
   else
     yel "cannot find the package's libexec/resolve.sh next to $srcdir — the resolver was not installed."
   fi
   [ -f "$cfg/paths.map" ] || { for c in "$srcdir/../templates/paths.map" "$srcdir/../share/claude-account/templates/paths.map"; do
       [ -f "$c" ] && { install -m 0600 "$c" "$cfg/paths.map"; break; }; done; }
+
+  # The status bar extension's source. The shims live in $bindir with no package tree
+  # beside them, so keep a copy where the CLI can always find it — and refresh it on
+  # every setup so an upgrade cannot leave an older extension behind.
+  for c in "$srcdir/../vscode-status" "$srcdir/../share/claude-account/vscode-status"; do
+    if [ -f "$c/extension.js" ]; then
+      mkdir -p "$cfg/vscode-status"
+      install -m 0644 "$c/extension.js"      "$cfg/vscode-status/extension.js"
+      install -m 0644 "$c/package.json.in"   "$cfg/vscode-status/package.json.in"
+      break
+    fi
+  done
 
   # Shims already deployed and OURS: refresh them if the package's copy moved on.
   if grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null && [ -n "$pkg_shim" ]; then
@@ -942,6 +1021,18 @@ cmd_setup(){
     fi
   done < <(editors)
   [ "$found" = 0 ] && dim "No VS Code-family editor found (VS Code, Cursor, Windsurf, VSCodium) — terminal routing still works."
+  if [ "$found" = 1 ]; then
+    echo
+    # Only where Claude actually runs: adding our item to an editor with no Claude
+    # extension would be noise. Never fatal — a missing source must not break setup.
+    if vscode_status_srcdir >/dev/null 2>&1; then
+      cmd_vscode_status install --only-with-claude 2>/dev/null || true
+    elif [ -d "$HOME/.config/claude-accounts/vscode-status" ]; then
+      cmd_vscode_status install --only-with-claude 2>/dev/null || true
+    else
+      dim "(status bar item source not found in this install — skipping)"
+    fi
+  fi
   echo; dim "then:  claude-account doctor"
 }
 
@@ -996,6 +1087,14 @@ print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else "")' 2
     else wrn "$el: found, wrapper setting not set — only matters if you run Claude from it"; fi
   done < <(editors)
   [ "$_ed" = 0 ] && dim "  (no VS Code-family editor found)"
+  if [ "$_ed" = 1 ]; then
+    local _vs; _vs=$(cmd_vscode_status status 2>/dev/null | grep -c 'installed (' || true)
+    if [ "${_vs:-0}" -gt 0 ]; then
+      cmd_vscode_status status 2>/dev/null | grep 'this CLI is' >/dev/null \
+        && wrn "vscode-status item is older than this CLI — claude-account vscode-status install" \
+        || ok_ "vscode-status item installed and current"
+    fi
+  fi
   local cc; cc=$(grep -c 'CLAUDE_CONFIG_DIR' "$dbin/claude" "$dbin/claude-vscode-wrapper" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
   [ "$cc" = 0 ] && ok_ "CLAUDE_CONFIG_DIR never set (config stays shared)" || bad "CLAUDE_CONFIG_DIR is set somewhere — profiles would lose plugins/MCP/memory"
   [ -x "$RESOLVE" ] && ok_ "resolver present" || bad "missing $RESOLVE"
@@ -2150,12 +2249,21 @@ main(){
   # Reads naturally either way; only swap when arg1 is a real profile/path and
   # arg2 is a verb that takes one.
   if [ $# -ge 2 ]; then
+    # ⚠️ Never swap when arg1 is itself a COMMAND. `[ -d "$1" ]` below treats any bare
+    # name that happens to be a directory in the cwd as a path — so `vscode-status
+    # remove`, run from a folder containing a `vscode-status/` directory, silently
+    # became `remove vscode-status`. A command name is never a profile or a path.
+    case "$1" in
+      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback      |export|import|usage|refresh|logout|switch|global|status|pause|resume|add|remove|rm      |login|forget|statusline|undo|vscode-status|help)
+        set -- "$@" ;;                      # a command: leave the order alone
+      *)
     case "$2" in
       usage|login|logout|pause|resume|remove|forget|label|verify|fallback)
         if awk -F'\t' -v n="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" '$2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null \
            || [ -d "$PROFILES/$1" ] || [ -d "$1" ]; then
           set -- "$2" "$1" "${@:3}"
         fi ;;
+    esac ;;
     esac
   fi
 case "${1:-list}" in
@@ -2166,6 +2274,7 @@ case "${1:-list}" in
   # expired profile, spending quota on the very accounts you paused for being spent.
   profiles|logins)   shift; cmd_profiles "$@" ;;
   overview|ov)       shift; cmd_overview "$@" ;;
+  vscode-status)     shift; cmd_vscode_status "$@" ;;
   statusline)        cmd_statusline ;;
   undo)              shift; cmd_undo "$@" ;;
   label)  shift; cmd_label "$@" ;;
@@ -2219,6 +2328,8 @@ INSPECT
   --no-refresh on list/profiles/verify/doctor/overview skips renewing expired tokens
 
   claude-account setup                 wire up PATH + VS Code after a package install
+  claude-account vscode-status install   add a status bar item to VS Code/Cursor naming
+                                       the account this folder routes to (remove|status)
   claude-account refresh [name|--all]  renew expired access tokens (default: all)
   claude-account usage [name|path]     live quota: session, weekly, resets (omit = global)
   claude-account usage --all           every profile + global (refreshes expired tokens)
