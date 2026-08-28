@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.20"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.21"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -670,7 +670,7 @@ cmd_import(){
   [ "$skipped" -gt 0 ]  && dim "Skipped $skipped path(s) that already had a rule."
   [ "$rejected" -gt 0 ] && yel "Rejected $rejected row(s) — see the reasons above."
   dim "Credentials are not importable — sign in on this machine:"
-  claude-account profiles 2>/dev/null | awk '/NOT LOGGED IN/{print "    claude-account login "$1}'
+  cmd_profiles --no-refresh 2>/dev/null | awk '/NOT LOGGED IN/{print "    claude-account login "$1}'
 }
 
 cmd_setup(){
@@ -815,7 +815,7 @@ cmd_doctor(){
     else
       case "$id" in
         *EXPIRED*)    wrn "$nm: access token EXPIRED — claude-account refresh $nm  (a paused profile is never used, so it drifts)";;
-        *"EXPIRES IN"*) wrn "$nm: credential expires within the hour — claude-account login $nm";;
+        *"EXPIRES IN"*) ok_ "$nm: signed in (access token renews itself on next use)$( [ "$used" -gt 0 ] && printf ', %s rule(s)' "$used" )";;
         *) if [ "$nm" = "$_dfb" ]; then ok_ "$nm: signed in, FALLBACK — every unrouted path uses it$( [ "$used" -gt 0 ] && printf ', plus %s rule(s)' "$used" )"
            elif [ "$used" -gt 0 ]; then ok_ "$nm: signed in, $used rule(s)"
            else wrn "$nm: signed in but no rule uses it (orphan)"; fi ;; esac
