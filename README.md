@@ -4,11 +4,11 @@ Route **Claude Code subscriptions per project path** on macOS. Open one project 
 that project's account; open anything else and it uses the one you signed in with normally.
 
 **Only the account changes.** Plugins, MCP servers, memory, settings, hooks and session history
-stay shared, because only `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set — never `CLAUDE_CONFIG_DIR`.
+stay shared, because only `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set - never `CLAUDE_CONFIG_DIR`.
 Most multi-account guides set both, which silently costs you all of the above.
 
 ```
-PATH RULES — what each project path does  (one row per rule)
+PATH RULES - what each project path does  (one row per rule)
 
   PATH                  PROFILE    STATUS  SIGNED IN AS (plan | tier)
   /project/path         work       ACTIVE  you@company.com · team
@@ -23,7 +23,7 @@ PATH RULES — what each project path does  (one row per rule)
 brew install reddeer-tech/tap/claude-account
 ```
 
-The tap is applied implicitly — there is no separate `brew tap` step.
+The tap is applied implicitly - there is no separate `brew tap` step.
 
 ### npm
 
@@ -38,7 +38,7 @@ git clone git@github.com:reddeer-tech/claude-account.git
 cd claude-account && ./install.sh
 ```
 
-### After installing — required
+### After installing - required
 
 ```sh
 claude-account setup
@@ -47,12 +47,12 @@ claude-account setup
 **This step is not optional.** Until it runs, typing `claude` still starts the real binary and
 no rule you add has any effect. It installs the routing shims and the resolver into directories
 you own (`~/bin`, `~/.config/claude-accounts`), checks the shim wins on your `PATH`, and prints
-the one line each editor needs — VS Code, Cursor, Windsurf and VSCodium all launch the Claude
+the one line each editor needs - VS Code, Cursor, Windsurf and VSCodium all launch the Claude
 binary by absolute path, so a `PATH` shim alone never reaches them. It is the same extension in
 every one of them; only the `settings.json` it reads differs, and `setup` names each file.
 
 It only *reports* on `PATH` order and editor settings rather than changing them: both mean
-editing files you own — your shell profile, and a `settings.json` that is JSONC with comments.
+editing files you own - your shell profile, and a `settings.json` that is JSONC with comments.
 
 Then `claude-account doctor` verifies the result.
 
@@ -89,10 +89,13 @@ Day to day you run nothing: open the project and work.
 | | |
 |---|---|
 | `overview` (alias `ov`) | the whole picture in one screen: every credential, its paths, live usage |
+| `statusline` | the account this session is spending - wire it into Claude Code's `statusLine` setting |
+| `undo` | restore `paths.map` from the newest automatic snapshot |
+| `list --json` | the whole state as one JSON object, for scripts |
 | `list` / `profiles` / `verify` | what routes where, and which account each holds |
 | `usage [name\|--all]` | live session/weekly/model quotas and reset times |
 | `pause` / `resume` / `switch` | park a depleted account, or move paths to another one |
-| `fallback <name>` / `fallback none` | a machine-wide stand-in for an exhausted global account — unrouted paths use that profile until cleared; no credential is copied or replaced |
+| `fallback <name>` / `fallback none` | a machine-wide stand-in for an exhausted global account - unrouted paths use that profile until cleared; no credential is copied or replaced |
 | `login` / `logout` / `refresh` | credentials; `refresh` renews an expired access token |
 | `doctor` / `setup` | health check; and one-time PATH + VS Code wiring |
 | `export` / `import` | move rules and labels to another machine |
@@ -110,11 +113,11 @@ Resolved **once, at process launch**, by a `PATH` shim for the terminal and by
 so a `PATH` shim never reaches it.
 
 A running session is therefore frozen to its launch-time routing. After `pause` or `switch`,
-restart the session — `claude -c` resumes it with full context.
+restart the session - `claude -c` resumes it with full context.
 
 ## Caveats
 
-- **macOS only** — uses the Keychain via `security`, and VS Code's settings path.
+- **macOS only** - uses the Keychain via `security`, and VS Code's settings path.
 - **Unofficial.** It relies on `CLAUDE_SECURESTORAGE_CONFIG_DIR`, the `sha256(dir)` Keychain
   naming, and an internal usage endpoint. All are internal to Claude Code and can change on
   any update.
