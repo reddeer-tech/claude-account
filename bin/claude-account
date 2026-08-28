@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.19"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.20"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -832,6 +832,38 @@ cmd_doctor(){
     case " $known " in *" $svc "*) ;; *) wrn "unreachable credential: $svc (no profile hashes to it)"; stray=$((stray+1));; esac
   done < <(security dump-keychain 2>/dev/null | grep -o '"Claude Code-credentials[^"]*"' | tr -d '"' | sort -u)
   [ "$stray" = 0 ] && ok_ "no unreachable credentials"
+
+  # LIVE SESSIONS. Everything above checks the plumbing; this checks whether the plumbing
+  # is actually being used. Routing is decided at process launch, and VS Code reads the
+  # wrapper setting only when IT starts — so a VS Code that was running before the setting
+  # was written spawns every session unrouted, forever, while every check above passes.
+  # MEASURED 2026-08-28: 0 of 14 VS Code sessions routed, VS Code up since 08-23, setting
+  # written 08-25. TuringLabs work had been billing the personal account for days, and
+  # doctor said "all good". Compare each live session's env against what its cwd resolves
+  # to; a mismatch on a rule whose profile IS signed in means the launch bypassed the shim.
+  echo; echo "live sessions"
+  local lp lcwd lwant lhave lsvc unrouted=0 total=0 ulist=""
+  for lp in $(pgrep -f 'native-binary/claude|\.local/bin/claude' 2>/dev/null); do
+    lcwd=$(lsof -a -p "$lp" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'); [ -z "$lcwd" ] && continue
+    total=$((total+1))
+    lwant=$("$RESOLVE" "$lcwd" 2>/dev/null | cut -f1); [ -z "$lwant" ] && continue
+    lsvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$lwant" | shasum -a 256 | cut -c1-8)"
+    security find-generic-password -s "$lsvc" >/dev/null 2>&1 || continue   # unsigned: falls back by design
+    lhave=$(ps eww -p "$lp" 2>/dev/null | tr ' ' '\n' | grep '^CLAUDE_SECURESTORAGE_CONFIG_DIR=' | sed 's/.*profiles\///')
+    if [ "$lhave" != "$lwant" ]; then
+      unrouted=$((unrouted+1)); ulist="$ulist
+      pid $lp  ${lcwd/#$HOME/~}  →  should be '$lwant', is ${lhave:-(global)}"
+    fi
+  done
+  if [ "$total" = 0 ]; then dim "  (no claude sessions running)"
+  elif [ "$unrouted" = 0 ]; then ok_ "$total live session(s), every routed folder carries its profile"
+  else
+    bad "$unrouted of $total live session(s) are NOT routed although their folder has a signed-in rule:$ulist"
+    echo "      They spend the GLOBAL account. Their launcher bypassed the shim — for VS Code that"
+    echo "      means it was started before the wrapper setting took effect: QUIT and reopen VS Code,"
+    echo "      then resume the sessions from history (claude -c in a terminal). /login in one of"
+    echo "      these windows would overwrite your GLOBAL credential, not the profile's."
+  fi
 
   echo
   [ "$prob" = 0 ] && [ "$warn" = 0 ] && grn "all good" \
