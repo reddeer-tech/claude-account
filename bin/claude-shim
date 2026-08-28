@@ -23,13 +23,19 @@ for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
   [ -n "$_c" ] && [ -f "$_c" ] && { RESOLVE="$_c"; break; }
 done
 RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
-self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+[ -n "${CLAUDE_ACCOUNTS_LIB:-}" ] && [ ! -f "${CLAUDE_ACCOUNTS_LIB}/resolve.sh" ] \
+  && printf 'claude: CLAUDE_ACCOUNTS_LIB=%s has no resolve.sh — using %s\n' "$CLAUDE_ACCOUNTS_LIB" "$RESOLVE" >&2
+self="$_ca_dir/$(basename "$_ca_self")"
 real=""
 IFS=: read -ra _p <<< "$PATH"
 for d in "${_p[@]}" "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
   [ -x "$d/claude" ] || continue
   cand=$(cd "$d" 2>/dev/null && pwd)/claude
-  [ "$cand" = "$self" ] && continue
+  # -ef catches a symlink or hardlink to this shim (string comparison did not, and the
+  # result was an exec ping-pong loop that hung claude forever); the header sniff
+  # catches a SECOND COPY of the shim elsewhere on PATH — keep looking for the real one.
+  [ -e "$cand" ] && [ "$cand" -ef "$self" ] && continue
+  head -c 200 "$cand" 2>/dev/null | grep -q 'Per-path Claude account routing' && continue
   real="$cand"; break
 done
 [ -z "$real" ] && { echo "claude-shim: real claude not found on PATH" >&2; exit 127; }

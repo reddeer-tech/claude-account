@@ -9,11 +9,17 @@ dir=${1:-$PWD}
 case "$dir" in /*) ;; *) dir=$(cd "$dir" 2>/dev/null && pwd) || exit 0 ;; esac
 [ -f "$MAP" ] || exit 0
 
-best_len=0; best_name=""; best_prefix=""; p_len=0; p_why=""
+best_len=0; best_name=""; best_prefix=""; best_state=""; best_why=""
 # TAB-separated so project paths may contain spaces ("Apps & Games").
-match_dir(){ # <absolute dir> — fills best_* (longest ACTIVE match) and p_* (longest PAUSED match)
+# ⚠️ ONE ranking across every state. The LONGEST matching prefix decides, whatever its
+# state; only then does its state say what happens (active → route; paused+global →
+# pinned to the real global; paused → as if unrouted, so the fallback may apply).
+# Tracking active and paused matches separately — as this file once did — let a shallow
+# ACTIVE parent beat a deeper pause and even a deeper explicit pin, spending the parent
+# profile while pause/switch/list all claimed "your GLOBAL account".
+match_dir(){ # <absolute dir> — fills best_* with the longest match of ANY state
   local d="$1" prefix name state why _rest len
-  best_len=0; best_name=""; best_prefix=""; p_len=0; p_why=""
+  best_len=0; best_name=""; best_prefix=""; best_state=""; best_why=""
   while IFS=$'\t' read -r prefix name state why _rest || [ -n "${prefix:-}" ]; do
     case "$prefix" in ''|\#*) continue ;; esac
     [ -z "$name" ] && continue
@@ -21,21 +27,21 @@ match_dir(){ # <absolute dir> — fills best_* (longest ACTIVE match) and p_* (l
     prefix="${prefix%/}"
     case "$d/" in
       "$prefix"/*) len=${#prefix}
-        # A third field of "paused" keeps the rule (and its login) but stops routing.
-        # Its FOURTH field decides, below, whether the fallback applies ("" = plain
-        # pause) or is suppressed ("global" = an explicit pin via `switch <x> global`).
-        if [ "$state" = "paused" ]; then
-          if [ "$len" -gt "$p_len" ]; then p_len=$len; p_why="${why:-}"; fi
-        else
-          if [ "$len" -gt "$best_len" ]; then best_len=$len; best_name=$name; best_prefix=$prefix; fi
+        if [ "$len" -gt "$best_len" ]; then
+          best_len=$len; best_name=$name; best_prefix=$prefix
+          best_state="${state:-}"; best_why="${why:-}"
         fi ;;
     esac
   done < "$MAP"
 }
 
+# A symlinked cwd never string-matches a rule stored in physical spelling (and vice
+# versa) — try the physical form as a second candidate before the worktree walk.
+dirP=$(cd "$dir" 2>/dev/null && pwd -P) || dirP="$dir"
 match_dir "$dir"
+[ -z "$best_name" ] && [ "$dirP" != "$dir" ] && match_dir "$dirP"
 via=""
-if [ -z "$best_name" ] && [ "$p_len" -eq 0 ]; then
+if [ -z "$best_name" ]; then
   # NO rule of any kind covers this dir. It may be a LINKED GIT WORKTREE of a routed
   # repo (`git worktree add`, showrunner, …): the worktree lives outside every rule's
   # prefix, so without this step that work would silently bill the global account.
@@ -47,6 +53,9 @@ if [ -z "$best_name" ] && [ "$p_len" -eq 0 ]; then
     [ -e "$wt/.git" ] && break
     wt="${wt%/*}"; hops=$((hops+1))
   done
+  [ ! -f "${wt:-/}/.git" ] && [ "$dirP" != "$dir" ] && { wt="$dirP"; hops=0
+    while [ -n "$wt" ] && [ "$wt" != "/" ] && [ "$hops" -lt 64 ]; do
+      [ -e "$wt/.git" ] && break; wt="${wt%/*}"; hops=$((hops+1)); done; }
   if [ -n "$wt" ] && [ "$wt" != "/" ] && [ -f "$wt/.git" ]; then
     g=""; IFS= read -r g < "$wt/.git" 2>/dev/null || true
     case "$g" in gitdir:*) g="${g#gitdir:}"; g="${g# }" ;; *) g="" ;; esac
@@ -63,13 +72,14 @@ if [ -z "$best_name" ] && [ "$p_len" -eq 0 ]; then
   fi
 fi
 
-if [ -n "$best_name" ]; then
+if [ -n "$best_name" ] && [ "$best_state" != "paused" ]; then
   printf '%s\t%s\t%s\n' "$best_name" "$PROFILES/$best_name" "$best_prefix$via"
   exit 0
 fi
-# `switch <x> global` is an explicit choice of the real global account, so it suppresses
-# the fallback; a plain pause behaves as if unrouted.
-[ "$p_len" -gt 0 ] && [ "$p_why" = "global" ] && exit 0
+# The longest match is PAUSED (or nothing matched). `switch <x> global` is an explicit
+# choice of the real global account, so it suppresses the fallback; a plain pause
+# behaves as if unrouted.
+[ "$best_state" = "paused" ] && [ "$best_why" = "global" ] && exit 0
 # Machine-wide fallback: one profile name in $PROFILES/.fallback. Regex-gated and NOT
 # dir-checked — the Keychain entry is keyed on the dir PATH STRING and the shims
 # mkdir -p it, so a hand-deleted dir must not silently revert the machine to the

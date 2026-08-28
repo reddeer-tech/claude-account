@@ -1,4 +1,4 @@
-# claude-account
+# Claude Account
 
 Route **Claude Code subscriptions per project path** on macOS. Open one project and Claude uses
 that project's account; open anything else and it uses the one you signed in with normally.
@@ -12,7 +12,7 @@ PATH RULES - what each project path does  (one row per rule)
 
   PATH                  PROFILE    STATUS  SIGNED IN AS (plan | tier)
   /project/path         work       ACTIVE  you@company.com · team
-  /another/project      personal   PAUSED  using global: you@personal.com · max   (login kept)
+  /another/project      personal   PAUSED  using (global): you@personal.com · max   (login kept)
 ```
 
 ## Install

@@ -24,6 +24,8 @@ for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
   [ -n "$_c" ] && [ -f "$_c" ] && { RESOLVE="$_c"; break; }
 done
 RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
+[ -n "${CLAUDE_ACCOUNTS_LIB:-}" ] && [ ! -f "${CLAUDE_ACCOUNTS_LIB}/resolve.sh" ] \
+  && printf 'claude: CLAUDE_ACCOUNTS_LIB=%s has no resolve.sh — using %s\n' "$CLAUDE_ACCOUNTS_LIB" "$RESOLVE" >&2
 real="$1"
 if [ -z "$real" ] || [ ! -x "$real" ]; then
   echo "claude-vscode-wrapper: expected the real claude binary as argv[1] (got '${real:-<empty>}')" >&2

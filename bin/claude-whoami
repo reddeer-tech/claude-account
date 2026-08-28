@@ -20,17 +20,38 @@ for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
   [ -n "$_c" ] && [ -f "$_c" ] && { RESOLVE="$_c"; break; }
 done
 RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
+[ -n "${CLAUDE_ACCOUNTS_LIB:-}" ] && [ ! -f "${CLAUDE_ACCOUNTS_LIB}/resolve.sh" ] \
+  && printf 'claude: CLAUDE_ACCOUNTS_LIB=%s has no resolve.sh — using %s\n' "$CLAUDE_ACCOUNTS_LIB" "$RESOLVE" >&2
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
+PORC=0
+case "${1:-}" in -q|--porcelain) PORC=1; shift ;; esac
 dir=${1:-$PWD}
 # Same global token and colour the CLI uses, so the two never disagree about what
 # "global" looks like. Colour only to a terminal, and never when NO_COLOR is set.
 CA_GTAG="(global)"
 if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then GT=$'\033[36m'"$CA_GTAG"$'\033[0m'; else GT="$CA_GTAG"; fi
-echo "directory     : $dir"
 line=$([ -x "$RESOLVE" ] && "$RESOLVE" "$dir" 2>/dev/null)
+# --porcelain: exactly one ANSI-free line for scripts:  <account>\t<source>\t<signed_in>
+# source ∈ env-override|token-override|rule|worktree|fallback|none ; signed_in ∈ yes|no|error|-
+if [ "$PORC" = 1 ]; then
+  if [ -n "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ]; then
+    printf '%s\tenv-override\t-\n' "$(basename "$CLAUDE_SECURESTORAGE_CONFIG_DIR")"; exit 0
+  fi
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then printf '(token)\ttoken-override\t-\n'; exit 0; fi
+  if [ -z "$line" ]; then printf '(global)\tnone\t-\n'; exit 0; fi
+  pn=$(printf '%s' "$line" | cut -f1); pd=$(printf '%s' "$line" | cut -f2); pr=$(printf '%s' "$line" | cut -f3)
+  src=rule; case "$pr" in "(fallback)") src=fallback ;; *" (worktree)") src=worktree ;; esac
+  security find-generic-password -s "Claude Code-credentials-$(printf '%s' "$pd" | shasum -a 256 | cut -c1-8)" >/dev/null 2>&1
+  case $? in 0) si=yes ;; 44) si=no ;; *) si=error ;; esac
+  printf '%s\t%s\t%s\n' "$pn" "$src" "$si"; exit 0
+fi
+echo "directory     : $dir"
 if [ -n "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ]; then
   echo "account       : (explicit override in env)"
   echo "profile dir   : $CLAUDE_SECURESTORAGE_CONFIG_DIR"
+elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  echo "account       : (explicit OAuth token override in env — CLAUDE_CODE_OAUTH_TOKEN)"
+  echo "                the token wins over every rule; routing is bypassed for this shell"
 elif [ -z "$line" ]; then
   # resolve.sh skips a PAUSED rule, so a bare "none" is a half-truth: there IS a rule here,
   # it is simply not routing. Saying "none" sends you looking for a rule you already have.
@@ -43,7 +64,7 @@ elif [ -z "$line" ]; then
   if [ -n "$parked" ]; then
     echo "matched rule  : $(printf '%s' "$parked" | cut -f1)"
     echo "                ...but it is $(printf '%s' "$parked" | cut -f3), so it is NOT routing"
-    echo "account       : $GT — resume it with:  claude-account resume $(printf '%s' "$parked" | cut -f2)"
+    echo "account       : $GT — resume JUST this path with:  claude-account resume '$(printf '%s' "$parked" | cut -f1)'"
   else
     echo "matched rule  : none"
     echo "account       : $GT — whatever you signed in with (VS Code \"Switch account\")"
@@ -61,15 +82,18 @@ elif [ "$(printf '%s' "$line" | cut -f3)" = "(fallback)" ]; then
   if [ -n "$parked" ]; then
     echo "matched rule  : $(printf '%s' "$parked" | cut -f1)"
     echo "                ...but it is paused, so it is NOT routing"
-    echo "account       : $name — via the machine FALLBACK (resume the rule: claude-account resume $(printf '%s' "$parked" | cut -f2))"
+    echo "account       : $name — via the machine FALLBACK (resume JUST this path: claude-account resume '$(printf '%s' "$parked" | cut -f1)')"
   else
     echo "matched rule  : none — the machine FALLBACK applies"
     echo "account       : $name  (clear with: claude-account fallback none)"
   fi
   echo "profile dir   : $pdir"
   svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-  if security find-generic-password -s "$svc" >/dev/null 2>&1; then
+  security find-generic-password -s "$svc" >/dev/null 2>&1; _fsrc=$?
+  if [ "$_fsrc" -eq 0 ]; then
     echo "login         : signed in"
+  elif [ "$_fsrc" -ne 44 ]; then
+    echo "login         : could not verify (security exit $_fsrc) — the shim routes to it anyway"
   else
     echo "login         : NOT signed in — this folder falls back to $GT"
     echo "                run:  claude-account login $name   (or: claude-account fallback none)"

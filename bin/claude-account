@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.24"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.25"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -27,6 +27,8 @@ for _c in "${CLAUDE_ACCOUNTS_LIB:-}/resolve.sh" \
   [ -n "$_c" ] && [ -f "$_c" ] && { RESOLVE="$_c"; break; }
 done
 RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
+[ -n "${CLAUDE_ACCOUNTS_LIB:-}" ] && [ ! -f "${CLAUDE_ACCOUNTS_LIB}/resolve.sh" ] \
+  && printf 'claude-account: CLAUDE_ACCOUNTS_LIB=%s has no resolve.sh — using %s\n' "$CLAUDE_ACCOUNTS_LIB" "$RESOLVE" >&2
 # Where paths.map snapshots go before every mutation. This was hardcoded to the author's
 # lab folder, which would have created ~/workspace/_lab/... on every installed machine.
 # Keep an existing lab dir if it is already there, so nobody's history moves under them.
@@ -129,7 +131,9 @@ cmd_verify(){
         printf '  %-46s → %s · paused     (login for %s kept)\n' "${prefix/#$HOME/~}" "$(gtag)" "'$name'"
       fi
       continue; fi
-    printf '  %-46s %s\n' "${prefix/#$HOME/~}" "$(acct_identity "$PROFILES/$name")"
+    local vid; vid=$(acct_identity "$PROFILES/$name")
+    case "$vid" in *"NOT LOGGED IN"*) vid="$vid  → uses $CA_GTAG + warns at launch" ;; esac
+    printf '  %-46s %s\n' "${prefix/#$HOME/~}" "$vid"
   done < "$MAP"
   [ "$any" = 0 ] && dim "  (no path rules)"
   local _vfb2; _vfb2=$(get_fallback) || _vfb2=""
@@ -251,7 +255,8 @@ map_lock(){
     sleep 0.05
   done
   CA_MAP_LOCKED=1
-  trap 'rmdir "$(dirname "$MAP")/.map.lock" 2>/dev/null' EXIT
+  CA_LOCK="$lock"
+  trap 'rmdir "$CA_LOCK" 2>/dev/null' EXIT INT TERM HUP PIPE
 }
 
 # F6 (from chatmux): tmp + rename for every one-line state file, so a reader never
@@ -264,8 +269,23 @@ write_line(){ # <file> <content>
 backup(){ map_lock || exit 1; mkdir -p "$BK"; cp "$MAP" "$BK/paths.map.$(date +%Y%m%d-%H%M%S)${1:+-$1}" 2>/dev/null; }
 
 norm(){ local p="$1"; case "$p" in "~"*) p="$HOME${p#\~}";; esac
-  p="${p%/}"; case "$p" in /*) ;; *) p="$(cd "$p" 2>/dev/null && pwd)" || return 1;; esac
+  while [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  [ -z "$p" ] && return 1      # "add /" stripped to nothing; `cd ""` would bind $PWD
+  case "$p" in /*) ;; *) p="$(cd "$p" 2>/dev/null && pwd)" || return 1;; esac
   printf '%s\n' "$p"; }
+
+# A path argument that is a SUBFOLDER of a rule gets "no rule matches", which reads
+# as "this folder is unrouted" — it is not. Say which rule covers it.
+covering_rule_hint(){ # <path-or-name arg>
+  case "$1" in /*|~*|./*|../*) ;; *) return 0 ;; esac
+  local pth; pth=$(norm "$1" 2>/dev/null) || return 0
+  local line; line=$("$RESOLVE" "$pth" 2>/dev/null); [ -z "$line" ] && return 0
+  [ "$(printf '%s' "$line" | cut -f3)" = "(fallback)" ] && return 0
+  local pre nm; pre=$(printf '%s' "$line" | cut -f3); nm=$(printf '%s' "$line" | cut -f1)
+  pre="${pre% (worktree)}"
+  dim "  no rule at THIS exact path, but ${pre/#$HOME/~} (profile '$nm') covers it —"
+  dim "  act on that rule's own path, or pass the profile name."
+}
 
 # pause/resume: keep the rule AND the login, but stop routing so the path falls
 # back to the global account. Nothing is deleted, so resume needs no re-auth.
@@ -282,7 +302,7 @@ set_state(){ # <path> <state|""> [why]
     /^[ \t]*#/ || NF==0 { print; next }
     $1==t {
       if (st=="")      print $1,$2
-      else if (wy=="") print $1,$2,st
+      else if (wy=="") { if ($4=="global") print $1,$2,st,$4; else print $1,$2,st }
       else             print $1,$2,st,wy
       next }
     { print }' "$MAP" > "$tmp" && write_map "$tmp" "$before"
@@ -311,9 +331,13 @@ paths_for(){ # <path|name>
 cmd_pause(){ # <path|name> [why]
   [ -z "${1:-}" ] && { red "usage: claude-account pause <path|profile-name>"; exit 2; }
   local hits; hits=$(paths_for "$1")
-  [ -z "$hits" ] && { red "no rule matches: $1"; dim "  see:  claude-account list"; exit 1; }
+  [ -z "$hits" ] && { red "no rule matches: $1"; covering_rule_hint "$1"; dim "  see:  claude-account list"; exit 1; }
   backup "pause"
   local why="${2:-}"
+  case "$why" in ""|global) ;; *)
+    red "unexpected argument '$why' — pause takes a path or a profile name only"
+    dim "  to pin a path to the real global account:  claude-account switch <x> global"
+    exit 2 ;; esac
   local n=0 verb="paused"; [ "$why" = "global" ] && verb="moved "
   while IFS= read -r pth; do [ -z "$pth" ] && continue
     set_state "$pth" paused "$why"; n=$((n+1)); echo "  $verb   $pth"; done <<< "$hits"
@@ -344,7 +368,7 @@ cmd_pause(){ # <path|name> [why]
 cmd_resume(){
   [ -z "${1:-}" ] && { red "usage: claude-account resume <path|profile-name>"; exit 2; }
   local hits; hits=$(paths_for "$1")
-  [ -z "$hits" ] && { red "no rule matches: $1"; exit 1; }
+  [ -z "$hits" ] && { red "no rule matches: $1"; covering_rule_hint "$1"; exit 1; }
   backup "resume"
   local n=0
   while IFS= read -r pth; do [ -z "$pth" ] && continue
@@ -514,12 +538,20 @@ status_cell(){ # <state> <width>   — list's STATUS column: active | paused
 # still bound here and is NOT using it. Saying "→ global (switched)" on the profile's own
 # row read as though the PROFILE had moved; it never does. Only the path stops routing.
 usedby_cell(){ # <state>   active | paused | global
-  local why
+  local why fbn=""
   case "${1:-}" in
-    paused) why="paused" ;;
+    # a PLAIN pause goes wherever unrouted paths go — the fallback when one is set.
+    # Rendering "(global)" here while a fallback billed another profile was a lie on
+    # the exact surface people check. A PIN (switched) always means the real global.
+    paused) why="paused"; fbn=$(get_fallback 2>/dev/null) || fbn="" ;;
     global) why="switched" ;;
     *)      if _use_colour; then printf '\033[32min use\033[0m'; else printf 'in use'; fi; return ;;
   esac
+  if [ -n "$fbn" ]; then
+    if _use_colour; then printf "\033[38;5;208mnot in use → '%s' (fallback) · paused\033[0m" "$fbn"
+    else printf "not in use → '%s' (fallback) · paused" "$fbn"; fi
+    return
+  fi
   # orange for "bound but not routing", with the tag keeping the global colour
   if _use_colour; then printf '\033[38;5;208mnot in use → %s%s\033[38;5;208m · %s%s' "$CA_OFF" "$(gtag)" "$why" "$CA_OFF"
   else printf 'not in use → %s · %s' "$CA_GTAG" "$why"; fi
@@ -710,8 +742,10 @@ cmd_import(){
   [ -z "$f" ] && { red "usage: claude-account import <file>"; exit 2; }
   [ -f "$f" ] || { red "no such file: $f"; exit 2; }
   backup "import"
-  local rules=0 labels=0 skipped=0 rejected=0
-  while IFS=$'\t' read -r kind a b c d; do
+  local rules=0 labels=0 skipped=0 rejected=0 unknown=0 unkinds=""
+  while IFS=$'\t' read -r kind a b c d || [ -n "${kind:-}" ]; do
+    # a hand-edited TSV from Windows carries \r on the last field of every row
+    kind="${kind%$'\r'}"; a="${a%$'\r'}"; b="${b%$'\r'}"; c="${c%$'\r'}"; d="${d%$'\r'}"
     case "$kind" in
       rule)
         if awk -F'\t' -v p="$a" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
@@ -728,6 +762,10 @@ cmd_import(){
           rejected=$((rejected+1)); continue; fi
         if [ "$b" = "none" ]; then
           yel "  rejected: '$a' names the reserved profile 'none'"; rejected=$((rejected+1)); continue; fi
+        case "${c:-active}" in active|paused) ;; *)
+          yel "  rejected: bad state '${c}' on $a (space-mangled row?)"; rejected=$((rejected+1)); continue ;; esac
+        case "${d:-}" in ""|global) ;; *)
+          yel "  rejected: bad 4th field '${d}' on $a"; rejected=$((rejected+1)); continue ;; esac
         mkdir -p "$PROFILES/$b"
         ensure_final_newline "$MAP"
         if [ "${c:-active}" = "paused" ] && [ -n "${d:-}" ]; then printf '%s\t%s\tpaused\t%s\n' "$a" "$b" "$d" >> "$MAP"
@@ -744,15 +782,28 @@ cmd_import(){
         case "$a" in global|none) yel "  rejected fallback: '$a' is reserved"; rejected=$((rejected+1)); continue ;; esac
         if [ -f "$PROFILES/.fallback" ]; then
           yel "  skipped fallback '$a' — one is already set"; skipped=$((skipped+1)); continue; fi
+        if ! security find-generic-password -s "Claude Code-credentials-$(printf '%s' "$PROFILES/$a" | shasum -a 256 | cut -c1-8)" >/dev/null 2>&1; then
+          yel "  fallback '$a' NOT applied — that profile is not signed in on this machine"
+          dim "    claude-account login $a   then:   claude-account fallback $a"
+          skipped=$((skipped+1)); continue; fi
         mkdir -p "$PROFILES/$a"; write_line "$PROFILES/.fallback" "$a"
         grn "  fallback set: unrouted paths use '$a'  (clear: claude-account fallback none)" ;;
+      ''|\#*) ;;                                   # blank lines and the export header
+      *) unknown=$((unknown+1))
+         case " $unkinds " in *" $kind "*) ;; *) unkinds="${unkinds:+$unkinds }$kind" ;; esac ;;
     esac
   done < "$f"
   grn "Imported $rules rule(s) and $labels label(s)."
   [ "$skipped" -gt 0 ]  && dim "Skipped $skipped path(s) that already had a rule."
   [ "$rejected" -gt 0 ] && yel "Rejected $rejected row(s) — see the reasons above."
+  [ "$unknown" -gt 0 ]  && dim "Ignored $unknown row(s) of unknown kind(s): $unkinds  (from a newer export?)"
   dim "Credentials are not importable — sign in on this machine:"
-  cmd_profiles --no-refresh 2>/dev/null | awk '/NOT LOGGED IN/{print "    claude-account login "$1}'
+  local d2 nm3
+  for d2 in "$PROFILES"/*/; do
+    [ -d "$d2" ] || continue; nm3=$(basename "$d2")
+    security find-generic-password -s "Claude Code-credentials-$(printf '%s' "${d2%/}" | shasum -a 256 | cut -c1-8)" >/dev/null 2>&1 \
+      || echo "    claude-account login $nm3"
+  done
 }
 
 # The Claude Code extension is one extension that runs in every VS Code-family editor, and
@@ -762,16 +813,19 @@ cmd_import(){
 # dir or extensions dir present), so setup and doctor can speak about each by name.
 editors(){
   local spec label sdir xdir
+  local adir
   for spec in \
-    "VS Code|Code|.vscode" \
-    "VS Code Insiders|Code - Insiders|.vscode-insiders" \
-    "Cursor|Cursor|.cursor" \
-    "Windsurf|Windsurf|.windsurf" \
-    "VSCodium|VSCodium|.vscode-oss"; do
-    label="${spec%%|*}"; sdir="${spec#*|}"; sdir="${sdir%%|*}"; xdir="${spec##*|}"
+    "VS Code|Code|.vscode|Visual Studio Code" \
+    "VS Code Insiders|Code - Insiders|.vscode-insiders|Visual Studio Code - Insiders" \
+    "Cursor|Cursor|.cursor|Cursor" \
+    "Windsurf|Windsurf|.windsurf|Windsurf" \
+    "VSCodium|VSCodium|.vscode-oss|VSCodium"; do
+    label="${spec%%|*}"; spec="${spec#*|}"
+    sdir="${spec%%|*}"; spec="${spec#*|}"
+    xdir="${spec%%|*}"; adir="${spec##*|}"
     local sp="$HOME/Library/Application Support/$sdir/User/settings.json" xp="$HOME/$xdir/extensions"
     if [ -d "$HOME/Library/Application Support/$sdir" ] || [ -d "$xp" ]; then
-      printf '%s\t%s\t%s\n' "$label" "$sp" "$xp"
+      printf '%s\t%s\t%s\t%s\n' "$label" "$sp" "$xp" "$adir"
     fi
   done
 }
@@ -810,6 +864,9 @@ cmd_setup(){
   # `brew upgrade` cannot leave an old resolver under a new CLI.
   local cfg="$HOME/.config/claude-accounts"
   mkdir -p "$cfg" "$cfg/profiles"
+  # remember where the shims landed, so doctor checks the SAME place — its old
+  # hardcoded ~/bin contradicted setup's own BINDIR escape hatch
+  write_line "$cfg/.bindir" "$bindir"
   if [ -n "$pkg_res" ]; then
     if [ ! -f "$cfg/resolve.sh" ]; then
       install -m 0755 "$pkg_res" "$cfg/resolve.sh"; grn "Installed the resolver into $cfg."
@@ -871,8 +928,8 @@ cmd_setup(){
     echo "        export PATH=\"$bindir:\$PATH\""
   fi
 
-  local found=0 el es ex
-  while IFS=$'\t' read -r el es ex; do
+  local found=0 el es ex ea
+  while IFS=$'\t' read -r el es ex ea; do
     [ -z "$el" ] && continue; found=1
     if [ -f "$es" ] && grep -q 'claudeCode.claudeProcessWrapper' "$es"; then
       grn "$el: wrapper already configured."
@@ -896,35 +953,50 @@ cmd_doctor(){
   case " $* " in *" --no-refresh "*) CA_NO_REFRESH=1 ;; esac
   refresh_expired_all
   local prob=0 warn=0
+  local dbin; dbin=$(head -1 "$HOME/.config/claude-accounts/.bindir" 2>/dev/null)
+  [ -n "$dbin" ] || dbin="$HOME/bin"
   bad(){ red "  ✗ $*"; prob=$((prob+1)); }
   wrn(){ yel "  ! $*"; warn=$((warn+1)); }
   ok_(){ grn "  ✓ $*"; }
   echo "CLAUDE ACCOUNT DOCTOR"; echo
 
   echo "routing plumbing"
-  [ -x "$HOME/bin/claude" ] && ok_ "terminal shim present" || bad "missing shim ~/bin/claude"
+  [ -x "$dbin/claude" ] && ok_ "terminal shim present" || bad "missing shim $dbin/claude"
   # Check the shell the USER actually gets (login shell), not whatever PATH this
   # process happens to have inherited — a tool-spawned shell may lack ~/bin and
   # would report a false failure.
   local login_first; login_first=$("$SHELL" -lc 'command -v claude' 2>/dev/null | tail -1)
   local here_first;  here_first=$(bash -c 'command -v claude' 2>/dev/null)
-  if [ "$login_first" = "$HOME/bin/claude" ]; then ok_ "shim wins PATH in your login shell"
+  if [ "$login_first" = "$dbin/claude" ]; then ok_ "shim wins PATH in your login shell"
   elif [ -n "$login_first" ]; then bad "login shell resolves claude to '$login_first', not the shim — terminal routing is bypassed"
   else bad "claude not found on your login shell's PATH"; fi
-  if [ "$here_first" != "$HOME/bin/claude" ]; then
+  if [ "$here_first" != "$dbin/claude" ]; then
     wrn "this shell resolves claude to '${here_first:-<not found>}' — fine for a tool-spawned shell, but scripts run from here are unrouted"
   fi
-  [ -x "$HOME/bin/claude-vscode-wrapper" ] && ok_ "VS Code wrapper present" || bad "missing VS Code wrapper"
+  [ -x "$dbin/claude-vscode-wrapper" ] && ok_ "VS Code wrapper present" || bad "missing VS Code wrapper"
   # one line per editor: a problem only where the Claude extension is actually installed
-  local _ed=0 el es ex
-  while IFS=$'\t' read -r el es ex; do
+  local _ed=0 el es ex ea epid est emt
+  while IFS=$'\t' read -r el es ex ea; do
     [ -z "$el" ] && continue; _ed=1
     if [ -f "$es" ] && grep -q 'claudeProcessWrapper' "$es"; then ok_ "$el: setting points at the wrapper"
+      # a setting the running app has never loaded is a setting that does nothing:
+      # the app reads it only at ITS start. Caught live 2026-08-28 — 0/14 sessions
+      # routed under a VS Code older than the setting, doctor all green.
+      epid=$(pgrep -f "/Applications/$ea.app/Contents/MacOS/" 2>/dev/null | head -1)
+      if [ -n "$epid" ]; then
+        est=$(ps -o lstart= -p "$epid" 2>/dev/null | python3 -c 'import sys,time
+s=sys.stdin.read().strip()
+print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else "")' 2>/dev/null)
+        emt=$(stat -f %m "$es" 2>/dev/null)
+        if [ -n "$est" ] && [ -n "$emt" ] && [ "$est" -lt "$emt" ]; then
+          bad "$el has been running since BEFORE its settings.json was last written — its sessions may bypass the wrapper. QUIT and reopen $el."
+        fi
+      fi
     elif editor_has_claude "$ex"; then bad "$el: Claude extension installed but claudeCode.claudeProcessWrapper not set — its sessions are unrouted (claude-account setup prints the line)"
     else wrn "$el: found, wrapper setting not set — only matters if you run Claude from it"; fi
   done < <(editors)
   [ "$_ed" = 0 ] && dim "  (no VS Code-family editor found)"
-  local cc; cc=$(grep -c 'CLAUDE_CONFIG_DIR' "$HOME/bin/claude" "$HOME/bin/claude-vscode-wrapper" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+  local cc; cc=$(grep -c 'CLAUDE_CONFIG_DIR' "$dbin/claude" "$dbin/claude-vscode-wrapper" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
   [ "$cc" = 0 ] && ok_ "CLAUDE_CONFIG_DIR never set (config stays shared)" || bad "CLAUDE_CONFIG_DIR is set somewhere — profiles would lose plugins/MCP/memory"
   [ -x "$RESOLVE" ] && ok_ "resolver present" || bad "missing $RESOLVE"
   # which claude the shim will exec, and where it came from — turns "works on my
@@ -966,10 +1038,10 @@ cmd_doctor(){
     bad "the shims' resolver $_cfgres differs from this version's — run: claude-account setup"
   else ok_ "shims' resolver present and current"; fi
   local _drift=0
-  [ -n "${_pkg_shim:-}" ] && [ -f "$HOME/bin/claude" ] && ! cmp -s "$_pkg_shim" "$HOME/bin/claude" && _drift=1
-  [ -n "${_pkg_wrap:-}" ] && [ -f "$HOME/bin/claude-vscode-wrapper" ] && ! cmp -s "$_pkg_wrap" "$HOME/bin/claude-vscode-wrapper" && _drift=1
-  if [ "$_drift" = 1 ]; then wrn "the ~/bin shims differ from this version's copies (stale after an upgrade?) — run: claude-account setup"
-  elif [ -n "${_pkg_shim:-}" ]; then ok_ "~/bin shims match this version"; fi
+  [ -n "${_pkg_shim:-}" ] && [ -f "$dbin/claude" ] && ! cmp -s "$_pkg_shim" "$dbin/claude" && _drift=1
+  [ -n "${_pkg_wrap:-}" ] && [ -f "$dbin/claude-vscode-wrapper" ] && ! cmp -s "$_pkg_wrap" "$dbin/claude-vscode-wrapper" && _drift=1
+  if [ "$_drift" = 1 ]; then wrn "the $dbin shims differ from this version's copies (stale after an upgrade?) — run: claude-account setup"
+  elif [ -n "${_pkg_shim:-}" ]; then ok_ "$dbin shims match this version"; fi
 
   # the machine-wide fallback, if any — a redirect this large must be loud here
   local fbraw=""; [ -f "$PROFILES/.fallback" ] && IFS= read -r fbraw < "$PROFILES/.fallback"
@@ -1043,10 +1115,19 @@ cmd_doctor(){
   # to; a mismatch on a rule whose profile IS signed in means the launch bypassed the shim.
   echo; echo "live sessions"
   local lp lcwd lwant lhave lsvc unrouted=0 total=0 ulist=""
+  local prefb=0 lline lsrc
   for lp in $(pgrep -f 'native-binary/claude|\.local/bin/claude' 2>/dev/null); do
     lcwd=$(lsof -a -p "$lp" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'); [ -z "$lcwd" ] && continue
     total=$((total+1))
-    lwant=$("$RESOLVE" "$lcwd" 2>/dev/null | cut -f1); [ -z "$lwant" ] && continue
+    lline=$("$RESOLVE" "$lcwd" 2>/dev/null)
+    lwant=$(printf '%s' "$lline" | cut -f1); [ -z "$lwant" ] && continue
+    lsrc=$(printf '%s' "$lline" | cut -f3)
+    if [ "$lsrc" = "(fallback)" ]; then
+      # launched before the fallback was set — the launcher did nothing wrong
+      lhave=$(ps eww -p "$lp" 2>/dev/null | tr ' ' '\n' | grep '^CLAUDE_SECURESTORAGE_CONFIG_DIR=' | sed 's/.*profiles\///')
+      [ "$lhave" != "$lwant" ] && prefb=$((prefb+1))
+      continue
+    fi
     lsvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$lwant" | shasum -a 256 | cut -c1-8)"
     security find-generic-password -s "$lsvc" >/dev/null 2>&1 || continue   # unsigned: falls back by design
     lhave=$(ps eww -p "$lp" 2>/dev/null | tr ' ' '\n' | grep '^CLAUDE_SECURESTORAGE_CONFIG_DIR=' | sed 's/.*profiles\///')
@@ -1055,6 +1136,7 @@ cmd_doctor(){
       pid $lp  ${lcwd/#$HOME/~}  →  should be '$lwant', is ${lhave:-(global)}"
     fi
   done
+  [ "$prefb" -gt 0 ] && wrn "$prefb session(s) predate the fallback — they spend the global account until restarted (claude -c)"
   if [ "$total" = 0 ]; then dim "  (no claude sessions running)"
   elif [ "$unrouted" = 0 ]; then ok_ "$total live session(s), every routed folder carries its profile"
   else
@@ -1090,12 +1172,12 @@ cmd_switch(){
   fi
   local target; target=$(to_profile "$2") || exit $?
   local hits; hits=$(paths_for "$1")
-  if [ -z "$hits" ]; then red "no rule matches: $1"; dim "  see:  claude-account list"; exit 1; fi
+  if [ -z "$hits" ]; then red "no rule matches: $1"; covering_rule_hint "$1"; dim "  see:  claude-account list"; exit 1; fi
   local from; from=$(awk -F'\t' -v t="$(printf '%s' "$hits" | head -1)" '$1==t{print $2}' "$MAP" 2>/dev/null | head -1)
   if [ "$from" = "$target" ]; then
     # Same profile: a no-op UNLESS the rows are paused, in which case the intent is
     # plainly "use this profile again" — so resume rather than silently doing nothing.
-    if awk -F'\t' -v n="$target" '$2==n && $3=="paused"{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
+    if awk -F'\t' -v n="$target" '$1 !~ /^[ \t]*#/ && $2==n && $3=="paused"{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
       cmd_resume "$1"; return 0
     fi
     yel "Those paths already use '$target' — nothing to do."; exit 0
@@ -1169,6 +1251,7 @@ cmd_logout(){
       yel "  will fail with 'Not logged in' until you sign in again:"
       printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
     else
+      backup "logout-$name"
       while IFS= read -r pth; do [ -z "$pth" ] && continue; set_state "$pth" paused; done <<< "$hits"
       echo "  paused its paths so they use your GLOBAL account instead of failing:"
       printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
@@ -1473,6 +1556,11 @@ cmd_fallback(){
     fi
     return 0
   fi
+  case "$a" in /*|~*|./*|../*)
+    red "the fallback is MACHINE-WIDE — it takes a profile NAME, not a path."
+    dim "  to park just this path:  claude-account pause '$a'    (or: switch '$a' global)"
+    local _fn; _fn=$(to_profile "$a" 2>/dev/null) && dim "  to make its profile the machine-wide fallback:  claude-account fallback $_fn"
+    exit 2 ;; esac
   if [ "$a" = "global" ]; then
     red "unrouted paths already use the global account when no fallback is set —"
     red "there is nothing to point at."
@@ -1557,6 +1645,12 @@ $fbrow"; fi
   else
     printf '  %s %-52s %s\n' "$(gcell "$CA_GTAG" 13)" "$CA_GLOBAL_ID" "every path with no rule"
   fi
+  local dup; dup=$( { for d in "$PROFILES"/*/; do [ -d "$d" ] || continue
+        local _l; _l=$(profile_label "${d%/}"); [ -n "$_l" ] && printf '%s\t%s\n' "$_l" "$(basename "$d")"; done
+      local _g; _g=$(head -1 "$PROFILES/.global-account" 2>/dev/null)
+      [ -n "$_g" ] && printf '%s\t%s\n' "$_g" "(global)"; } \
+    | awk -F'\t' '{n[$1]=n[$1]", "$2; c[$1]++} END{for(k in n) if(c[k]>1) printf "  note: %s record the SAME account (%s) — one quota, not two\n", substr(n[k],3), k}' )
+  [ -n "$dup" ] && { echo; yel "$dup"; }
   echo
   dim "  The email is RECORDED AT LOGIN (from ~/.claude.json, which reflects the most"
   dim "  recent sign-in) — the token itself carries no identity. Set one by hand with:"
@@ -1576,13 +1670,20 @@ usage_bars(){ # <profile-dir or "" for global>
   body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
       -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
   if printf '%s' "$body" | grep -q 'authentication_error\|token has expired'; then
-    if refresh_token_if_needed "$pdir" >/dev/null 2>&1; then
+    if [ "${CA_NO_REFRESH:-0}" = "1" ]; then
+      dim "  (access token expired — not renewing under --no-refresh)"; return 0; fi
+    refresh_token_if_needed "$pdir" >/dev/null 2>&1; local _rrc=$?
+    if [ "$_rrc" = 0 ] || [ "$_rrc" = 2 ]; then
       tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
             | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
       body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
              -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
     fi
-    printf '%s' "$body" | grep -q 'authentication_error' && { red "  could not refresh — sign in again"; return 0; }
+    if printf '%s' "$body" | grep -q 'authentication_error'; then
+      if [ "$_rrc" = 2 ]; then red "  the token looks valid locally but the API rejects it — sign in again"
+      else red "  could not refresh — sign in again"; fi
+      return 0
+    fi
   fi
   if [ -z "$body" ] || ! printf '%s' "$body" | head -c1 | grep -q '{'; then
     red "  could not reach the usage endpoint"; return 0; fi
@@ -1709,7 +1810,7 @@ cmd_list(){
   while IFS=$'\t' read -r prefix name state why || [ -n "${prefix:-}" ]; do
     case "$prefix" in ''|\#*) continue;; esac; [ -z "${name:-}" ] && continue
     any=1
-    local pdir="$PROFILES/$name" st="no"      # must precede the paused branch:
+    local pdir="$PROFILES/$name" st=""        # must precede the paused branch:
     if [ "${state:-}" = "paused" ]; then      # it leaked the previous row's pdir
       # Whichever way the row got parked, the IDENTITY shown is the GLOBAL account's,
       # because that is what the path spends. Printing the parked profile's own
@@ -1760,8 +1861,12 @@ cmd_list(){
         else post=$'\033[31m'"$post"$'\033[0m'; fi
       fi
       printf '  %-40s %s %s %s\n' "${prefix/#$HOME/~}" "$(gcell "$col" 12)" "$(status_cell "$stat" 7)" "${pre:+$pre }$rowid   $post"; continue; fi
-    [ -d "$pdir" ] || st="no profile dir"
+    if [ ! -d "$pdir" ]; then
+      printf '  %-40s %s %s %s\n' "${prefix/#$HOME/~}" "$(gcell "$name" 12)" "$(status_cell active 7)" "no profile dir — see: claude-account doctor"
+      continue
+    fi
     st=$(acct_identity "$pdir"); lbl=$(profile_label "$pdir"); [ -n "$lbl" ] && st="$lbl  ·  $st"
+    case "$st" in *"NOT LOGGED IN"*) st="$st  → uses $CA_GTAG + warns at launch" ;; esac
     printf '  %-40s %s %s %s\n' "${prefix/#$HOME/~}" "$(gcell "$name" 12)" "$(status_cell active 7)" "$st"
   done < "$MAP"
   local _fb; _fb=$(get_fallback) || _fb=""
@@ -1824,7 +1929,7 @@ cmd_add(){
     dim "  (that is what passing the name explicitly means)"
     # pause is stored per ROW, so a new row starts ACTIVE even if its siblings are
     # paused. Surprising when the profile was paused for a depleted quota.
-    if awk -F'\t' -v n="$name" '$2==n && $3=="paused"{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
+    if awk -F'\t' -v n="$name" '$1 !~ /^[ \t]*#/ && $2==n && $3=="paused"{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
       yel "  NOTE: other paths on '$name' are PAUSED, but this new one starts ACTIVE."
       dim  "        pause covers the rows that existed when you ran it. To pause them all:"
       dim  "            claude-account pause $name"
@@ -1850,8 +1955,8 @@ cmd_add(){
     echo "       claude-account setup      # links the shims and checks your PATH"
     echo
   fi
-  if [ -e "$PROFILES/$name/.login-attempted" ]; then
-    dim "Profile '$name' has already been signed in — nothing else to do."
+  if security find-generic-password -s "Claude Code-credentials-$(printf '%s' "$PROFILES/$name" | shasum -a 256 | cut -c1-8)" >/dev/null 2>&1; then
+    dim "Profile '$name' is already signed in — nothing else to do."
     dim "Check it with:  claude-account verify"
   else
     echo "Next, authenticate it — IN YOUR OWN TERMINAL (it opens a browser):"
@@ -1907,13 +2012,15 @@ RMPY
             return 0
        else path="$hits"; fi ;;
   esac
-  awk -F'\t' -v p="$path" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null || { yel "no rule for: $path"; exit 1; }
+  awk -F'\t' -v p="$path" '$1==p{f=1} END{exit !f}' "$MAP" 2>/dev/null || { yel "no rule for: $path"; covering_rule_hint "$path"; exit 1; }
   # -F'\t' matters: without it a path containing a space (this machine has several)
   # matches on its first word only, so $name came back empty and the messages below
   # named the wrong profile dir. Last survivor of the tab migration.
   local name; name=$(awk -F'\t' -v p="$path" '$1==p{print $2}' "$MAP" | head -1)
   backup "remove-$name"
   local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
+  local nmatch; nmatch=$(awk -F'\t' -v p="$path" '$1 !~ /^[ \t]*#/ && $1==p' "$MAP" 2>/dev/null | grep -c .)
+  [ "$nmatch" -gt 1 ] && yel "note: $nmatch duplicate rows for this path — removing all of them."
   local tmp; tmp=$(mktemp)
   python3 - "$MAP" "$path" "$tmp" <<'PY'
 import sys
@@ -1921,7 +2028,7 @@ m,p,tmp=sys.argv[1],sys.argv[2],sys.argv[3]
 lines=open(m).readlines()                      # READ FIRST — open(...,"w") truncates
 open(tmp,'w').writelines([l for l in lines if l.rstrip('\n').split('\t')[0]!=p])
 PY
-  write_map "$tmp" "$((before-1))" || exit 1
+  write_map "$tmp" "$((before-nmatch))" || exit 1
   if _rfb2=$(get_fallback 2>/dev/null); then
     grn "Removed: $path  ->  no rule now, so it uses the fallback profile '$_rfb2'."
   else
@@ -1970,7 +2077,7 @@ cmd_login(){
     dim "Note: Claude's in-app Account panel will now show THIS account's email in every"
     dim "      window, routed or not, until the next sign-in elsewhere. Only the email and"
     dim "      organisation are affected — Plan and the usage bars stay correct per session."
-    local paths; paths=$(awk -F'\t' -v n="$name" '$2==n{print "  "$1}' "$MAP" 2>/dev/null)
+    local paths; paths=$(awk -F'\t' -v n="$name" '$1 !~ /^[ \t]*#/ && $2==n{print "  "$1}' "$MAP" 2>/dev/null)
     [ -n "$paths" ] && { echo "Applies to:"; printf '%s\n' "$paths"; }
     dim "Restart VS Code once so the extension picks it up."
   fi
@@ -1993,7 +2100,7 @@ cmd_forget(){
       exit 1
     fi
   fi
-  local still; still=$(awk -F'\t' -v n="$name" '$2==n{print "    "$1}' "$MAP" 2>/dev/null)
+  local still; still=$(awk -F'\t' -v n="$name" '$1 !~ /^[ \t]*#/ && $2==n{print "    "$1}' "$MAP" 2>/dev/null)
   if [ -n "$still" ]; then
     if [ "${2:-}" = "--force" ]; then
       backup "forget-force-$name"
@@ -2075,7 +2182,9 @@ case "${1:-list}" in
   logout) shift; cmd_logout "$@" ;;
   switch) shift; cmd_switch "$@" ;;
   global) shift; cmd_global "$@" ;;
-  status) shift; if [ "${1:-global}" = "global" ]; then global_ambiguous status || exit 1; cmd_global status; else cmd_verify; fi ;;
+  status) shift
+     if [ "${1:-global}" = "global" ]; then global_ambiguous status || exit 1; cmd_global status
+     else red "status takes 'global' only — for '$1' use: claude-account list / verify / usage $1"; exit 2; fi ;;
   pause)  shift; cmd_pause "$@" ;;
   resume) shift; cmd_resume "$@" ;;
   add)    shift; cmd_add "$@" ;;
