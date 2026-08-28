@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.18"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.19"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -431,12 +431,21 @@ colorize_help(){
   if ! _use_colour; then cat; return; fi
   local G=$'\033[32m' C=$'\033[36m' B=$'\033[1m' D=$'\033[2m' O=$'\033[0m'
   local U=$'\033[4;34m'
+  # `global` in verb position ("claude-account global <verb>") gets caught by the
+  # bold-verb rule, and the escape bytes then hide it from the cyan word-boundary
+  # rule — so re-paint any bold global cyan. PB/PO are the ALREADY-INSERTED codes
+  # as regex literals (the [ must be escaped or it opens a character class).
+  local PB=$'\033''\[1m' PO=$'\033''\[0m'
   sed -E \
     -e "s/^(GLOBAL ACCOUNT)/${B}${C}\1${O}/" \
     -e "s/^(INSPECT|SET UP|PAUSE \/ RESUME|FALLBACK|PORTABILITY|TEAR DOWN|NOTES)/${B}\1${O}/" \
     -e "s|https://[a-zA-Z0-9./_-]+|${U}&${O}|g" \
+    -e "s/(^|[ \"])(claude-(account|whoami)) ([a-z][a-z-]*)/\1\2 ${B}\4${O}/g" \
     -e "s/(^|[ \"])claude-(account|whoami)/\1${G}claude-\2${O}/g" \
-    -e "s/[[:<:]]global[[:>:]]/${C}&${O}/g"
+    -e "s/<[a-z|]+>/${D}&${O}/g" \
+    -e "s/\[[a-z|-]+\]/${D}&${O}/g" \
+    -e "s/[[:<:]]global[[:>:]]/${C}&${O}/g" \
+    -e "s/${PB}global${PO}/${C}global${O}/g"
 }
 
 status_cell(){ # <state> <width>   — list's STATUS column: active | paused
