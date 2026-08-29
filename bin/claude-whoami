@@ -85,7 +85,7 @@ elif [ "$(printf '%s' "$line" | cut -f3)" = "(fallback)" ]; then
     echo "account       : $name — via the machine FALLBACK (resume JUST this path: claude-account resume '$(printf '%s' "$parked" | cut -f1)')"
   else
     echo "matched rule  : none — the machine FALLBACK applies"
-    echo "account       : $name  (clear with: claude-account fallback none)"
+    echo "account       : $name  (back to global: claude-account use global)"
   fi
   echo "profile dir   : $pdir"
   svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
@@ -96,7 +96,7 @@ elif [ "$(printf '%s' "$line" | cut -f3)" = "(fallback)" ]; then
     echo "login         : could not verify (security exit $_fsrc) — the shim routes to it anyway"
   else
     echo "login         : NOT signed in — this folder falls back to $GT"
-    echo "                run:  claude-account login $name   (or: claude-account fallback none)"
+    echo "                run:  claude-account login $name   (or: claude-account use global)"
   fi
 else
   name=$(printf '%s' "$line" | cut -f1); pdir=$(printf '%s' "$line" | cut -f2); pre=$(printf '%s' "$line" | cut -f3)

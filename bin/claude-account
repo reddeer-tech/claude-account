@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.26"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.27"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -208,13 +208,17 @@ global_ambiguous(){ # <verb>
   return 1
 }
 
-# `none` is the token that CLEARS the fallback (claude-account fallback none), so a
+# Every command word, one list — the dispatch guard and create's shadow warning both
+# consult it, so adding a verb in one place covers both.
+CA_VERBS="list ls profiles logins overview ov label verify version doctor setup rename fallback use create export import usage refresh logout switch global status pause resume add remove rm login forget statusline undo vscode-status help"
+
+# `none` is the token that CLEARS the fallback (claude-account use global), so a
 # profile by that name would make the clearing command ambiguous — the same trap as a
 # profile literally named `global`. Reserve it before one can exist.
 reserved_none(){ # <name>
   [ "$1" = "none" ] || return 0
   red "'none' cannot be a profile name — it is reserved (it clears the fallback:" >&2
-  red "  claude-account fallback none)." >&2
+  red "  claude-account use global)." >&2
   return 2
 }
 
@@ -361,7 +365,7 @@ cmd_pause(){ # <path|name> [why]
   local _pnm; _pnm=$(awk -F'\t' -v t="$(printf '%s' "$hits" | head -1)" '$1==t{print $2}' "$MAP" 2>/dev/null | head -1)
   if [ -n "$_pnm" ] && [ "$_pnm" = "$_pfb" ]; then
     yel "  NOTE: '$_pnm' is also the FALLBACK — unrouted paths STILL use it."
-    dim "        stop that with:  claude-account fallback none"
+    dim "        stop that with:  claude-account use global"
   fi
 }
 
@@ -509,7 +513,7 @@ colorize_help(){
   local PB=$'\033''\[1m' PO=$'\033''\[0m'
   sed -E \
     -e "s/^(GLOBAL ACCOUNT)/${B}${C}\1${O}/" \
-    -e "s/^(INSPECT|SET UP|PAUSE \/ RESUME|FALLBACK|PORTABILITY|TEAR DOWN|NOTES)/${B}\1${O}/" \
+    -e "s/^(INSPECT|SET UP|PAUSE \/ RESUME|USE|PORTABILITY|TEAR DOWN|NOTES)/${B}\1${O}/" \
     -e "s|https://[a-zA-Z0-9./_-]+|${U}&${O}|g" \
     -e "s/(^|[ \"])(claude-(account|whoami)) ([a-z][a-z-]*)/\1\2 ${B}\4${O}/g" \
     -e "s/(^|[ \"])claude-(account|whoami)/\1${G}claude-\2${O}/g" \
@@ -784,10 +788,10 @@ cmd_import(){
           yel "  skipped fallback '$a' — one is already set"; skipped=$((skipped+1)); continue; fi
         if ! security find-generic-password -s "Claude Code-credentials-$(printf '%s' "$PROFILES/$a" | shasum -a 256 | cut -c1-8)" >/dev/null 2>&1; then
           yel "  fallback '$a' NOT applied — that profile is not signed in on this machine"
-          dim "    claude-account login $a   then:   claude-account fallback $a"
+          dim "    claude-account login $a   then:   claude-account use $a"
           skipped=$((skipped+1)); continue; fi
         mkdir -p "$PROFILES/$a"; write_line "$PROFILES/.fallback" "$a"
-        grn "  fallback set: unrouted paths use '$a'  (clear: claude-account fallback none)" ;;
+        grn "  fallback set: unrouted paths use '$a'  (clear: claude-account use global)" ;;
       ''|\#*) ;;                                   # blank lines and the export header
       *) unknown=$((unknown+1))
          case " $unkinds " in *" $kind "*) ;; *) unkinds="${unkinds:+$unkinds }$kind" ;; esac ;;
@@ -1110,6 +1114,30 @@ print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else "")' 2
       *mise*|*asdf*) prov="mise/asdf" ;;
     esac
     ok_ "real claude: ${rcb/#$HOME/~} — $prov"
+    # Routing depends on Claude ≥ 2.1.144 (config-dir-scoped Keychain entries). One
+    # --version spawn, DOCTOR-ONLY — the shims' launch budget stays ~13 ms. A prerelease
+    # of the floor (2.1.144-beta.1) counts as OLDER. A failed probe is a warning, never
+    # "too old" (probe-honesty rule).
+    local cver vres
+    cver=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR "$rcb" --version 2>/dev/null | head -1)
+    vres=$(printf '%s' "$cver" | python3 -c "
+import sys
+toks = sys.stdin.read().split()
+tok = toks[0].lstrip('v') if toks else ''
+core, _, pre = tok.partition('-')
+try:
+    t = tuple(int(x) for x in core.split('.')[:3])
+    assert len(t) == 3
+except Exception:
+    print('unparseable'); raise SystemExit
+need = (2, 1, 144)
+print('ok' if (t > need or (t == need and not pre)) else 'old')
+" 2>/dev/null)
+    case "$vres" in
+      ok)  ok_ "claude $cver supports profile-scoped Keychain entries (≥ 2.1.144)" ;;
+      old) bad "claude $cver is OLDER than 2.1.144 — profile-scoped Keychain entries do not exist there, so routing cannot work. Update Claude Code." ;;
+      *)   wrn "could not read claude's version (probe failure — not proof it is too old)" ;;
+    esac
   else
     bad "no real claude binary found on PATH"
   fi
@@ -1149,16 +1177,15 @@ print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else "")' 2
     if [ -z "$fbok" ]; then
       wrn "\$PROFILES/.fallback contains '$fbraw' — not a valid profile name, so it is IGNORED (unrouted paths use global)"
     else
-      local fbage; fbage=$(fallback_age_days 2>/dev/null) || fbage=0
-      if [ "${fbage:-0}" -ge 3 ]; then
-        wrn "FALLBACK set ${fbage} days ago: unrouted paths still use '$fbok' — has the global quota reset? (clear: claude-account fallback none)"
-      else
-        ok_ "FALLBACK set: unrouted paths use '$fbok', NOT the global account (clear: claude-account fallback none)"
-      fi
+      # No 3-day nag since 1.0.27: living on a selected account is a normal state
+      # (`use`), not a forgotten emergency. The age is still said, informationally.
+      local fbage agenote=""; fbage=$(fallback_age_days 2>/dev/null) || fbage=0
+      [ "${fbage:-0}" -ge 1 ] && agenote=" (set ${fbage}d ago)"
+      ok_ "using '$fbok' for every unrouted path$agenote — claude-account use global returns to the global account"
       [ -d "$PROFILES/$fbok" ] || wrn "fallback profile '$fbok' has no directory (still routes — the Keychain key is the path string)"
       local fsvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$fbok" | shasum -a 256 | cut -c1-8)"
       security find-generic-password -s "$fsvc" >/dev/null 2>&1 \
-        || bad "fallback profile '$fbok' is NOT signed in — every unrouted claude launch warns (login $fbok, or: fallback none)"
+        || bad "selected profile '$fbok' is NOT signed in — every unrouted claude launch warns (login $fbok, or: use global)"
     fi
   fi
 
@@ -1182,14 +1209,14 @@ print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else "")' 2
     if [ "$id" = "NOT LOGGED IN" ]; then
       if [ "$nm" = "$_dfb" ]; then wrn "$nm: is the FALLBACK but NOT signed in — every unrouted launch warns"
       elif [ "$used" -gt 0 ]; then wrn "$nm: $used rule(s) but NOT signed in — those paths use global + warn"
-      else wrn "$nm: no login and no rules (orphan) — claude-account forget $nm"; fi
+      else wrn "$nm: floating and not signed in — claude-account login $nm  (no longer wanted? claude-account forget $nm)"; fi
     else
       case "$id" in
         *EXPIRED*)    wrn "$nm: access token EXPIRED — claude-account refresh $nm  (a paused profile is never used, so it drifts)";;
         *"EXPIRES IN"*) ok_ "$nm: signed in (access token renews itself on next use)$( [ "$used" -gt 0 ] && printf ', %s rule(s)' "$used" )";;
         *) if [ "$nm" = "$_dfb" ]; then ok_ "$nm: signed in, FALLBACK — every unrouted path uses it$( [ "$used" -gt 0 ] && printf ', plus %s rule(s)' "$used" )"
            elif [ "$used" -gt 0 ]; then ok_ "$nm: signed in, $used rule(s)"
-           else wrn "$nm: signed in but no rule uses it (orphan)"; fi ;; esac
+           else ok_ "$nm: signed in, floating — select it: claude-account use $nm  (or bind a path: claude-account add <path> $nm)"; fi ;; esac
     fi
   done
 
@@ -1337,7 +1364,7 @@ cmd_logout(){
     rm -f "$PROFILES/.fallback"
     yel "  cleared the FALLBACK — it pointed at '$name', which now has no login."
     dim "  unrouted paths use your GLOBAL account again. Restore later with:"
-    dim "      claude-account login $name  &&  claude-account fallback $name"
+    dim "      claude-account login $name  &&  claude-account use $name"
   fi
 
   # A routed path with no credential FAILS ("Not logged in") — it does not fall
@@ -1572,10 +1599,13 @@ fallback_banner(){
   local fb; fb=$(get_fallback) || return 0
   local age agestr=""; age=$(fallback_age_days 2>/dev/null) || age=0
   [ "${age:-0}" -ge 1 ] && agestr=" (set ${age}d ago)"
+  # Calm since 1.0.27: `use` made a selected account a normal way to live, not an
+  # emergency. Still shown on list/profiles/verify/doctor — a machine-wide redirect
+  # must stay VISIBLE everywhere (CLAUDE.md rule 4), it just stops shouting.
   if _use_colour; then
-    printf "  \033[38;5;208m⚠ fallback active%s: paths with no rule use '%s' — clear: claude-account fallback none\033[0m\n" "$agestr" "$fb"
+    printf "  \033[2musing \033[0m\033[36m'%s'\033[0m\033[2m for every path with no rule%s — back: claude-account use global\033[0m\n" "$fb" "$agestr"
   else
-    printf "  ⚠ fallback active%s: paths with no rule use '%s' — clear: claude-account fallback none\n" "$agestr" "$fb"
+    printf "  using '%s' for every path with no rule%s — back: claude-account use global\n" "$fb" "$agestr"
   fi
 }
 
@@ -1614,58 +1644,68 @@ cmd_statusline(){
   fi
 }
 
-cmd_fallback(){
+# `use` is the primary verb since 1.0.27; `fallback` is a plain alias of it (published
+# verb, kept forever). One code path, one storage file, one meaning.
+cmd_use(){
   local a="${1:-}"
+  # -q: just the selected name, for prompts/scripts. Empty + exit 1 when unset, so
+  # `[ -n "$(claude-account use -q)" ]` and grep both behave.
+  if [ "$a" = "-q" ] || [ "$a" = "--quiet" ]; then
+    local q; q=$(get_fallback) || exit 1
+    printf '%s\n' "$q"; return 0
+  fi
   # show
   if [ -z "$a" ]; then
     local raw=""; [ -f "$PROFILES/.fallback" ] && IFS= read -r raw < "$PROFILES/.fallback"
     local fb; fb=$(get_fallback) || fb=""
     if [ -n "$fb" ]; then
-      echo "fallback : $fb  ($(acct_identity "$PROFILES/$fb"))"
-      dim "  every path with NO rule routes to it — the global account is not used for"
-      dim "  unrouted paths while this is set. Clear with:  claude-account fallback none"
+      echo "using : $fb  ($(acct_identity "$PROFILES/$fb"))"
+      dim "  every path with NO rule routes to it — your global credential is untouched."
+      dim "  switch:  claude-account use <name>        back:  claude-account use global"
+      [ -d "$PROFILES/global" ] && dim "  (note: a PROFILE named 'global' also exists here — 'use global' means the REAL global account; remove the clash: claude-account rename global <newname>)"
     elif [ -n "$raw" ]; then
       yel "'.fallback' contains '$raw' — not a valid profile name, so it is IGNORED."
-      dim "  unrouted paths use your GLOBAL account. Set a real one:"
-      dim "      claude-account fallback <profile>      (or clear it: claude-account fallback none)"
+      dim "  unrouted paths use your GLOBAL account. Select a real one:"
+      dim "      claude-account use <name>      (or clear it: claude-account use global)"
     else
       load_global_identity
-      echo "no fallback set — unrouted paths use $(gtag): $CA_GLOBAL_ID"
-      dim "  set one with:  claude-account fallback <profile>"
+      echo "nothing selected — unrouted paths use $(gtag): $CA_GLOBAL_ID"
+      dim "  select one with:  claude-account use <name>"
+      [ -d "$PROFILES/global" ] && dim "  (note: a PROFILE named 'global' exists here — it is NOT this global account)"
     fi
     return 0
   fi
-  # clear
-  if [ "$a" = "none" ]; then
-    # A legacy profile literally named `none` (pre-reservation, or import) makes this
-    # ambiguous between "clear" and "set to profile none" — refuse rather than guess,
-    # the same shape as the profile-named-global trap.
-    if [ -d "$PROFILES/none" ] || awk -F'\t' '$1 !~ /^[ \t]*#/ && $2=="none"{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
-      red "'none' is ambiguous here: a PROFILE named 'none' exists on this machine."
-      echo "      claude-account rename none <newname>     # removes the clash, then retry"
-      exit 1
+  # clear — `use global` and the legacy `fallback none` both mean "back to the real
+  # global account". ⚠ BEHAVIOUR CHANGE (1.0.27): `fallback global` used to REFUSE with
+  # exit 2 ("nothing to point at"); as an alias of `use global` it now CLEARS, exit 0.
+  if [ "$a" = "none" ] || [ "$a" = "global" ]; then
+    if [ "$a" = "global" ]; then
+      # a legacy profile literally named `global` makes "use global" ambiguous between
+      # the real global account and that profile — refuse and disambiguate, never guess
+      global_ambiguous use || exit 1
+    else
+      # same trap for a legacy profile named `none` (the clearing token)
+      if [ -d "$PROFILES/none" ] || awk -F'\t' '$1 !~ /^[ \t]*#/ && $2=="none"{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
+        red "'none' is ambiguous here: a PROFILE named 'none' exists on this machine."
+        echo "      claude-account rename none <newname>     # removes the clash, then retry"
+        exit 1
+      fi
     fi
     if [ -f "$PROFILES/.fallback" ]; then
       local prev=""; IFS= read -r prev < "$PROFILES/.fallback"
       rm -f "$PROFILES/.fallback"
-      grn "Cleared the fallback (was '$prev') — unrouted paths use your GLOBAL account again."
+      grn "Back on your GLOBAL account (was '$prev')."
       dim "Sessions already open keep their account; restart them (claude -c) to re-route."
     else
-      dim "No fallback was set — unrouted paths already use your GLOBAL account."
+      dim "Nothing was selected — unrouted paths already use your GLOBAL account."
     fi
     return 0
   fi
   case "$a" in /*|~*|./*|../*)
-    red "the fallback is MACHINE-WIDE — it takes a profile NAME, not a path."
+    red "'use' selects a machine-wide account — it takes a profile NAME, not a path."
     dim "  to park just this path:  claude-account pause '$a'    (or: switch '$a' global)"
-    local _fn; _fn=$(to_profile "$a" 2>/dev/null) && dim "  to make its profile the machine-wide fallback:  claude-account fallback $_fn"
+    local _fn; _fn=$(to_profile "$a" 2>/dev/null) && dim "  to select its profile machine-wide:  claude-account use $_fn"
     exit 2 ;; esac
-  if [ "$a" = "global" ]; then
-    red "unrouted paths already use the global account when no fallback is set —"
-    red "there is nothing to point at."
-    dim "  to clear an existing fallback:  claude-account fallback none"
-    exit 2
-  fi
   local name; name=$(to_profile "$a") || exit $?
   # An unsigned fallback would warn on EVERY claude launch in EVERY unrouted folder on
   # the machine (and fail-fast machine-wide under CLAUDE_ACCOUNTS_STRICT). Refuse
@@ -1675,15 +1715,15 @@ cmd_fallback(){
     red "profile '$name' is not signed in — a fallback with no login would warn on"
     red "EVERY claude launch, machine-wide."
     dim "  sign in first:  claude-account login $name"
-    dim "  (or force it:   claude-account fallback $name --force)"
+    dim "  (or force it:   claude-account use $name --force)"
     exit 1
   fi
   local prev=""; [ -f "$PROFILES/.fallback" ] && IFS= read -r prev < "$PROFILES/.fallback"
   write_line "$PROFILES/.fallback" "$name"
-  grn "Fallback set: every path with NO rule now uses profile '$name' ($(acct_identity "$PROFILES/$name"))."
+  grn "Now using '$name' for every path with no rule  ($(acct_identity "$PROFILES/$name"))."
   [ -n "$prev" ] && [ "$prev" != "$name" ] && dim "  (was '$prev')"
   dim "Your global account's credential is untouched — it is simply not used for unrouted"
-  dim "paths while this is set. Undo with:  claude-account fallback none"
+  dim "paths while this is set. Undo with:  claude-account use global"
   # Name who goes where, so nothing moves silently: plain-paused rows follow the
   # fallback (paused ≡ unrouted); switch-to-global rows are an explicit pin and stay
   # on the real global account.
@@ -1731,7 +1771,7 @@ cmd_profiles(){
       if [ -z "$used" ]; then used="$fbrow"; else used="$used
 $fbrow"; fi
     fi
-    if [ -z "$used" ]; then used="— no path uses it (orphan)"; fi
+    if [ -z "$used" ]; then used="— floating (no path) · select it: claude-account use $nm"; fi
     printf '  %-13s %-52s %s\n' "$nm" "$id" "$(printf '%s' "$used" | head -1 | sed "s|$HOME|~|")"
     printf '%s\n' "$used" | tail -n +2 | sed "s|$HOME|~|" | sed 's/^/                                                     /'
   done
@@ -1838,7 +1878,7 @@ cmd_overview(){
 $fbrow"; fi
     fi
     if [ -z "$used" ]; then
-      dim "     paths : — no path uses it (orphan)"
+      dim "     paths : — floating (no path) · select it: claude-account use $nm"
     else
       local first=1 ln
       while IFS= read -r ln; do [ -z "$ln" ] && continue
@@ -1971,7 +2011,7 @@ cmd_list(){
   local _fb; _fb=$(get_fallback) || _fb=""
   if [ -n "$_fb" ]; then
     [ "$any" = 0 ] && dim "  (no rules — every path uses the fallback profile '$_fb')"
-    echo; printf '\033[2m  Anything not listed uses the fallback profile \033[0m\033[38;5;208m%s\033[0m\033[2m — NOT %s\033[2m. Clear: claude-account fallback none\033[0m\n' "'$_fb'" "$(gtag)"
+    echo; printf '\033[2m  Anything not listed uses the fallback profile \033[0m\033[38;5;208m%s\033[0m\033[2m — NOT %s\033[2m. Clear: claude-account use global\033[0m\n' "'$_fb'" "$(gtag)"
   else
     [ "$any" = 0 ] && dim "  (no rules — every path uses your global account)"
     echo; printf '\033[2m  Anything not listed uses %s\033[2m — the account you signed in with.\033[0m\n' "$(gtag)"
@@ -2033,6 +2073,13 @@ cmd_add(){
       dim  "        pause covers the rows that existed when you ran it. To pause them all:"
       dim  "            claude-account pause $name"
     fi
+  fi
+
+  # A floating profile (dir exists, no map rows) binds cleanly — create-first then
+  # `add <path>` is the natural flow — but sharing an account is always said out loud.
+  if [ -z "$owners" ] && [ -d "$PROFILES/$name" ]; then
+    yel "Binding to EXISTING floating profile '$name'  ($(acct_identity "$PROFILES/$name"))."
+    dim "  (created earlier — e.g. with: claude-account create $name)"
   fi
 
   # (fallback) is not a parent RULE — saying so would be a lie about where the name came from
@@ -2101,9 +2148,9 @@ RMPY
             grn "Removed $cnt rule(s) — those paths have no rule now."
             if [ "$(get_fallback 2>/dev/null)" = "$path" ]; then
               yel "  NOTE: '$path' is also the FALLBACK — those paths (and every unrouted one) STILL use it."
-              dim "        stop that with:  claude-account fallback none"
+              dim "        stop that with:  claude-account use global"
             elif _rfb=$(get_fallback 2>/dev/null); then
-              dim "They now use the fallback profile '$_rfb' (claude-account fallback none returns them to global)."
+              dim "They now use the fallback profile '$_rfb' (claude-account use global returns them to global)."
             else
               dim "They now use your GLOBAL account."
             fi
@@ -2137,12 +2184,94 @@ PY
   dim "To forget the login too:  claude-account forget $name"
 }
 
+# One command from nothing to a signed-in FLOATING profile (no path bound). The other
+# half of the sample-tool ergonomics: `create work` then `use work`, and a path can be
+# bound later (`add <path> work`) or never.
+cmd_create(){
+  local name="${1:-}"
+  [ -z "$name" ] && { red "usage: claude-account create <name> [--email <a>] [--sso] [--console]"; exit 2; }
+  case "$name" in /*|~*|./*|../*)
+    red "create takes a NEW profile NAME, not a path."
+    dim "  to bind a path to a profile:  claude-account add <path> <name>"
+    exit 2 ;; esac
+  name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+  if ! printf '%s' "$name" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$'; then
+    red "invalid profile name '$name' (lowercase letters, digits, . _ -)"; exit 2; fi
+  reserved_global "$name" create || exit 2
+  reserved_none "$name" || exit 2
+  case " $CA_VERBS " in *" $name "*)
+    yel "note: '$name' is also a claude-account COMMAND — the '$name usage' shorthand will not work for it (verb-first 'usage $name' always does)." ;; esac
+  if [ -d "$PROFILES/$name" ] || awk -F'\t' -v n="$name" '$1 !~ /^[ \t]*#/ && $2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null; then
+    if security find-generic-password -s "Claude Code-credentials-$(printf '%s' "$PROFILES/$name" | shasum -a 256 | cut -c1-8)" >/dev/null 2>&1; then
+      red "profile '$name' already exists and is signed in."
+      dim "  select it machine-wide:  claude-account use $name"
+      dim "  bind a path to it:       claude-account add <path> $name"
+    else
+      red "profile '$name' already exists (not signed in)."
+      dim "  sign in:  claude-account login $name"
+    fi
+    exit 1
+  fi
+  mkdir -p "$PROFILES/$name"
+  grn "Created floating profile '$name' — no path bound (bind later: claude-account add <path> $name)."
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    # ⚠ the one exit-3 path with a side effect: the profile EXISTS now, only the
+    # interactive sign-in is deferred. Documented in CLAUDE.md's exit-code table.
+    yel "Sign-in is interactive — finish it in your own terminal:"
+    echo
+    echo "    claude-account login $name${2:+ ${*:2}}"
+    echo
+    exit 3
+  fi
+  cmd_login "$name" "${@:2}"
+  # cmd_login historically exits 0 even when the browser flow did not complete; for
+  # create, scripts chain `create x && use x`, so verify and be strict.
+  if [ "$(acct_identity "$PROFILES/$name")" = "NOT LOGGED IN" ]; then
+    yel "profile '$name' kept — sign in later:  claude-account login $name"
+    exit 1
+  fi
+}
+
 cmd_login(){
   # "login global" reads the same way as every other verb-first command;
   # "global login" still works. Keep both.
   if [ "${1:-}" = "global" ]; then global_ambiguous login || exit 1; cmd_global login; return $?; fi
-  [ -z "${1:-}" ] && { red "usage: claude-account login <profile-name|project-path>"; exit 2; }
-  local name; name=$(to_profile "$1") || exit $?
+  [ -z "${1:-}" ] && { red "usage: claude-account login <profile-name|project-path> [--email <a>] [--sso] [--console]"; exit 2; }
+  # An unknown NAME gets a create offer instead of a dead end (path-shaped args keep
+  # to_profile's exact errors — its (fallback)-rejection guard is load-bearing).
+  local name
+  case "$1" in
+    /*|~*|./*|../*) name=$(to_profile "$1") || exit $? ;;
+    *)
+      local _lc; _lc=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+      if printf '%s' "$_lc" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$' \
+         && ! awk -F'\t' -v n="$_lc" '$1 !~ /^[ \t]*#/ && $2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null \
+         && [ ! -d "$PROFILES/$_lc" ] \
+         && [ "$_lc" != "global" ] && [ "$_lc" != "none" ] \
+         && [ -t 0 ] && [ -t 1 ]; then
+        printf "profile '%s' does not exist — create it now? [y/N] " "$_lc"
+        local _ans; IFS= read -r _ans
+        case "$_ans" in
+          y|Y|yes) cmd_create "$_lc" "${@:2}"; return $? ;;
+          *) dim "nothing created."; exit 1 ;;
+        esac
+      fi
+      name=$(to_profile "$1") || { local _tprc=$?
+        dim "  create it first:  claude-account create $_lc" >&2; exit $_tprc; } ;;
+  esac
+  # optional flags, passed straight to `claude auth login`. --console selects the
+  # API-console account type, which conflicts with the hardcoded --claudeai — drop it.
+  local extra="" claudeai="--claudeai"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --email)   [ -n "${2:-}" ] || { red "--email needs a value"; exit 2; }
+                 extra="$extra --email $2"; shift 2 ;;
+      --sso)     extra="$extra --sso"; shift ;;
+      --console) extra="$extra --console"; claudeai=""; shift ;;
+      *) red "unknown login flag: $1"; exit 2 ;;
+    esac
+  done
   local pdir="$PROFILES/$name"; mkdir -p "$pdir"
   local rc; rc=$(real_claude) || { red "real claude binary not found"; exit 127; }
 
@@ -2154,7 +2283,7 @@ cmd_login(){
     echo
     echo "Run this yourself in a terminal (not through Claude):"
     echo
-    echo "    claude-account login $name"
+    echo "    claude-account login $name$extra"
     echo
     dim "Then come back and run:  claude-account verify"
     exit 3
@@ -2163,8 +2292,9 @@ cmd_login(){
   echo "Signing in to Claude profile '$name'."
   dim "A browser will open. Sign in with the account that owns this project."
   echo
+  # $claudeai/$extra intentionally unquoted: they are flag words assembled above
   env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
-      CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir" "$rc" auth login --claudeai
+      CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir" "$rc" auth login $claudeai $extra
   : > "$pdir/.login-attempted"
   capture_label "$pdir"
   echo
@@ -2194,7 +2324,7 @@ cmd_forget(){
       yel "Cleared the fallback (--force) — unrouted paths use your GLOBAL account again."
     else
       red "'$name' is the FALLBACK — every unrouted path on this machine uses it."
-      dim "    claude-account fallback none       # stop that first"
+      dim "    claude-account use global       # stop that first"
       dim "    claude-account forget $name --force  # or cascade"
       exit 1
     fi
@@ -2254,11 +2384,11 @@ main(){
     # remove`, run from a folder containing a `vscode-status/` directory, silently
     # became `remove vscode-status`. A command name is never a profile or a path.
     case "$1" in
-      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback      |export|import|usage|refresh|logout|switch|global|status|pause|resume|add|remove|rm      |login|forget|statusline|undo|vscode-status|help)
+      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|refresh|logout|switch|global|status|pause|resume|add|remove|rm      |login|forget|statusline|undo|vscode-status|help)
         set -- "$@" ;;                      # a command: leave the order alone
       *)
     case "$2" in
-      usage|login|logout|pause|resume|remove|forget|label|verify|fallback)
+      usage|login|logout|pause|resume|remove|forget|label|verify|fallback|use)
         if awk -F'\t' -v n="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" '$2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null \
            || [ -d "$PROFILES/$1" ] || [ -d "$1" ]; then
           set -- "$2" "$1" "${@:3}"
@@ -2283,7 +2413,8 @@ case "${1:-list}" in
   doctor) shift; cmd_doctor "$@" ;;
   setup)  cmd_setup ;;
   rename) shift; cmd_rename "$@" ;;
-  fallback) shift; cmd_fallback "$@" ;;
+  use|fallback) shift; cmd_use "$@" ;;
+  create)       shift; cmd_create "$@" ;;
   export) cmd_export ;;
   import) shift; cmd_import "$@" ;;
   usage)  shift; cmd_usage "$@" ;;
@@ -2357,14 +2488,17 @@ PAUSE / RESUME                         paused = that path falls back to the glob
   claude-account switch <x> global     stop routing it — same routing as pause, but
                                        list then shows PROFILE as global
 
-FALLBACK                               a machine-wide stand-in for the global account
-  claude-account fallback <name>       every path with NO rule uses that profile
-                                       (your global credential is untouched — this is
-                                        how to ride out an exhausted global account)
-  claude-account fallback              show the current fallback, if any
-  claude-account fallback none         clear it — unrouted paths use global again
-                                       plain-PAUSED paths follow the fallback too;
+USE                                    which account is "the" account, machine-wide
+  claude-account use <name>            every path with NO rule now uses that profile
+                                       (your global credential is untouched)
+  claude-account use                   show what is selected
+  claude-account use global            back to the account you signed in with globally
+  claude-account use -q                just the name, for scripts and prompts
+  claude-account create <name>         NEW floating profile + sign-in, one command
+                                       (bind a path later: add <path> <name>)
+                                       plain-PAUSED paths follow the selection too;
                                        switch <x> global pins a path to the real global
+                                       (fallback is the old name for use — same command)
 
 GLOBAL ACCOUNT                         the one used by every unrouted path
                                        (unless a fallback is set — see above)

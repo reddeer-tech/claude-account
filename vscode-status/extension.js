@@ -51,7 +51,7 @@ function activate(context) {
       const why = {
         rule: 'a path rule covers this folder',
         worktree: 'a path rule covers the MAIN repo of this git worktree',
-        fallback: 'no rule matches — the machine-wide fallback applies',
+        fallback: 'no rule matches — the account selected with claude-account use applies',
         none: 'no rule matches — your global account',
         'env-override': 'an explicit account override is set in the environment',
         'token-override': 'CLAUDE_CODE_OAUTH_TOKEN overrides all routing',
