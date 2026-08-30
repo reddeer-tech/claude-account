@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.27"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.28"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -33,7 +33,7 @@ RESOLVE="${RESOLVE:-$HOME/.config/claude-accounts/resolve.sh}"
 # lab folder, which would have created ~/workspace/_lab/... on every installed machine.
 # Keep an existing lab dir if it is already there, so nobody's history moves under them.
 if [ -n "${CLAUDE_ACCOUNTS_BACKUPS:-}" ]; then BK="$CLAUDE_ACCOUNTS_BACKUPS"
-elif [ -d "$HOME/workspace/_lab/Claude/backups" ]; then BK="$HOME/workspace/_lab/Claude/backups"
+elif [ -d "$HOME/workspace/_lab/Claude/backups/claude-account" ]; then BK="$HOME/workspace/_lab/Claude/backups/claude-account"
 else BK="$HOME/.config/claude-accounts/backups"; fi
 
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
