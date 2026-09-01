@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.29"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.30"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -429,6 +429,12 @@ CAPPY
 
 profile_label(){ # <profile-dir> -> recorded email, or empty
   [ -f "$1/.account" ] && head -1 "$1/.account"
+}
+
+# The global account's equivalent. It has no profile dir, so its label lives in one
+# file beside them. Same trust as a profile label: recorded at login, never re-checked.
+global_label(){ # -> recorded global account, or empty
+  head -1 "$PROFILES/.global-account" 2>/dev/null
 }
 
 cmd_label(){
@@ -1457,7 +1463,7 @@ cmd_usage(){
   local name pdir label
   if [ "${1:-}" = "global" ]; then global_ambiguous usage || exit 1; fi
   if [ -z "${1:-}" ] || [ "$1" = "global" ]; then
-    name="$CA_GTAG"; pdir=""
+    name="$CA_GTAG"; pdir=""; label=$(global_label)
   else
     name=$(to_profile "$1") || exit $?
     pdir="$PROFILES/$name"; label=$(profile_label "$pdir")
@@ -1568,7 +1574,7 @@ CA_GLOBAL_ID=""
 load_global_identity(){
   [ -n "$CA_GLOBAL_ID" ] && return 0
   CA_GLOBAL_ID=$(acct_identity "")
-  local l; l=$(head -1 "$PROFILES/.global-account" 2>/dev/null)
+  local l; l=$(global_label)
   [ -n "$l" ] && CA_GLOBAL_ID="$l  ·  $CA_GLOBAL_ID"
 }
 
@@ -1786,7 +1792,7 @@ $fbrow"; fi
   fi
   local dup; dup=$( { for d in "$PROFILES"/*/; do [ -d "$d" ] || continue
         local _l; _l=$(profile_label "${d%/}"); [ -n "$_l" ] && printf '%s\t%s\n' "$_l" "$(basename "$d")"; done
-      local _g; _g=$(head -1 "$PROFILES/.global-account" 2>/dev/null)
+      local _g; _g=$(global_label)
       [ -n "$_g" ] && printf '%s\t%s\n' "$_g" "(global)"; } \
     | awk -F'\t' '{n[$1]=n[$1]", "$2; c[$1]++} END{for(k in n) if(c[k]>1) printf "  note: %s record the SAME account (%s) — one quota, not two\n", substr(n[k],3), k}' )
   [ -n "$dup" ] && { echo; yel "$dup"; }
