@@ -124,6 +124,36 @@ X profiles --no-refresh 2>/dev/null | grep -q 'floating (no path)' && ok "profil
 X use work >/dev/null 2>&1 && [ "$(X use -q)" = "work" ] && ok "create -> use chain works" || no "create->use"
 X use global >/dev/null 2>&1
 
+section "overview: which account is this machine on?"
+# The user question this answers: "I ran `use turinglabs` — shouldn't the (global) card
+# show alan@turinglabs.ai?" No: (global) is a CREDENTIAL, never a slot another account
+# moves into. Card ORDER carries the answer instead; the identity must never be swapped.
+sign_global
+echo "personal@example.com (Personal)" > "$T/profiles/.global-account"
+echo "alan@turinglabs.ai (Turing Labs)" > "$T/profiles/tl/.account"
+X use global >/dev/null 2>&1
+first=$(X overview --no-refresh 2>/dev/null | grep -o '── [^ ]*' | head -1)
+[ "$first" = "── (global)" ] && ok "no selection: (global) is the first card" || no "first card: $first"
+X overview --no-refresh 2>/dev/null | grep -q 'paths : every path with no rule' && ok "…with today's wording, unchanged" || no "no-selection wording"
+X use tl >/dev/null 2>&1
+O=$(X overview --no-refresh 2>/dev/null)
+first=$(printf '%s' "$O" | grep -o '── [^ ]*' | head -1)
+[ "$first" = "── tl" ] && ok "with a selection: the SELECTED profile's card is first" || no "first card: $first"
+printf '%s' "$O" | grep -q '── (global).*not in use for unrouted paths' && ok "(global) is badged 'not in use for unrouted paths'" || no "no badge"
+printf '%s' "$O" | grep -q "none — every path with no rule uses 'tl'" && ok "…and its paths line names where those paths went" || no "global paths line"
+# rule 4: the global card keeps its OWN identity. Swapping it in would be the same lie
+# as the in-app Account panel's stale email — the thing this tool works around.
+printf '%s' "$O" | grep -A1 '── (global)' | grep -q 'personal@example.com' && ok "(global) still shows its OWN email, never the selection's" || no "global identity swapped"
+printf '%s' "$O" | grep -A1 '── (global)' | grep -q 'alan@turinglabs.ai' && no "the selection's identity leaked onto the (global) card" || ok "no identity leak"
+# a pin routes to the REAL global even while a selection is set, so it must appear on
+# global's card — it used to say "none", which was false about its own subject.
+mkdir -p "$T/proj/Pin"; X add "$T/proj/Pin" pinp >/dev/null 2>&1; sign pinp
+X switch "$T/proj/Pin" global >/dev/null 2>&1
+O=$(X overview --no-refresh 2>/dev/null)
+printf '%s' "$O" | grep -A3 '── (global)' | grep -q 'Pin' && ok "a switch-to-global PIN is listed on the (global) card" || no "pinned path missing from global card"
+printf '%s' "$O" | grep -A3 '── pinp' | grep -q 'not in use' && ok "…and reads 'not in use' on its own profile's card (same fact, two subjects)" || no "pin subject"
+X remove "$T/proj/Pin" >/dev/null 2>&1; X use global >/dev/null 2>&1
+
 section "add × floating profiles"
 mkdir -p "$T/proj/Work"
 out=$(X add "$T/proj/Work" work 2>&1); rc=$?
