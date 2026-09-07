@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.31"   # kept in step with package.json by `make version`
+CA_VERSION="1.0.32"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -1205,6 +1205,27 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
   done < "$MAP"
 
   echo; echo "profiles"
+  # The GLOBAL credential itself. Every profile below is probed, but this one never was
+  # — so a machine that had signed out of global (or never signed in, and lives on a
+  # selected account) passed clean while two things silently had nowhere to go: any rule
+  # pinned by `switch <x> global`, and every unrouted path the moment `use global` runs.
+  local _gid; _gid=$(acct_identity "")
+  local _gpins; _gpins=$(awk -F'\t' '$1 !~ /^[ \t]*#/ && $3=="paused" && $4=="global"{c++} END{print c+0}' "$MAP" 2>/dev/null)
+  local _gsel; _gsel=$(get_fallback 2>/dev/null) || _gsel=""
+  case "$_gid" in
+    *"KEYCHAIN ERROR"*)
+      wrn "$(gtag): could not read the credential — $_gid (probe failure, NOT proof it is missing)" ;;
+    "NOT LOGGED IN")
+      if [ "${_gpins:-0}" -gt 0 ]; then
+        bad "$(gtag) is NOT signed in, and $_gpins rule(s) are pinned to it by switch <x> global — those paths have nowhere to go (claude-account login global)"
+      elif [ -n "$_gsel" ]; then
+        wrn "$(gtag) is NOT signed in — fine while '$_gsel' is selected, but claude-account use global would leave every unrouted path with no account (claude-account login global)"
+      else
+        bad "$(gtag) is NOT signed in and nothing is selected — every unrouted path has no account (claude-account login global, or: claude-account use <name>)"
+      fi ;;
+    *) if [ -n "$_gsel" ]; then ok_ "$(gtag): signed in, standing by while '$_gsel' is selected$( [ "${_gpins:-0}" -gt 0 ] && printf ', serving %s pinned rule(s)' "$_gpins" )"
+       else ok_ "$(gtag): signed in$( [ "${_gpins:-0}" -gt 0 ] && printf ', %s pinned rule(s)' "$_gpins" )"; fi ;;
+  esac
   for d in "$PROFILES"/*/; do
     [ -d "$d" ] || continue
     local nm; nm=$(basename "$d")

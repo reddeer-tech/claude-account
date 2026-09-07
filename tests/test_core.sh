@@ -145,6 +145,27 @@ X usage global 2>&1 | head -1 | grep -q 'me@personal.com' && ok "usage global na
 X usage --all 2>&1 | grep '^USAGE — (global)' | grep -q 'me@personal.com' && ok "usage --all too" || no "usage --all label"
 X profiles --no-refresh 2>&1 | grep -q 'me@personal.com' && ok "one source: profiles agrees" || no "profiles label"
 
+section "doctor checks the GLOBAL credential too, not just the profiles"
+# Reachable by a legitimate setup: sign out of global, keep every account as a profile,
+# and live on `use <name>`. Doctor probed every profile and never global, so that machine
+# passed clean while pinned rules had nowhere to go.
+mkdir -p "$T/gp" "$T/profiles/pers"; sign pers
+X add "$T/gp" gpin >/dev/null 2>&1; sign gpin
+DG(){ X doctor --no-refresh 2>&1 | grep -E '\(global\)' | head -1; }
+sign_global
+DG | grep -q 'signed in' && ok "global signed in -> ok" || no "A: $(DG)"
+X use pers >/dev/null 2>&1
+DG | grep -q "standing by while 'pers' is selected" && ok "…and says it is standing by while a selection is active" || no "B: $(DG)"
+grep -v '^Claude Code-credentials$' "$T_SIGNED" > "$T/s2"; mv "$T/s2" "$T_SIGNED"
+DG | grep -q 'fine while' && ok "signed out + selection: warns about what use global would do" || no "C: $(DG)"
+X doctor --no-refresh >/dev/null 2>&1; [ $? = 0 ] && ok "…and that alone is a warning, not a failure" || no "C exit"
+X switch "$T/gp" global >/dev/null 2>&1
+DG | grep -q 'pinned to it' && ok "a pin to an unsigned global is a PROBLEM, and is counted" || no "D: $(DG)"
+X doctor --no-refresh >/dev/null 2>&1; [ $? = 1 ] && ok "…and doctor exits 1" || no "D exit"
+out=$(SEC_MODE=err X doctor --no-refresh 2>&1 | grep -E '\(global\)' | head -1)
+printf '%s' "$out" | grep -q 'NOT proof it is missing' && ok "a probe FAILURE never reads as 'not signed in'" || no "F: $out"
+X resume gpin >/dev/null 2>&1; X use global >/dev/null 2>&1; sign_global
+
 section "exit codes"
 X --help >/dev/null 2>&1;             [ $? = 0 ] && ok "--help -> 0" || no "help"
 X not-a-command >/dev/null 2>&1;      [ $? = 2 ] && ok "unknown command -> 2 (a typo must not look like success)" || no "unknown cmd"
