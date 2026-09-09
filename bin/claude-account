@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.1.0"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.1"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -548,7 +548,7 @@ colorize_help(){
     -e "s|https://[a-zA-Z0-9./_-]+|${U}&${O}|g" \
     -e "s/(^|[ \"])(claude-(account|whoami)) ([a-z][a-z-]*)/\1\2 ${B}\4${O}/g" \
     -e "s/(^|[ \"])claude-(account|whoami)/\1${G}claude-\2${O}/g" \
-    -e "s/<[a-z|]+>/${D}&${O}/g" \
+    -e "s/<[a-z|-]+>/${D}&${O}/g" \
     -e "s/\[[a-z|-]+\]/${D}&${O}/g" \
     -e "s/[[:<:]]global[[:>:]]/${C}&${O}/g" \
     -e "s/${PB}global${PO}/${C}global${O}/g"
@@ -2558,88 +2558,88 @@ case "${1:-list}" in
 claude-account — route Claude subscriptions per project path
 
 INSPECT
-  claude-account list                  path rules: what each project path does
-                                       (aliases: ls, -l, --list)
-  claude-account profiles              every stored login, incl. unused ones
-                                       (alias: logins)
-  claude-account overview              the whole picture in one screen: every
-                                       credential, its paths, and live usage bars
-                                       (list + profiles + usage combined; alias: ov)
-  claude-account list --json           the same state as one JSON object (for scripts;
-                                       no ANSI, no refresh, no network)
-  claude-account verify                same data framed per path
-  claude-account doctor                health check: plumbing, rules, logins, keychain
-  claude-account undo                  restore paths.map from the most recent snapshot
-                                       (every mutating command takes one first)
-  claude-account statusline            the account THIS session is spending — for
-                                       Claude Code's statusLine setting, where the
-                                       Account panel's email cannot be trusted
-  claude-account --version             print the installed version
+  claude-account list                        path rules: what each project path does
+                                             (aliases: ls, -l, --list)
+  claude-account profiles                    every stored login, incl. unused ones
+                                             (alias: logins)
+  claude-account overview                    the whole picture in one screen: every
+                                             credential, its paths, and live usage bars
+                                             (list + profiles + usage combined; alias: ov)
+  claude-account list --json                 the same state as one JSON object (for scripts;
+                                             no ANSI, no refresh, no network)
+  claude-account verify                      same data framed per path
+  claude-account doctor                      health check: plumbing, rules, logins, keychain
+  claude-account undo                        restore paths.map from the most recent snapshot
+                                             (every mutating command takes one first)
+  claude-account statusline                  the account THIS session is spending — for
+                                             Claude Code's statusLine setting, where the
+                                             Account panel's email cannot be trusted
+  claude-account --version                   print the installed version
 
   --no-refresh on list/profiles/verify/doctor/overview skips renewing expired tokens
 
-  claude-account setup                 wire up PATH + VS Code after a package install
-  claude-account vscode-status install   add a status bar item to VS Code/Cursor naming
-                                       the account this folder routes to (remove|status)
-  claude-account refresh [name|--all]  renew expired access tokens (default: all)
-  claude-account usage [name|path]     live quota: session, weekly, resets (omit = global)
-  claude-account usage --all           every profile + global (refreshes expired tokens)
-  claude-account <name> usage          same thing, read the other way round
-  claude-whoami [dir]                  which account applies in a directory, and why
+  claude-account setup                       wire up PATH + VS Code after a package install
+  claude-account vscode-status install       add a status bar item to VS Code/Cursor naming
+                                             the account this folder routes to (remove|status)
+  claude-account refresh [profile|--all]     renew expired access tokens (default: all)
+  claude-account usage [profile|path]        live quota: session, weekly, resets (omit = global)
+  claude-account usage --all                 every profile + global (refreshes expired tokens)
+  claude-account <profile> usage             same thing, read the other way round
+  claude-whoami [dir]                        which account applies in a directory, and why
 
-SET UP                                 <path> = /abs/path   <name> = profile name
-  claude-account add <path> [name]     bind a path to a profile
-                                       name defaults to the folder, lowercased
-  claude-account login <name|path>     sign in to a profile  (YOUR TERMINAL — opens a browser)
-  claude-account label <name|path> <t> record which account it holds ("" clears)
-  claude-account label <name> --auto   read it from the most recent sign-in
-  claude-account rename <old> <new>    rename a profile, moving its stored login
-  claude-account logout <name|path>    sign out; keeps the rules, pauses them so
-                                       those paths use the global account
-                                       (--keep-active leaves them routed = failing)
+SET UP                                       <path> = /abs/path        <profile> = a profile name
+  claude-account add <path> [profile]        bind a path to a profile
+                                             name defaults to the folder, lowercased
+  claude-account login <profile|path>        sign in (YOUR TERMINAL — opens a browser)
+  claude-account label <profile|path> <text> record which account it holds ("" clears)
+  claude-account label <profile> --auto      read it from the most recent sign-in
+  claude-account rename <profile> <new-name> rename a profile, moving its stored login
+  claude-account logout <profile|path>       sign out; keeps the rules, pauses them so
+                                             those paths use the global account
+                                             (--keep-active leaves them routed = failing)
 
-PAUSE / RESUME                         paused = that path falls back to the global account
-  claude-account pause  <name>         pause EVERY path on that profile
-  claude-account pause  <path>         pause only that one path
-  claude-account resume <name>         resume every path on that profile
-  claude-account resume <path>         resume only that one path
-  claude-account switch <name> <to>    move EVERY path from one profile to another
-  claude-account switch <path> <to>    move just that path (both un-pause it)
-  claude-account switch <x> global     stop routing it — same routing as pause, but
-                                       list then shows PROFILE as global
+PAUSE / RESUME                               paused = that path falls back to the global account
+  claude-account pause <profile>             pause EVERY path on that profile
+  claude-account pause <path>                pause only that one path
+  claude-account resume <profile>            resume every path on that profile
+  claude-account resume <path>               resume only that one path
+  claude-account switch <profile> <dest>     move EVERY path from one profile to another
+  claude-account switch <path> <dest>        move just that path (both un-pause it)
+                                             <dest> = another profile, or global to stop routing
+                                             (same routing as pause; list shows PROFILE global)
 
-USE                                    which account is "the" account, machine-wide
-  claude-account create <name>         NEW floating profile + sign-in, one command
-                                       (bind a path later: add <path> <name>)
-  claude-account use <name>            every path with NO rule now uses that profile
-                                       (your global credential is untouched)
-  claude-account use                   show what is selected
-  claude-account use global            back to the account you signed in with globally
-  claude-account use -q                just the name, for scripts and prompts
-                                       plain-PAUSED paths follow the selection too;
-                                       switch <x> global pins a path to the real global
-                                       (fallback is the old name for use — same command)
+USE                                          which account is "the" account, machine-wide
+  claude-account create <profile>            NEW floating profile + sign-in, one command
+                                             (bind a path later: add <path> <profile>)
+  claude-account use <profile>               every path with NO rule now uses that profile
+                                             (your global credential is untouched)
+  claude-account use                         show what is selected
+  claude-account use global                  back to the account you signed in with globally
+  claude-account use -q                      just the name, for scripts and prompts
+                                             plain-PAUSED paths follow the selection too;
+                                             switch <path> global pins it to the real global
+                                             (fallback is the old name for use — same command)
 
-GLOBAL ACCOUNT                         the one used by every unrouted path
-                                       (unless use selects another — see above)
-                                       "global" works as a target of the normal verbs
-  claude-account login global          sign in globally (YOUR TERMINAL)
-  claude-account logout global         sign out globally
-  claude-account status global         who you are signed in as globally
-  claude-account usage global          global quota
-                                       (the older "claude-account global <verb>" form
-                                        still works and does the same thing)
+GLOBAL ACCOUNT                               the one used by every unrouted path
+                                             (unless use selects another — see above)
+                                             "global" works as a target of the normal verbs
+  claude-account login global                sign in globally (YOUR TERMINAL)
+  claude-account logout global               sign out globally
+  claude-account status global               who you are signed in as globally
+  claude-account usage global                global quota
+                                             (the older "claude-account global <verb>" form
+                                              still works and does the same thing)
 
-PORTABILITY                            rules + labels only; logins never leave the Keychain
-  claude-account export > file.tsv     dump rules and labels
-  claude-account import <file>         restore them on another machine
+PORTABILITY                                  rules + labels only; logins never leave the Keychain
+  claude-account export > file.tsv           dump rules and labels
+  claude-account import <file>               restore them on another machine
 
 TEAR DOWN
-  claude-account unbind <path|name>    that path stops using its profile; login kept
-                                       (by name: only when it has a single path)
-  claude-account unbind <name> --all   detach EVERY path on that profile
-  claude-account forget <name|path>    delete the profile and its login
-                                       (refuses while rules exist; --force cascades)
+  claude-account unbind <path|profile>       that path stops using its profile; login kept
+                                             (by name: only when it has a single path)
+  claude-account unbind <profile> --all      detach EVERY path on that profile
+  claude-account forget <profile|path>       delete the profile and its login
+                                             (refuses while rules exist; --force cascades)
 
 NOTES
   Only the ACCOUNT is routed. Plugins, MCP servers, memory, settings, hooks and
