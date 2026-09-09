@@ -96,6 +96,8 @@ Day to day you run nothing: open the project and work.
 | `list` / `profiles` / `verify` | what routes where, and which account each holds |
 | `usage [name\|--all]` | live session/weekly/model quotas and reset times |
 | `pause` / `resume` / `switch` | park a depleted account, or move paths to another one |
+| `unbind <path>` / `unbind <name> --all` | that path stops using its profile - the rule goes, the login stays (named `remove` before 1.1.0) |
+| `forget <name>` | delete the profile itself, its label and its login |
 | `create <name>` | new profile with no path bound, and the browser sign-in, in one command - bind a path later with `add <path> <name>`, or never |
 | `use <name>` / `use global` | point every path with no rule at that profile / back at your global account - switch the machine's "default" account at ease; no credential is copied or replaced (`fallback` is the older name, same command) |
 | `use` / `use -q` | show what is selected / just the name, for scripts |

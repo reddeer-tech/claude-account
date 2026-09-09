@@ -152,7 +152,7 @@ X switch "$T/proj/Pin" global >/dev/null 2>&1
 O=$(X overview --no-refresh 2>/dev/null)
 printf '%s' "$O" | grep -A3 '── (global)' | grep -q 'Pin' && ok "a switch-to-global PIN is listed on the (global) card" || no "pinned path missing from global card"
 printf '%s' "$O" | grep -A3 '── pinp' | grep -q 'not in use' && ok "…and reads 'not in use' on its own profile's card (same fact, two subjects)" || no "pin subject"
-X remove "$T/proj/Pin" >/dev/null 2>&1; X use global >/dev/null 2>&1
+X unbind "$T/proj/Pin" >/dev/null 2>&1; X use global >/dev/null 2>&1
 
 section "add × floating profiles"
 mkdir -p "$T/proj/Work"

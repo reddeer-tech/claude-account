@@ -1,6 +1,6 @@
 {
   "name": "claude-account",
-  "version": "1.0.32",
+  "version": "1.1.0",
   "description": "Route Claude Code subscriptions per project path on macOS \u2014 different account per folder, everything else shared.",
   "keywords": [
     "claude",

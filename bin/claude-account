@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.0.32"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.0"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -229,10 +229,10 @@ reserved_global(){ # <name> <verb>
   dim "  global account. To put a path on the global account, say so directly:" >&2
   echo >&2
   if [ "${2:-}" = "add" ]; then
-    echo "      claude-account remove <path>          # permanently: drop the rule" >&2
+    echo "      claude-account unbind <path>          # permanently: drop the rule" >&2
     echo "      claude-account pause  <path>          # temporarily: keep it, reversible" >&2
   else
-    echo "      claude-account remove <path>          # drop the rule entirely" >&2
+    echo "      claude-account unbind <path>          # drop the rule entirely" >&2
   fi
   return 2
 }
@@ -388,7 +388,7 @@ cmd_resume(){
   local state="ok"
   if [ -n "$nm2" ]; then
     local pdir="$PROFILES/$nm2"
-    if [ "$(acct_identity "$pdir")" = "NOT LOGGED IN" ]; then
+    if [ "$(acct_state "$pdir")" = absent ]; then
       state="nologin"
     elif acct_is_expired "$pdir"; then
       dim "  '$nm2': access token expired — renewing…"
@@ -425,6 +425,31 @@ except Exception:
 CAPPY
 )
   [ -n "$out" ] && write_line "$1/.account" "$out"
+}
+
+# The STATE of an account's credential, as a bare token that is NEVER coloured. "" is
+# the global account (its Keychain service carries no hash suffix).
+#
+# ⚠ THIS is what every DECISION must use. `acct_identity` is for PRINTING: it colours its
+# output whenever stdout is a terminal, so `[ "$(acct_identity …)" = "NOT LOGGED IN" ]`
+# compares against `\033[31mNOT LOGGED IN\033[0m` and is false exactly when a human is
+# running the command. Six call sites had that bug at once — `doctor` reported an unsigned
+# profile as "signed in" on a terminal while printing the truth when piped, which is also
+# why every test passed (the suite runs with NO_COLOR=1). Same rule as `acct_is_expired`.
+#
+# `error` is a probe failure, and it is deliberately NOT folded into `absent`: an
+# unverifiable credential must never read as a missing one. Callers deciding whether to
+# make a CLAIM should treat `error` as "say nothing"; callers deciding ROUTING must treat
+# it as "route toward the rule anyway" — the opposite, and the reason this returns three
+# values rather than a boolean.
+acct_state(){ # <profile-dir or ""> -> signed-in | absent | error
+  local svc="Claude Code-credentials"
+  [ -n "${1:-}" ] && svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
+  local blob rc
+  blob=$(security find-generic-password -s "$svc" -w 2>/dev/null); rc=$?
+  if [ -n "$blob" ]; then printf 'signed-in\n'; return 0; fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 44 ]; then printf 'error\n'; return 0; fi
+  printf 'absent\n'
 }
 
 profile_label(){ # <profile-dir> -> recorded email, or empty
@@ -1215,7 +1240,7 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
   case "$_gid" in
     *"KEYCHAIN ERROR"*)
       wrn "$(gtag): could not read the credential — $_gid (probe failure, NOT proof it is missing)" ;;
-    "NOT LOGGED IN")
+    *"NOT LOGGED IN"*)
       if [ "${_gpins:-0}" -gt 0 ]; then
         bad "$(gtag) is NOT signed in, and $_gpins rule(s) are pinned to it by switch <x> global — those paths have nowhere to go (claude-account login global)"
       elif [ -n "$_gsel" ]; then
@@ -1233,7 +1258,7 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
     local used; used=$(awk -F'\t' -v n="$nm" '$1 !~ /^[ \t]*#/ && $2==n{c++} END{print c+0}' "$MAP" 2>/dev/null)
     local id; id=$(acct_identity "${d%/}")
     local _dfb; _dfb=$(get_fallback) || _dfb=""
-    if [ "$id" = "NOT LOGGED IN" ]; then
+    if [ "$(acct_state "${d%/}")" = absent ]; then
       if [ "$nm" = "$_dfb" ]; then wrn "$nm: is the FALLBACK but NOT signed in — every unrouted launch warns"
       elif [ "$used" -gt 0 ]; then wrn "$nm: $used rule(s) but NOT signed in — those paths use global + warn"
       else wrn "$nm: floating and not signed in — claude-account login $nm  (no longer wanted? claude-account forget $nm)"; fi
@@ -1320,7 +1345,7 @@ cmd_switch(){
     dim "      claude-account switch $1 <profile>"
     dim "  To detach the path for good instead — rule deleted, login kept, nothing left"
     dim "  associating it with that profile:"
-    dim "      claude-account remove <path>"
+    dim "      claude-account unbind <path>"
     return 0
   fi
   local target; target=$(to_profile "$2") || exit $?
@@ -1412,7 +1437,7 @@ cmd_logout(){
   fi
   echo
   dim "  sign in again : claude-account login $name   (then: claude-account resume $name)"
-  dim "  drop the paths: claude-account remove <path>     (or: remove $name)"
+  dim "  drop the paths: claude-account unbind <path>     (or: unbind $name)"
   dim "  delete it all : claude-account forget $name"
 }
 
@@ -1811,10 +1836,15 @@ $fbrow"; fi
   else
     printf '  %s %-52s %s\n' "$(gcell "$CA_GTAG" 13)" "$CA_GLOBAL_ID" "every path with no rule"
   fi
+  # Only a profile that HOLDS a credential can share a quota with another. Pairing
+  # LABELS alone made a signed-out profile "record the SAME account" as global — two
+  # untruths at once: it records nothing, and there is no second quota to warn about.
+  # A probe that fails is not a confirmation, so it stays out of the note as well.
   local dup; dup=$( { for d in "$PROFILES"/*/; do [ -d "$d" ] || continue
+        [ "$(acct_state "${d%/}")" = signed-in ] || continue
         local _l; _l=$(profile_label "${d%/}"); [ -n "$_l" ] && printf '%s\t%s\n' "$_l" "$(basename "$d")"; done
       local _g; _g=$(global_label)
-      [ -n "$_g" ] && printf '%s\t%s\n' "$_g" "(global)"; } \
+      [ -n "$_g" ] && [ "$(acct_state "")" = signed-in ] && printf '%s\t%s\n' "$_g" "(global)"; } \
     | awk -F'\t' '{n[$1]=n[$1]", "$2; c[$1]++} END{for(k in n) if(c[k]>1) printf "  note: %s record the SAME account (%s) — one quota, not two\n", substr(n[k],3), k}' )
   [ -n "$dup" ] && { echo; yel "$dup"; }
   echo
@@ -2035,8 +2065,7 @@ cmd_list(){
       #   switch <x> global  -> you named global, so the column says global and the
       #                         binding moves to the aside — it is what resume restores
       # The routing is identical in both; only the wording is not.
-      local pid; pid=$(acct_identity "$pdir")
-      local note="login kept"; [ "$pid" = "NOT LOGGED IN" ] && note="NOT signed in"
+      local note="login kept"; [ "$(acct_state "$pdir")" = absent ] && note="NOT signed in"
       load_global_identity
       load_dest_identity
       # STATUS describes whatever PROFILE names, or the row contradicts itself.
@@ -2118,7 +2147,7 @@ cmd_add(){
   local existing; existing=$(awk -F'\t' -v p="$path" '$1==p{print $2}' "$MAP" 2>/dev/null | head -1)
   if [ -n "$existing" ]; then
     yel "That exact path already routes to profile '$existing'."
-    dim "  change it:  claude-account remove '$path'  then add again"; exit 1; fi
+    dim "  change it:  claude-account unbind '$path'  then add again"; exit 1; fi
   # Two paths MAY share one profile (same client, two checkouts) — but only on
   # purpose. A DERIVED name that collides is almost always an accident: two folders
   # with the same basename would silently share one account and one quota.
@@ -2185,19 +2214,26 @@ cmd_add(){
   fi
 }
 
-cmd_remove(){
+cmd_unbind(){
   local path="${1:-}"
-  [ -z "$path" ] && { red "usage: claude-account remove <project-path|profile-name>"; exit 2; }
+  [ -z "$path" ] && { red "usage: claude-account unbind <project-path|profile-name>"; exit 2; }
   case "$path" in
     /*|~*|./*|../*) path=$(norm "$path") || path="${1%/}" ;;
     *) # a profile name: resolve to its path(s)
        local hits; hits=$(awk -F'\t' -v n="$path" '$1 !~ /^[ \t]*#/ && $2==n{print $1}' "$MAP" 2>/dev/null)
        local cnt; cnt=$(printf '%s' "$hits" | grep -c .)
-       if [ "$cnt" = 0 ]; then red "no rule for profile or path: $path"; exit 1
+       if [ "$cnt" = 0 ] && [ -d "$PROFILES/$path" ]; then
+            red "profile '$path' has no path rules, so there is nothing for unbind to detach."
+            dim "  unbind detaches a PATH from its profile; the profile itself is deleted by forget:"
+            dim "      claude-account forget $path        # deletes the profile and its login"
+            dim "  or give it a path:"
+            dim "      claude-account add <path> $path"
+            exit 1
+       elif [ "$cnt" = 0 ]; then red "no rule for profile or path: $path"; exit 1
        elif [ "$cnt" -gt 1 ] && [ "${2:-}" != "--all" ]; then
             red "profile '$path' covers several paths — name one, or use --all:"
             printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
-            dim "    claude-account remove $path --all"
+            dim "    claude-account unbind $path --all"
             exit 1
        elif [ "$cnt" -gt 1 ]; then
             backup "remove-all-$path"
@@ -2216,8 +2252,8 @@ open(tmp,"w").writelines([l for l in lines if l.rstrip("\n").split("\t")[0] not 
 RMPY
             rm -f "$plist"
             write_map "$tmp" "$((before-cnt))" || exit 1
-            printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/  removed  /'
-            grn "Removed $cnt rule(s) — those paths have no rule now."
+            printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/  unbound  /'
+            grn "Unbound $cnt path(s) — they have no rule now."
             if [ "$(get_fallback 2>/dev/null)" = "$path" ]; then
               yel "  NOTE: '$path' is also the FALLBACK — those paths (and every unrouted one) STILL use it."
               dim "        stop that with:  claude-account use global"
@@ -2248,9 +2284,9 @@ open(tmp,'w').writelines([l for l in lines if l.rstrip('\n').split('\t')[0]!=p])
 PY
   write_map "$tmp" "$((before-nmatch))" || exit 1
   if _rfb2=$(get_fallback 2>/dev/null); then
-    grn "Removed: $path  ->  no rule now, so it uses the fallback profile '$_rfb2'."
+    grn "Unbound: $path  ->  no rule now, so it uses the selected profile '$_rfb2'."
   else
-    grn "Removed: $path  ->  now uses your GLOBAL account again."
+    grn "Unbound: $path  ->  now uses your GLOBAL account again."
   fi
   dim "Profile dir kept at $PROFILES/$name (its login still works if you re-add it)."
   dim "To forget the login too:  claude-account forget $name"
@@ -2298,7 +2334,7 @@ cmd_create(){
   cmd_login "$name" "${@:2}"
   # cmd_login historically exits 0 even when the browser flow did not complete; for
   # create, scripts chain `create x && use x`, so verify and be strict.
-  if [ "$(acct_identity "$PROFILES/$name")" = "NOT LOGGED IN" ]; then
+  if [ "$(acct_state "$PROFILES/$name")" != signed-in ]; then
     yel "profile '$name' kept — sign in later:  claude-account login $name"
     exit 1
   fi
@@ -2368,10 +2404,12 @@ cmd_login(){
   env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
       CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir" "$rc" auth login $claudeai $extra
   : > "$pdir/.login-attempted"
-  capture_label "$pdir"
   echo
   local acct; acct=$(acct_identity "$pdir")
-  if [ "$acct" = "NOT LOGGED IN" ]; then
+  # Only once the credential is actually THERE. A probe failure is not a confirmation
+  # either, so it does not get a label — an unverified label is worse than none.
+  [ "$(acct_state "$pdir")" = signed-in ] && capture_label "$pdir"
+  if [ "$(acct_state "$pdir")" = absent ]; then
     yel "Still not logged in for '$name'. Re-run:  claude-account login $name"
   else
     grn "Profile '$name' is now: $acct"
@@ -2423,7 +2461,7 @@ FGPY
     else
       yel "Paths still route to '$name':"; printf '%s\n' "$still" | sed "s|$HOME|~|"
       red "Remove them first, or cascade:"
-      dim "    claude-account remove $name --all      # keep the login"
+      dim "    claude-account unbind $name --all      # keep the login"
       dim "    claude-account forget $name --force    # delete everything"
       exit 1
     fi
@@ -2456,11 +2494,11 @@ main(){
     # remove`, run from a folder containing a `vscode-status/` directory, silently
     # became `remove vscode-status`. A command name is never a profile or a path.
     case "$1" in
-      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|refresh|logout|switch|global|status|pause|resume|add|remove|rm      |login|forget|statusline|undo|vscode-status|help)
+      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|refresh|logout|switch|global|status|pause|resume|add|unbind|remove|rm      |login|forget|statusline|undo|vscode-status|help)
         set -- "$@" ;;                      # a command: leave the order alone
       *)
     case "$2" in
-      usage|login|logout|pause|resume|remove|forget|label|verify|fallback|use)
+      usage|login|logout|pause|resume|unbind|remove|forget|label|verify|fallback|use)
         if awk -F'\t' -v n="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" '$2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null \
            || [ -d "$PROFILES/$1" ] || [ -d "$1" ]; then
           set -- "$2" "$1" "${@:3}"
@@ -2500,7 +2538,17 @@ case "${1:-list}" in
   pause)  shift; cmd_pause "$@" ;;
   resume) shift; cmd_resume "$@" ;;
   add)    shift; cmd_add "$@" ;;
-  remove|rm) shift; cmd_remove "$@" ;;
+  unbind) shift; cmd_unbind "$@" ;;
+  # `remove`/`rm` were the name for this until 1.1.0. They are DELETED, not aliased:
+  # `remove` and `forget` are near-synonyms in English, so nothing in either word said
+  # which object it acted on and the wrong one was a coin flip. This refuses, names the
+  # verb, and touches nothing — a working alias would have preserved the ambiguity.
+  remove|rm)
+    red "'$1' was renamed to 'unbind' in 1.1.0 — nothing was changed."
+    dim "  claude-account unbind <path>          detach that path from its profile"
+    dim "  claude-account unbind <name> --all    detach every path on that profile"
+    dim "  claude-account forget <name>          delete the profile itself, and its login"
+    exit 2 ;;
   login)  shift; cmd_login "$@" ;;
   forget) shift; cmd_forget "$@" ;;
   # QUOTED delimiter. Unquoted, bash expands $ and backticks inside the help text —
@@ -2587,9 +2635,9 @@ PORTABILITY                            rules + labels only; logins never leave t
   claude-account import <file>         restore them on another machine
 
 TEAR DOWN
-  claude-account remove <path|name>    delete one rule; keeps the login
+  claude-account unbind <path|name>    that path stops using its profile; login kept
                                        (by name: only when it has a single path)
-  claude-account remove <name> --all   delete EVERY rule on that profile
+  claude-account unbind <name> --all   detach EVERY path on that profile
   claude-account forget <name|path>    delete the profile and its login
                                        (refuses while rules exist; --force cascades)
 

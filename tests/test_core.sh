@@ -36,7 +36,7 @@ X add "$T/Spa ce" spacey >/dev/null 2>&1; sign spacey
 [ "$(Rn "$T/Spa ce/src")" = "spacey" ] && ok "…and from a subfolder" || no "space sub"
 X pause "$T/Spa ce" >/dev/null 2>&1; [ "$(Rn "$T/Spa ce")" = "(global)" ] && ok "pause matches it exactly" || no "space pause"
 X resume "$T/Spa ce" >/dev/null 2>&1
-X remove "$T/Spa ce" >/dev/null 2>&1;  [ "$(Rn "$T/Spa ce")" = "(global)" ] && ok "remove matches it exactly" || no "space remove"
+X unbind "$T/Spa ce" >/dev/null 2>&1;  [ "$(Rn "$T/Spa ce")" = "(global)" ] && ok "unbind matches it exactly" || no "space remove"
 
 section "a map with no trailing newline keeps its last rule"
 # `while read` returns false on an unterminated final line, so that path quietly used
@@ -45,7 +45,7 @@ printf '%s\tlastone' "$T/other" >> "$CLAUDE_ACCOUNTS_MAP"
 mkdir -p "$T/profiles/lastone"; sign lastone
 [ "$(Rn "$T/other")" = "lastone" ] && ok "resolver reads the unterminated last line" || no "resolver lost it"
 X list --no-refresh 2>/dev/null | grep -q lastone && ok "list shows it too" || no "list lost it"
-X remove "$T/other" >/dev/null 2>&1
+X unbind "$T/other" >/dev/null 2>&1
 
 section "commented template lines are not live rules"
 # The shipped template's examples are TAB separated too, so an awk without a ^# guard
@@ -53,7 +53,7 @@ section "commented template lines are not live rules"
 mkdir -p "$T/fresh"
 out=$(X add "$T/fresh" personal 2>&1); rc=$?
 [ $rc = 0 ] && ok "a name used only by a commented example is free" || no "comment counted as a rule (rc=$rc)"
-X remove "$T/fresh" >/dev/null 2>&1
+X unbind "$T/fresh" >/dev/null 2>&1
 
 section "probe honesty: a Keychain ERROR is not 'not signed in'"
 # exit 44 = item not found. Anything else is a probe failure and must route TOWARD the
@@ -165,6 +165,77 @@ X doctor --no-refresh >/dev/null 2>&1; [ $? = 1 ] && ok "…and doctor exits 1" 
 out=$(SEC_MODE=err X doctor --no-refresh 2>&1 | grep -E '\(global\)' | head -1)
 printf '%s' "$out" | grep -q 'NOT proof it is missing' && ok "a probe FAILURE never reads as 'not signed in'" || no "F: $out"
 X resume gpin >/dev/null 2>&1; X use global >/dev/null 2>&1; sign_global
+
+section "a label is never recorded for a sign-in that did not happen"
+# capture_label reads the SHARED ~/.claude.json, which names the most recent sign-in of
+# ANY profile. It used to run unconditionally after the auth attempt, so an ABANDONED
+# login stamped the profile with whatever account was last used elsewhere: `profiles`
+# then showed "NOT LOGGED IN (last: someone@example.com)" for a profile that never
+# signed in as anyone, and the duplicate-account note repeated the fiction.
+mkdir -p "$T/profiles/aband"
+# ⚠ PTYC, not PTY. acct_identity COLOURS its output on a terminal, and cmd_login refuses
+# to run without one — so the earlier version of this guard compared coloured bytes to a
+# plain string and never fired in production, while this test passed under ca_sandbox's
+# NO_COLOR=1. Any assertion about a credential DECISION must run with colour on.
+out=$(PTYC '' login aband)
+printf '%s' "$out" | grep -q 'Still not logged in' && ok "an abandoned login says so" || no "abandoned: $out"
+[ ! -f "$T/profiles/aband/.account" ] && ok "…and writes NO label" || no "label written: $(cat "$T/profiles/aband/.account")"
+mkdir -p "$T/profiles/good"; sign good
+out=$(PTYC '' login good)
+printf '%s' "$out" | grep -q "Profile 'good' is now:" && ok "a successful login reports the identity" || no "good: $out"
+[ -f "$T/profiles/good/.account" ] && ok "…and DOES record the label" || no "no label on success"
+
+section "the duplicate-account note is about shared QUOTA, so it needs credentials"
+mkdir -p "$T/profiles/lbl"; echo "same@example.com (Org)" > "$T/profiles/lbl/.account"
+sign_global; echo "same@example.com (Org)" > "$T/profiles/.global-account"
+X profiles --no-refresh 2>&1 | grep -q 'SAME account' && no "a signed-OUT profile still claims to share a quota" || ok "a signed-out profile raises no duplicate note"
+sign lbl
+X profiles --no-refresh 2>&1 | grep -q 'lbl.*SAME account\|SAME account.*same@example.com' && ok "…but a real duplicate (both signed in) is still caught" || no "real duplicate missed"
+rm -rf "$T/profiles/lbl"
+
+section "remove/rm are DELETED (1.1.0), and refuse loudly instead of aliasing"
+# An alias that WORKS is what made remove/forget guessable-but-wrong. A tombstone
+# performs nothing and names the verb once.
+for dead in remove rm; do
+  out=$(X $dead "$T/a" 2>&1); rc=$?
+  [ $rc = 2 ] || no "$dead exited $rc, want 2"
+  printf '%s' "$out" | grep -q "renamed to 'unbind'" || no "$dead did not name unbind"
+done
+ok "remove and rm both refuse with exit 2 and name unbind"
+grep -q "^$T/a	" "$CLAUDE_ACCOUNTS_MAP" && ok "…and the rule they were aimed at is UNTOUCHED" || no "tombstone still mutated the map"
+# the 1.0.26 incident class: a directory named like the dead verb must not word-swap it
+mkdir -p "$T/wd2/remove"
+out=$( cd "$T/wd2" && bash "$CA" remove "$T/a" 2>&1 ); rc=$?
+[ $rc = 2 ] && printf '%s' "$out" | grep -q "renamed to 'unbind'" && ok "still a tombstone from a dir containing ./remove" || no "guard: rc=$rc"
+
+section "unbind <floating profile> says what to run instead"
+# `remove` deletes a PATH RULE. Given a profile with none, "no rule for profile or path"
+# reads as "no such profile", which sends you looking for the wrong thing.
+mkdir -p "$T/profiles/floaty"
+out=$(X unbind floaty 2>&1); rc=$?
+[ $rc = 1 ] && ok "still exit 1" || no "remove floaty rc=$rc"
+printf '%s' "$out" | grep -q 'has no path rules' && ok "names the actual situation" || no "wording: $out"
+printf '%s' "$out" | grep -q 'claude-account forget floaty' && ok "hands you forget" || no "no forget hint"
+printf '%s' "$out" | grep -q 'add <path> floaty' && ok "…and the bind-a-path alternative" || no "no add hint"
+out=$(X unbind nosuchprofile 2>&1); rc=$?
+[ $rc = 1 ] && printf '%s' "$out" | grep -q 'no rule for profile or path' && ok "a genuinely unknown name is unchanged" || no "unknown: $out"
+rmdir "$T/profiles/floaty"
+
+section "a credential decision must not change when stdout is a terminal"
+# The class bug: `acct_identity` is DISPLAY text and carries colour on a tty, so every
+# `[ "$(acct_identity …)" = "NOT LOGGED IN" ]` was false exactly when a human ran it.
+# doctor reported an unsigned profile as "signed in" on a terminal and the truth when
+# piped. Decisions go through acct_state (a bare token); acct_identity only PRINTS.
+strip_ansi(){ tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g'; }
+mkdir -p "$T/tty1"; X add "$T/tty1" ttyp >/dev/null 2>&1     # a rule, no credential
+piped=$(X doctor --no-refresh 2>&1 | strip_ansi | grep -o 'ttyp: [^—]*' | head -1)
+ontty=$(PTYC '' doctor --no-refresh 2>&1 | strip_ansi | grep -o 'ttyp: [^—]*' | head -1)
+[ -n "$piped" ] && [ "$piped" = "$ontty" ] && ok "doctor says the same thing piped and on a tty" || no "piped='$piped' tty='$ontty'"
+printf '%s' "$ontty" | grep -q 'NOT signed in' && ok "…and on a tty it is still the TRUTH" || no "tty doctor: $ontty"
+sign ttyp
+ontty2=$(PTYC '' doctor --no-refresh 2>&1 | strip_ansi | grep -o 'ttyp: [^—]*' | head -1)
+printf '%s' "$ontty2" | grep -q 'signed in' && printf '%s' "$ontty2" | grep -qv 'NOT signed' && ok "a signed-in profile still reads as signed in" || no "signed: $ontty2"
+X unbind "$T/tty1" >/dev/null 2>&1
 
 section "exit codes"
 X --help >/dev/null 2>&1;             [ $? = 0 ] && ok "--help -> 0" || no "help"
