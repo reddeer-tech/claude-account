@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.1.2"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.3"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -623,8 +623,18 @@ def when(ts):
     try:
         t=datetime.datetime.fromisoformat(ts.replace("Z","+00:00")).astimezone()
         s=(t-datetime.datetime.now(t.tzinfo)).total_seconds()
-        h,m=int(s//3600),int((s%3600)//60)
-        rel=f"in {h}h {m}m" if h>0 else (f"in {m}m" if m>0 else "now")
+        # Days once past 24h: "in 152h 32m" makes you divide by 24 to learn it is
+        # Thursday week. Granularity drops as the horizon grows, and a NEGATIVE gap is
+        # said plainly rather than rendered as a countdown — the old expression floored
+        # a past timestamp into a positive "in Nm", which read as still to come.
+        if s < 0:
+            rel="passed"
+        else:
+            d,r=divmod(int(s),86400); h,r=divmod(r,3600); m=r//60
+            if d:   rel=f"in {d}d {h}h {m}m"
+            elif h: rel=f"in {h}h {m}m"
+            elif m: rel=f"in {m}m"
+            else:   rel="now"
         # Date, not just the weekday: a weekly window can reset 150+ hours out, and "Thu"
         # alone does not say WHICH Thursday. Month by NAME — a numeric 09-11 reads as
         # 11 Sep or 9 Nov depending on the reader. t.day, not %-d: this file already

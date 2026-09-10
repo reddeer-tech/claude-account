@@ -51,9 +51,12 @@ case "$1" in
   *)         echo pong ;;
 esac
 STUB
+  # $FAKE_RESETS_AT overrides both reset timestamps, so a test can put the window in the
+  # PAST — the branch that used to render a negative gap as a positive countdown.
   cat > "$T/bin/curl" <<'STUB'
 #!/bin/bash
-printf '{"limits":[{"kind":"session","percent":40,"severity":"normal","resets_at":"2030-01-01T15:40:00Z"},{"kind":"weekly_all","percent":34,"severity":"normal","resets_at":"2030-01-03T15:00:00Z"}]}'
+A="${FAKE_RESETS_AT:-2030-01-01T15:40:00Z}"; B="${FAKE_RESETS_AT:-2030-01-03T15:00:00Z}"
+printf '{"limits":[{"kind":"session","percent":40,"severity":"normal","resets_at":"%s"},{"kind":"weekly_all","percent":34,"severity":"normal","resets_at":"%s"}]}' "$A" "$B"
 STUB
   chmod +x "$T/bin/security" "$T/bin/claude" "$T/bin/curl"
   export T_SIGNED="$T/signed"; : > "$T_SIGNED"

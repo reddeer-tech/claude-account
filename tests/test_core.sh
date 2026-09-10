@@ -247,8 +247,19 @@ printf '%s' "$U" | grep -qE 'resets [A-Z][a-z][a-z] [0-9]{1,2} [A-Z][a-z][a-z] '
   && ok "renders as 'resets <Day> <D> <Mon> <time>'" || no "format: $(printf '%s' "$U" | grep resets | head -1)"
 printf '%s' "$U" | grep -q 'Jan' && ok "month spelled, not numeric" || no "no spelled month"
 printf '%s' "$U" | grep -qE 'resets [A-Z][a-z][a-z] [0-9]{1,2}-[0-9]' && no "numeric month came back" || ok "no numeric month"
-printf '%s' "$U" | grep -qE '\(in [0-9]+h [0-9]+m\)|\(in [0-9]+m\)|\(now\)' \
-  && ok "the relative countdown is still there" || no "countdown lost"
+# Granularity drops as the horizon grows: days past 24h, then hours, then minutes.
+# "in 152h 32m" made you divide by 24 to learn it meant Thursday week.
+printf '%s' "$U" | grep -qE '\(in [0-9]+d [0-9]+h [0-9]+m\)' \
+  && ok "past 24h it counts in DAYS (the stub resets in 2030)" || no "no day form: $(printf '%s' "$U" | grep -oE '\(in [^)]*\)' | head -1)"
+printf '%s' "$U" | grep -qE '\(in [0-9]{3,}h' && no "still counting three-digit hours" || ok "no three-digit hour counts"
+U2=$(FAKE_RESETS_AT="$(date -u -v+3H +%Y-%m-%dT%H:%M:%SZ)" X usage global 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+printf '%s' "$U2" | grep -qE '\(in [0-9]+h [0-9]+m\)' && ok "under 24h it counts in hours" || no "hours form: $(printf '%s' "$U2" | grep -oE '\(in [^)]*\)' | head -1)"
+U3=$(FAKE_RESETS_AT="$(date -u -v+20M +%Y-%m-%dT%H:%M:%SZ)" X usage global 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+printf '%s' "$U3" | grep -qE '\(in [0-9]+m\)' && ok "under an hour it counts in minutes" || no "minutes form"
+# a reset already behind us must NOT render as a countdown — it used to floor to "in Nm"
+U4=$(FAKE_RESETS_AT="$(date -u -v-5H +%Y-%m-%dT%H:%M:%SZ)" X usage global 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+printf '%s' "$U4" | grep -q '(passed)' && ok "a PAST reset says 'passed', not a fake countdown" || no "past: $(printf '%s' "$U4" | grep -oE '\(in [^)]*\)|\(passed\)' | head -1)"
+printf '%s' "$U4" | grep -qE '\(in [0-9]' && no "a past reset still renders as 'in ...'" || ok "…and no 'in' countdown on it"
 # the token EXPIRY is the other date on these screens, and it was numeric (%m-%d) too.
 # No weekday on this one: an expiry needs no action, it renews itself on use.
 mkdir -p "$T/dt"; X add "$T/dt" dtp >/dev/null 2>&1; sign dtp
