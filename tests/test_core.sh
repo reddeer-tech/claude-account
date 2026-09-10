@@ -237,6 +237,29 @@ ontty2=$(PTYC '' doctor --no-refresh 2>&1 | strip_ansi | grep -o 'ttyp: [^—]*'
 printf '%s' "$ontty2" | grep -q 'signed in' && printf '%s' "$ontty2" | grep -qv 'NOT signed' && ok "a signed-in profile still reads as signed in" || no "signed: $ontty2"
 X unbind "$T/tty1" >/dev/null 2>&1
 
+section "a reset time names the DATE, not just the weekday"
+# A weekly window can reset 150+ hours out, where "resets Thu 8:00 AM" does not say WHICH
+# Thursday. The month is spelled, never numeric: 09-11 reads as 11 Sep or 9 Nov depending
+# on the reader. The stubbed curl in lib.sh pins resets_at to 2030, so this is deterministic.
+sign_global
+U=$(X usage global 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+printf '%s' "$U" | grep -qE 'resets [A-Z][a-z][a-z] [0-9]{1,2} [A-Z][a-z][a-z] ' \
+  && ok "renders as 'resets <Day> <D> <Mon> <time>'" || no "format: $(printf '%s' "$U" | grep resets | head -1)"
+printf '%s' "$U" | grep -q 'Jan' && ok "month spelled, not numeric" || no "no spelled month"
+printf '%s' "$U" | grep -qE 'resets [A-Z][a-z][a-z] [0-9]{1,2}-[0-9]' && no "numeric month came back" || ok "no numeric month"
+printf '%s' "$U" | grep -qE '\(in [0-9]+h [0-9]+m\)|\(in [0-9]+m\)|\(now\)' \
+  && ok "the relative countdown is still there" || no "countdown lost"
+# the token EXPIRY is the other date on these screens, and it was numeric (%m-%d) too.
+# No weekday on this one: an expiry needs no action, it renews itself on use.
+mkdir -p "$T/dt"; X add "$T/dt" dtp >/dev/null 2>&1; sign dtp
+for c in list profiles verify overview; do
+  o=$(X $c --no-refresh 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+  printf '%s' "$o" | grep -qE 'exp [0-9]{1,2} [A-Z][a-z][a-z] ' || no "$c: expiry not spelled ($(printf '%s' "$o" | grep -oE 'exp [^ ]+ [^ ]+' | head -1))"
+  printf '%s' "$o" | grep -qE '(exp|EXPIRED) [0-9]{2}-[0-9]{2}' && no "$c: numeric date came back" || true
+done
+ok "list/profiles/verify/overview all spell the expiry month, none numeric"
+X unbind "$T/dt" >/dev/null 2>&1
+
 section "exit codes"
 X --help >/dev/null 2>&1;             [ $? = 0 ] && ok "--help -> 0" || no "help"
 X not-a-command >/dev/null 2>&1;      [ $? = 2 ] && ok "unknown command -> 2 (a typo must not look like success)" || no "unknown cmd"

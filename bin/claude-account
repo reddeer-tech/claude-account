@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.1.1"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.2"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -73,9 +73,14 @@ if exp:
     t = datetime.datetime.fromtimestamp(exp/1000)
     now = datetime.datetime.now()
     mins = (t - now).total_seconds() / 60
-    if mins < 0:      when = " EXPIRED " + t.strftime("%m-%d ") + hm(t)
+    # Spell the month. A numeric "09-11" reads as 11 Sep or 9 Nov depending on who is
+    # looking, and this line is the one people check when an account misbehaves. No
+    # weekday here, unlike a quota reset: an expiry needs no action from you (it renews
+    # itself on use), so it does not want the prominence of a day you might plan around.
+    def dm(t): return "%d %s " % (t.day, t.strftime("%b"))
+    if mins < 0:      when = " EXPIRED " + dm(t) + hm(t)
     elif mins < 60:   when = " EXPIRES IN %dm " % int(mins) + hm(t)
-    else:             when = " exp " + t.strftime("%m-%d ") + hm(t)
+    else:             when = " exp " + dm(t) + hm(t)
 plan = o.get("subscriptionType", "?"); tier = o.get("rateLimitTier", "?")
 print(plan + " | " + tier + when)
 ACCTPY
@@ -620,7 +625,11 @@ def when(ts):
         s=(t-datetime.datetime.now(t.tzinfo)).total_seconds()
         h,m=int(s//3600),int((s%3600)//60)
         rel=f"in {h}h {m}m" if h>0 else (f"in {m}m" if m>0 else "now")
-        return f"resets {t.strftime('%a ')}{t.strftime('%I:%M %p').lstrip('0')} ({rel})"
+        # Date, not just the weekday: a weekly window can reset 150+ hours out, and "Thu"
+        # alone does not say WHICH Thursday. Month by NAME — a numeric 09-11 reads as
+        # 11 Sep or 9 Nov depending on the reader. t.day, not %-d: this file already
+        # learned that the %- padding flags are not portable (see the 12-hour clock).
+        return f"resets {t.strftime('%a')} {t.day} {t.strftime('%b')} {t.strftime('%I:%M %p').lstrip('0')} ({rel})"
     except Exception: return f"resets {ts}"
 
 def bar(p):
