@@ -287,4 +287,21 @@ for c in list profiles verify doctor; do
 done
 ok "list/profiles/verify/doctor all accept --no-refresh"
 
+section "doctor: a parked rule does not count as routing to its profile"
+# `switch <path> global` is the documented way to pin a path to the real global account, and
+# it needs a placeholder profile that is deliberately never signed in. Counting its parked
+# rule as "used" made doctor warn "those paths use global + warn" — both halves false: the
+# resolver skips a parked row, so nothing routes there and nothing warns. Same false-alarm
+# class as the pre-1.0.21 "re-login for a token that renews itself".
+mkdir -p "$T/profiles/ghost" "$T/pinpath"
+X add "$T/pinpath" ghost >/dev/null 2>&1
+D=$(X doctor --no-refresh 2>&1)
+printf '%s' "$D" | grep -q 'ghost: 1 rule(s) but NOT signed in' && ok "an ACTIVE rule to an unsigned profile still warns" || no "lost the real warning"
+X switch "$T/pinpath" global >/dev/null 2>&1
+D=$(X doctor --no-refresh 2>&1)
+printf '%s' "$D" | grep -q 'ghost.*rule(s) are parked' && ok "a pinned rule reports as ok, not a warning" || no "still warns about a parked rule: $(printf '%s' "$D" | grep ghost)"
+printf '%s' "$D" | grep -q 'ghost.*use global + warn' && no "still claims those paths warn" || ok "…and stops claiming those paths warn"
+printf '%s' "$D" | grep -q 'ghost: floating' && no "a parked rule was mistaken for floating" || ok "…and is not mistaken for floating"
+[ -z "$(R "$T/pinpath")" ] && ok "the pinned path really does resolve to the real global" || no "resolve returned: $(R "$T/pinpath")"
+
 finish

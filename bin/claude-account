@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.1.3"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.4"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -1275,11 +1275,19 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
     local nm; nm=$(basename "$d")
     local svc="Claude Code-credentials-$(printf '%s' "${d%/}" | shasum -a 256 | cut -c1-8)"
     local used; used=$(awk -F'\t' -v n="$nm" '$1 !~ /^[ \t]*#/ && $2==n{c++} END{print c+0}' "$MAP" 2>/dev/null)
+    # ⚠ Rules that NAME this profile but are parked do not route to it — resolve.sh skips on
+    # the third field, so those paths use the global account and emit NO per-launch warning.
+    # Counting them as "used" made doctor tell you to sign in to a profile that is never
+    # reached, which is the same false-alarm class as the pre-1.0.21 "re-login for a token
+    # that renews itself". A path pinned by `switch <x> global` is the normal way to hit it.
+    local active; active=$(awk -F'\t' -v n="$nm" '$1 !~ /^[ \t]*#/ && $2==n && $3!="paused"{c++} END{print c+0}' "$MAP" 2>/dev/null)
+    local parked=$(( used - active ))
     local id; id=$(acct_identity "${d%/}")
     local _dfb; _dfb=$(get_fallback) || _dfb=""
     if [ "$(acct_state "${d%/}")" = absent ]; then
       if [ "$nm" = "$_dfb" ]; then wrn "$nm: is the FALLBACK but NOT signed in — every unrouted launch warns"
-      elif [ "$used" -gt 0 ]; then wrn "$nm: $used rule(s) but NOT signed in — those paths use global + warn"
+      elif [ "$active" -gt 0 ]; then wrn "$nm: $active rule(s) but NOT signed in — those paths use global + warn"
+      elif [ "$parked" -gt 0 ]; then ok_ "$nm: not signed in, and its $parked rule(s) are parked — nothing routes to it, nothing warns"
       else wrn "$nm: floating and not signed in — claude-account login $nm  (no longer wanted? claude-account forget $nm)"; fi
     else
       case "$id" in
