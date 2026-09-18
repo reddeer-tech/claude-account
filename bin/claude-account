@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.1.4"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.5"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -282,6 +282,24 @@ norm(){ local p="$1"; case "$p" in "~"*) p="$HOME${p#\~}";; esac
   [ -z "$p" ] && return 1      # "add /" stripped to nothing; `cd ""` would bind $PWD
   case "$p" in /*) ;; *) p="$(cd "$p" 2>/dev/null && pwd)" || return 1;; esac
   printf '%s\n' "$p"; }
+
+# The on-disk spelling of a path, but ONLY when it differs from the given one by CASE.
+# macOS filesystems are case-insensitive, so `add ~/projects/aimining` happily stores a
+# spelling no `cd` will ever produce, and resolve.sh matches prefixes by literal string
+# comparison — that rule then never fires and the path silently falls through to the
+# machine selection. Fixing it at WRITE time costs one exec, once, instead of on every
+# launch. ⚠ /bin/pwd, not the bash builtin: bash's `pwd -P` resolves symlinks textually
+# and keeps the typed case (see the same note in resolve.sh).
+# Symlinks are deliberately NOT collapsed. If the physical path differs by anything more
+# than case it is a symlink, and rewriting ~/work/Proj to /Volumes/Ext/work/Proj behind
+# the user's back would change what every rule LOOKS like for no routing benefit — the
+# resolver already tries the physical form as its second candidate.
+ondisk_case(){ local p="$1" phys
+  phys=$(cd "$p" 2>/dev/null && /bin/pwd -P) || { printf '%s\n' "$p"; return 0; }
+  if [ "$(printf '%s' "$phys" | tr '[:upper:]' '[:lower:]')" \
+     = "$(printf '%s' "$p"    | tr '[:upper:]' '[:lower:]')" ]; then
+    printf '%s\n' "$phys"
+  else printf '%s\n' "$p"; fi; }
 
 # A path argument that is a SUBFOLDER of a rule gets "no rule matches", which reads
 # as "this folder is unrouted" — it is not. Say which rule covers it.
@@ -1244,7 +1262,21 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
   ok_ "$nrules rule(s) in paths.map"
   while IFS=$'\t' read -r pth nm st _r || [ -n "${pth:-}" ]; do
     case "$pth" in ''|\#*) continue;; esac; [ -z "${nm:-}" ] && continue
-    [ -d "$pth" ] || wrn "path no longer exists on disk: ${pth/#$HOME/~}"
+    if [ -d "$pth" ]; then
+      # A rule stored in a spelling `cd` never produces routes NOTHING. macOS filesystems
+      # are case-insensitive, so `add ~/projects/aimining` on a folder called AIMining is
+      # accepted, looks right in `list`, and silently sends that path to the machine
+      # selection instead — a client's seat, with no warning anywhere. `add` stores the
+      # on-disk spelling since 1.1.5; this catches rules written before that.
+      local _disk; _disk=$(ondisk_case "$pth")
+      if [ "$_disk" != "$pth" ]; then
+        bad "rule spelling does not match the disk, so it NEVER routes: ${pth/#$HOME/~}"
+        dim "        on disk : ${_disk/#$HOME/~}"
+        dim "        fix it  :  claude-account unbind '$pth'  &&  claude-account add '$_disk' '$nm'"
+      fi
+    else
+      wrn "path no longer exists on disk: ${pth/#$HOME/~}"
+    fi
     [ -d "$PROFILES/$nm" ] || wrn "rule points at a profile with no directory: $nm"
   done < "$MAP"
 
@@ -2163,6 +2195,13 @@ cmd_add(){
   [ -z "$path" ] && { red "usage: claude-account add <project-path> [profile-name]"; exit 2; }
   path=$(norm "$path") || { red "no such directory: ${1}"; exit 2; }
   [ -d "$path" ] || { red "not a directory: $path"; exit 2; }
+  local _typed="$path"; path=$(ondisk_case "$path")
+  if [ "$path" != "$_typed" ]; then
+    yel "Spelling corrected to the one on disk:"
+    dim "  you typed : $_typed"
+    dim "  stored as : $path"
+    dim "  Rules match by exact text, so the spelling you typed would never have routed."
+  fi
   local derived=0
   if [ -z "$name" ]; then
     name=$(basename "$path" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-'); derived=1

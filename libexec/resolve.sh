@@ -35,11 +35,26 @@ match_dir(){ # <absolute dir> — fills best_* with the longest match of ANY sta
   done < "$MAP"
 }
 
-# A symlinked cwd never string-matches a rule stored in physical spelling (and vice
-# versa) — try the physical form as a second candidate before the worktree walk.
-dirP=$(cd "$dir" 2>/dev/null && pwd -P) || dirP="$dir"
 match_dir "$dir"
-[ -z "$best_name" ] && [ "$dirP" != "$dir" ] && match_dir "$dirP"
+dirP="$dir"
+if [ -z "$best_name" ]; then
+  # Nothing matched the cwd AS SPELLED. Resolve it to its real on-disk form and try once
+  # more: a symlinked cwd never string-matches a rule stored in physical spelling, and on
+  # a case-insensitive filesystem `cd ~/projects/aimining` leaves $PWD in whatever case
+  # was TYPED, so a correctly-spelled rule is missed and the path silently falls through
+  # to the machine selection — a client's seat, with nothing on any surface to say so.
+  #
+  # ⚠ /bin/pwd, NOT the bash builtin. bash's `pwd -P` resolves symlinks TEXTUALLY and
+  # keeps the typed case, so it never fixed a case mismatch — this line looked correct
+  # for months. zsh's builtin DOES canonicalise, which is why testing it by hand at a
+  # zsh prompt shows the right answer and hides the bug. Only getcwd(), which the
+  # external binary calls, returns the on-disk spelling.
+  #
+  # Computed lazily — before, every launch paid this fork even when the cwd matched on
+  # the first pass. A matching path now pays nothing and an unmatched one pays one exec.
+  dirP=$(cd "$dir" 2>/dev/null && /bin/pwd -P) || dirP="$dir"
+  [ "$dirP" != "$dir" ] && match_dir "$dirP"
+fi
 via=""
 if [ -z "$best_name" ]; then
   # NO rule of any kind covers this dir. It may be a LINKED GIT WORKTREE of a routed

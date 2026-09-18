@@ -304,4 +304,51 @@ printf '%s' "$D" | grep -q 'ghost.*use global + warn' && no "still claims those 
 printf '%s' "$D" | grep -q 'ghost: floating' && no "a parked rule was mistaken for floating" || ok "…and is not mistaken for floating"
 [ -z "$(R "$T/pinpath")" ] && ok "the pinned path really does resolve to the real global" || no "resolve returned: $(R "$T/pinpath")"
 
+
+section "resolver: a cwd spelled in the wrong CASE still routes"
+# 1.1.5. macOS filesystems are case-insensitive, so `cd ~/projects/aimining` succeeds on a
+# folder named AIMining and leaves $PWD in the case that was TYPED. resolve.sh matches
+# prefixes by literal string comparison, so the rule missed and the path fell through to
+# the machine selection — a client's seat, silently, with `verify` unable to catch it
+# (TuringLabs and the personal account both read max | default_claude_max_20x).
+# The second-candidate line existed but used bash's `pwd -P`, which resolves symlinks
+# TEXTUALLY and keeps the typed case, so it never fired. zsh's builtin DOES canonicalise,
+# which is exactly why testing it by hand at a zsh prompt showed the right answer.
+mkdir -p "$T/CaseProj/Sub"
+X add "$T/CaseProj" caseprof >/dev/null 2>&1; sign caseprof
+mkdir -p "$T/profiles/casefb"; sign casefb; X use casefb >/dev/null 2>&1
+lower=$(printf '%s' "$T/CaseProj/Sub" | sed "s|$T/CaseProj/Sub|$T/caseproj/sub|")
+[ "$(Rn "$T/CaseProj/Sub")" = "caseprof" ] && ok "exact spelling routes" || no "exact: $(Rn "$T/CaseProj/Sub")"
+[ "$(Rn "$lower")" = "caseprof" ] && ok "wrong-case cwd routes to the SAME profile" || no "wrong case leaked to: $(Rn "$lower")"
+[ "$(Rn "$T/CASEPROJ/SUB")" = "caseprof" ] && ok "all-caps cwd routes too" || no "caps leaked to: $(Rn "$T/CASEPROJ/SUB")"
+[ "$(Rn "$T/nosuchdir")" = "casefb" ] && ok "a genuinely unrouted path still follows the selection" || no "selection broken"
+X use global >/dev/null 2>&1
+
+section "add stores the spelling that is ON DISK, not the one typed"
+# Same incident, write side. A rule stored in a spelling `cd` never produces routes
+# NOTHING, and looks perfectly correct in `list`.
+out=$(X add "$T/caseproj/Sub" casetyped 2>&1)
+grep -q 'Spelling corrected' <<<"$out" && ok "add says it corrected the spelling" || no "add was silent about the correction"
+grep -qF "$T/CaseProj/Sub"$'\t'"casetyped" "$CLAUDE_ACCOUNTS_MAP" && ok "the map holds the on-disk spelling" || no "map: $(grep casetyped "$CLAUDE_ACCOUNTS_MAP")"
+sign casetyped
+[ "$(Rn "$T/CaseProj/Sub")" = "casetyped" ] && ok "and it routes" || no "stored rule does not route"
+
+# ⚠ Symlinks must NOT be collapsed. Rewriting ~/work/Proj to /Volumes/Ext/work/Proj
+# behind the user's back changes what every rule LOOKS like for no routing benefit —
+# the resolver already tries the physical form as its second candidate.
+mkdir -p "$T/RealDir"; ln -s "$T/RealDir" "$T/linkdir"
+X add "$T/linkdir" linkprof >/dev/null 2>&1
+grep -qF "$T/linkdir"$'\t'"linkprof" "$CLAUDE_ACCOUNTS_MAP" && ok "a symlinked path is stored as GIVEN, not resolved" || no "symlink was collapsed: $(grep linkprof "$CLAUDE_ACCOUNTS_MAP")"
+
+section "doctor flags a rule whose spelling does not match the disk"
+# Rules written before 1.1.5 can carry a spelling that never routes. It is a structural
+# problem, not a warning: the rule exists, looks right, and does nothing.
+mkdir -p "$T/LegacyCase"
+printf '%s\tlegacyprof\n' "$T/legacycase" >> "$CLAUDE_ACCOUNTS_MAP"
+mkdir -p "$T/profiles/legacyprof"; sign legacyprof
+dout=$(X doctor 2>&1); drc=$?
+grep -q 'NEVER routes' <<<"$dout" && ok "doctor names the mismatched rule" || no "doctor missed it"
+grep -qF "$T/LegacyCase" <<<"$dout" && ok "…and prints the on-disk spelling" || no "no on-disk spelling in the report"
+[ "$drc" != 0 ] && ok "and exits non-zero (structural, not cosmetic)" || no "doctor exited 0 on a rule that never routes"
+
 finish
