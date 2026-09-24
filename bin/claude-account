@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.1.5"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.6"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -234,8 +234,19 @@ reserved_global(){ # <name> <verb>
   dim "  global account. To put a path on the global account, say so directly:" >&2
   echo >&2
   if [ "${2:-}" = "add" ]; then
-    echo "      claude-account unbind <path>          # permanently: drop the rule" >&2
-    echo "      claude-account pause  <path>          # temporarily: keep it, reversible" >&2
+    # ⚠ This used to offer `unbind` and `pause`, and BOTH give the opposite of the intent:
+    # an unbound or plain-paused path follows `claude-account use`, so it moves the moment
+    # another account is selected. Neither expresses "this path stays on that account".
+    dim "  Give that account a profile of its own — then it keeps the path whatever" >&2
+    dim "  claude-account use is set to, and pause/resume move it when spent:" >&2
+    echo >&2
+    echo "      claude-account add <path> <profile>     # any name, e.g. personal" >&2
+    echo "      claude-account login <profile>          # sign in as that account" >&2
+    echo >&2
+    dim "  Or PIN it, to follow whatever is globally signed in and ignore the selection:" >&2
+    echo >&2
+    echo "      claude-account add <path> <label>       # <label> is just a peg for the rule" >&2
+    echo "      claude-account switch <path> global" >&2
   else
     echo "      claude-account unbind <path>          # drop the rule entirely" >&2
   fi
@@ -365,9 +376,20 @@ cmd_pause(){ # <path|name> [why]
     red "unexpected argument '$why' — pause takes a path or a profile name only"
     dim "  to pin a path to the real global account:  claude-account switch <x> global"
     exit 2 ;; esac
-  local n=0 verb="paused"; [ "$why" = "global" ] && verb="moved "
+  local n=0 pinned=0 verb="paused"; [ "$why" = "global" ] && verb="moved "
   while IFS= read -r pth; do [ -z "$pth" ] && continue
-    set_state "$pth" paused "$why"; n=$((n+1)); echo "  $verb   $pth"; done <<< "$hits"
+    # ⚠ set_state PRESERVES a 4th field of "global", so a plain `pause` on a row already
+    # pinned by `switch <x> global` changes nothing — it stays on the real global and does
+    # NOT join the selection. Counting those here is what stops the headline below naming
+    # a destination the row will not use; cmd_pause used to branch on its own ARGUMENT
+    # rather than on the row, and announced the selected profile over an unchanged pin.
+    local _was; _was=$(awk -F'\t' -v t="$pth" '$1 !~ /^[ \t]*#/ && $1==t{print $4}' "$MAP" 2>/dev/null | head -1)
+    if [ "$why" != "global" ] && [ "$_was" = "global" ]; then
+      pinned=$((pinned+1)); echo "  pinned   $pth   (already on your real global — unchanged)"
+    else
+      set_state "$pth" paused "$why"; n=$((n+1)); echo "  $verb   $pth"
+    fi
+  done <<< "$hits"
   # The headline must match what `list` will say seconds later. Reusing pause's wording
   # for `switch <x> global` announced "Paused" and then listed the row as ACTIVE on
   # (global) — two of this tool's own surfaces disagreeing about the same command.
@@ -376,12 +398,18 @@ cmd_pause(){ # <path|name> [why]
     grn "Moved $n path(s) to your GLOBAL account."
     dim "Profile and login untouched — the rule still points at it, so the path stays"
     dim "listed under that profile. Undo with:  claude-account resume $1"
+  elif [ "$n" = 0 ] && [ "$pinned" -gt 0 ]; then
+    yel "Nothing changed — $pinned path(s) are already pinned to your real global account."
+    dim "  A pin does not follow  claude-account use  — that is what pinning means."
+    dim "  Put one back on its profile with:  claude-account resume <path>"
   elif [ -n "$_pfb" ]; then
     grn "Paused $n path(s) — they now use the FALLBACK profile '$_pfb' (paused = as if unrouted)."
+    [ "$pinned" -gt 0 ] && yel "  $pinned other path(s) were already pinned — unchanged, and they do NOT use '$_pfb'."
     dim "Profile and login untouched. Re-enable with:  claude-account resume $1"
     dim "  (pin to your real global instead with:  claude-account switch <path> global)"
   else
     grn "Paused $n path(s) — they now use your GLOBAL account."
+    [ "$pinned" -gt 0 ] && dim "  ($pinned already pinned to it — unchanged)"
     dim "Profile and login untouched. Re-enable with:  claude-account resume $1"
   fi
   # pausing the fallback profile's RULES does not stop the fallback itself
@@ -664,6 +692,11 @@ def bar(p):
     filled=int(round((p or 0)/5))
     return paint("█"*filled, p) + "\033[2m" * COLOUR + "░"*(20-filled) + "\033[0m" * COLOUR
 
+if isinstance(d.get("error"), dict):
+    # Belt and braces. usage_problem() is the funnel that should catch this first; if an
+    # error body ever reaches here anyway it must not render as an empty account.
+    print("  the usage API returned an error, not usage data"); raise SystemExit(0)
+
 rows=[]
 for L in (d.get("limits") or []):
     kind=L.get("kind",""); pct=L.get("percent")
@@ -690,6 +723,54 @@ if ex.get("is_enabled"):
     u=float(ex.get("utilization") or 0)
     print(f"  {'extra usage':<22} {paint(f'{u:5.1f}%', u)}  [{bar(u)}]  used {ex.get('used_credits')}/{ex.get('monthly_limit')}")
 USAGEPY
+
+# ⚠ A FAILED usage probe still answers with well-formed JSON, so it parses fine, yields
+# no `limits` rows, and used to render as "no usage buckets reported for this account" —
+# a transient 429 reading as a FACT about the account. Measured 2026-09-24: seven projects
+# had been pointed at one credential, twelve live sessions were on it, and `overview`
+# reported that account as having no usage at all.
+#
+# Same rule as acct_state: an ERROR is not an ABSENCE. This is the single place that
+# judges a usage body, so the two surfaces cannot drift apart again (they already had —
+# cmd_usage and usage_bars carried near-identical copies of the curl and the checks).
+# Prints the reason and returns 0 when the body is NOT usable usage data; returns 1 when
+# it is, so a caller reads `if why=$(usage_problem "$body"); then <it failed>`.
+read -r -d "" USAGE_PROBE_PY <<'UPROBE' || true
+import json,sys
+b=sys.stdin.read().strip()
+if not b or not b.startswith("{"):
+    print("could not reach the usage endpoint"); sys.exit(0)
+try: d=json.loads(b)
+except Exception:
+    print("the usage endpoint returned something that is not JSON"); sys.exit(0)
+e=d.get("error")
+if isinstance(e,dict):
+    t=e.get("type") or "error"
+    if t=="rate_limit_error":
+        print("rate limited by the usage API - this says NOTHING about the account, try again shortly")
+    elif t in ("authentication_error","permission_error"):
+        print("the usage API rejected this token (%s)" % t)
+    else:
+        print("the usage API refused the request (%s)" % t)
+    sys.exit(0)
+sys.exit(1)
+UPROBE
+usage_problem(){ printf '%s' "${1:-}" | python3 -c "$USAGE_PROBE_PY" 2>/dev/null; }
+
+# One fetch for both surfaces. `overview` fires one of these per credential back to back,
+# which can itself provoke the 429 it would then have to report, so a rate-limited answer
+# gets one retry before being believed. $CA_USAGE_RETRY_SLEEP exists for the test suite.
+usage_fetch(){ # <token> -> body on stdout
+  local tok="$1" body
+  body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
+      -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+  case "$body" in *rate_limit_error*)
+    sleep "${CA_USAGE_RETRY_SLEEP:-2}"
+    body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
+        -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1) ;;
+  esac
+  printf '%s' "$body"
+}
 
 # Never replace paths.map with something implausible. Two incidents on 2026-08-25
 # (a truncate-before-read, and an invalid heredoc producing an empty file) each
@@ -1489,8 +1570,20 @@ cmd_logout(){
       printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
     else
       backup "logout-$name"
-      while IFS= read -r pth; do [ -z "$pth" ] && continue; set_state "$pth" paused; done <<< "$hits"
-      echo "  paused its paths so they use your GLOBAL account instead of failing:"
+      local _lpin=0
+      while IFS= read -r pth; do [ -z "$pth" ] && continue
+        awk -F'\t' -v t="$pth" '$1 !~ /^[ \t]*#/ && $1==t && $4=="global"{f=1} END{exit !f}' "$MAP" 2>/dev/null && _lpin=$((_lpin+1))
+        set_state "$pth" paused; done <<< "$hits"
+      # Where these land depends on the machine selection. This sentence was hardcoded to
+      # "your GLOBAL account", so with `use <x>` set it named an account they do not use.
+      local _lfb; _lfb=$(get_fallback 2>/dev/null) || _lfb=""
+      if [ -n "$_lfb" ]; then
+        echo "  paused its paths so they use the selected profile '$_lfb' instead of failing:"
+      else
+        echo "  paused its paths so they use your GLOBAL account instead of failing:"
+      fi
+      [ "$_lpin" -gt 0 ] && [ -n "$_lfb" ] && \
+        yel "  ($_lpin of them are pinned to your real global, so those ignore '$_lfb')"
       printf '%s\n' "$hits" | sed "s|$HOME|~|" | sed 's/^/    /'
     fi
   fi
@@ -1580,8 +1673,7 @@ cmd_usage(){
   if [ -z "$tok" ]; then red "No login for '$name'."; dim "  claude-account login $name"; exit 1; fi
   echo "USAGE — $name${label:+  ($label)}"
   echo
-  local body; body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
-      -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+  local body; body=$(usage_fetch "$tok")
 
   # An expired access token returns 401 authentication_error. Claude only refreshes
   # it when it actually makes a request, so a PAUSED profile — never used — drifts
@@ -1591,13 +1683,12 @@ cmd_usage(){
     if refresh_token_if_needed "$pdir"; then
       tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
             | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
-      body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
-             -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+      body=$(usage_fetch "$tok")
     fi
     printf '%s' "$body" | grep -q 'authentication_error' && { red "  could not refresh — sign in again:  claude-account login $name"; exit 1; }
   fi
-  if [ -z "$body" ] || ! printf '%s' "$body" | head -c1 | grep -q '{'; then
-    red "  could not reach the usage endpoint"; dim "  ${body:0:120}"; exit 1; fi
+  local _why
+  if _why=$(usage_problem "$body"); then red "  $_why"; exit 1; fi
   printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" python3 -c "$USAGE_PY"
   echo
   dim "  Live from api.anthropic.com/api/oauth/usage — the same source as /usage in-session."
@@ -1922,8 +2013,7 @@ usage_bars(){ # <profile-dir or "" for global>
   tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
       | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
   if [ -z "$tok" ]; then dim "  (not signed in — no usage to fetch)"; return 0; fi
-  body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
-      -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+  body=$(usage_fetch "$tok")
   if printf '%s' "$body" | grep -q 'authentication_error\|token has expired'; then
     if [ "${CA_NO_REFRESH:-0}" = "1" ]; then
       dim "  (access token expired — not renewing under --no-refresh)"; return 0; fi
@@ -1931,8 +2021,7 @@ usage_bars(){ # <profile-dir or "" for global>
     if [ "$_rrc" = 0 ] || [ "$_rrc" = 2 ]; then
       tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
             | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
-      body=$(curl -sS --max-time 25 https://api.anthropic.com/api/oauth/usage \
-             -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>&1)
+      body=$(usage_fetch "$tok")
     fi
     if printf '%s' "$body" | grep -q 'authentication_error'; then
       if [ "$_rrc" = 2 ]; then red "  the token looks valid locally but the API rejects it — sign in again"
@@ -1940,8 +2029,8 @@ usage_bars(){ # <profile-dir or "" for global>
       return 0
     fi
   fi
-  if [ -z "$body" ] || ! printf '%s' "$body" | head -c1 | grep -q '{'; then
-    red "  could not reach the usage endpoint"; return 0; fi
+  local _why
+  if _why=$(usage_problem "$body"); then red "  $_why"; return 0; fi
   printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" python3 -c "$USAGE_PY"
 }
 
@@ -2204,7 +2293,18 @@ cmd_add(){
   fi
   local derived=0
   if [ -z "$name" ]; then
-    name=$(basename "$path" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-'); derived=1
+    # A derived name must be USABLE. `add ~/workspace/_lab` used to exit 2 with
+    # "invalid profile name '_lab'" — an error blaming a name the user never typed, for a
+    # folder whose only sin is a leading underscore. Strip what the rules forbid at the
+    # front, cap the length, and refuse only when nothing usable is left.
+    name=$(basename "$path" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-' \
+           | sed 's/^[^a-z0-9]*//' | cut -c1-39); derived=1
+    case "$name" in ''|global|none) name="" ;; esac   # never silently invent one
+    if [ -z "$name" ]; then
+      red "Could not derive a usable profile name from the folder '$(basename "$path")'."
+      dim "  give one yourself:  claude-account add '$path' <profile-name>"
+      exit 2
+    fi
   else name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]'); fi   # 'TL' -> 'tl'
   if ! printf '%s' "$name" | grep -qE '^[a-z0-9][a-z0-9._-]{0,38}$'; then
     red "invalid profile name '$name' (lowercase letters, digits, . _ -)"; exit 2; fi
@@ -2213,7 +2313,8 @@ cmd_add(){
   local existing; existing=$(awk -F'\t' -v p="$path" '$1==p{print $2}' "$MAP" 2>/dev/null | head -1)
   if [ -n "$existing" ]; then
     yel "That exact path already routes to profile '$existing'."
-    dim "  change it:  claude-account unbind '$path'  then add again"; exit 1; fi
+    dim "  move it:    claude-account switch '$path' <profile>     # one step, keeps nothing behind"
+    dim "  detach it:  claude-account unbind '$path'"; exit 1; fi
   # Two paths MAY share one profile (same client, two checkouts) — but only on
   # purpose. A DERIVED name that collides is almost always an accident: two folders
   # with the same basename would silently share one account and one quota.

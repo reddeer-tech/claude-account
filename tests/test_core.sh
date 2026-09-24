@@ -351,4 +351,81 @@ grep -q 'NEVER routes' <<<"$dout" && ok "doctor names the mismatched rule" || no
 grep -qF "$T/LegacyCase" <<<"$dout" && ok "…and prints the on-disk spelling" || no "no on-disk spelling in the report"
 [ "$drc" != 0 ] && ok "and exits non-zero (structural, not cosmetic)" || no "doctor exited 0 on a rule that never routes"
 
+
+section "usage: a FAILED probe never reads as an empty account"
+# 1.1.6. The usage endpoint answers with JSON either way, so a 429 parsed fine, yielded no
+# `limits` rows, and rendered as "no usage buckets reported for this account" — a transient
+# rate limit reading as a FACT. Measured 2026-09-24 on a real account with 12 live sessions
+# on one credential. Same rule as acct_state: an ERROR is not an ABSENCE.
+export CA_USAGE_RETRY_SLEEP=0
+mkdir -p "$T/U"; X add "$T/U" uprof >/dev/null 2>&1; sign uprof
+CNT="$T/curlcount"
+stub_curl(){ printf '#!/bin/bash\n%s\n' "$1" > "$T/bin/curl"; chmod +x "$T/bin/curl"; }
+
+stub_curl "printf '%s' '{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"x\"}}'"
+out=$(X usage uprof 2>&1); rc=$?
+grep -qi 'rate limited' <<<"$out" && ok "a 429 says rate limited" || no "429 mislabelled: $out"
+grep -qi 'no usage buckets' <<<"$out" && no "a 429 still reads as an empty account" || ok "…and never 'no usage buckets'"
+[ "$rc" != 0 ] && ok "…and exits non-zero" || no "usage exited 0 on a failed probe"
+X overview --no-refresh 2>&1 | grep -qi 'rate limited' && ok "overview says it too" || no "overview hid the rate limit"
+
+stub_curl "printf '%s' '{\"limits\": []}'"
+X usage uprof 2>&1 | grep -qi 'no usage buckets' && ok "a genuinely empty account still says 'no usage buckets'" || no "empty account mislabelled"
+
+stub_curl "printf '%s' 'curl: (6) Could not resolve host'"
+X usage uprof 2>&1 | grep -qi 'could not reach' && ok "a non-JSON body says unreachable" || no "unreachable mislabelled"
+
+# one retry, because `overview` fires a call per credential back to back and can provoke
+# the very 429 it would then have to report
+printf '#!/bin/bash\nC="%s"; n=$(cat "$C" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$C"\nif [ "$n" = 1 ]; then printf %s %s; else printf %s %s; fi\n' \
+  "$CNT" "'%s'" "'{\"error\":{\"type\":\"rate_limit_error\"}}'" "'%s'" "'{\"limits\":[{\"kind\":\"session\",\"percent\":7,\"resets_at\":\"2030-01-01T15:40:00Z\"}]}'" > "$T/bin/curl"
+chmod +x "$T/bin/curl"; rm -f "$CNT"
+X usage uprof 2>&1 | grep -q 'Session' && ok "a rate-limited call is retried once and then succeeds" || no "retry did not fire"
+[ "$(cat "$CNT" 2>/dev/null)" = 2 ] && ok "…exactly one retry, not a loop" || no "retry count: $(cat "$CNT" 2>/dev/null)"
+unset CA_USAGE_RETRY_SLEEP
+
+section "pause on an already-PINNED row changes nothing, and says so"
+# 1.1.6. set_state PRESERVES a 4th field of "global", so a plain pause on a pinned row left
+# it on the real global — while the headline announced the selected profile. cmd_pause was
+# branching on its own ARGUMENT instead of on the row.
+mkdir -p "$T/Pin" "$T/profiles/pfb"; sign pfb
+X add "$T/Pin" pinprof >/dev/null 2>&1; sign pinprof
+X switch "$T/Pin" global >/dev/null 2>&1
+X use pfb >/dev/null 2>&1
+pout=$(X pause "$T/Pin" 2>&1)
+grep -qi 'already pinned' <<<"$pout" && ok "pause says the row is already pinned" || no "pause claimed a change: $pout"
+grep -q "pfb" <<<"$pout" && no "pause named the selection over an unchanged pin" || ok "…and does not name the selection"
+[ "$(Rn "$T/Pin")" = "(global)" ] && ok "…and the row still resolves to the real global" || no "pin broken: $(Rn "$T/Pin")"
+
+section "logout names the account those paths ACTUALLY get"
+# 1.1.6. The sentence was hardcoded to "your GLOBAL account"; with a selection live those
+# paths route to the selected profile instead.
+mkdir -p "$T/L1"; X add "$T/L1" lprof >/dev/null 2>&1; sign lprof
+lout=$(X logout lprof 2>&1)
+[ "$(Rn "$T/L1")" = "pfb" ] && ok "a logged-out profile's paths follow the selection" || no "routing: $(Rn "$T/L1")"
+grep -q "pfb" <<<"$lout" && ok "…and logout names it" || no "logout still hardcodes GLOBAL: $(grep -i 'paused its paths' <<<"$lout")"
+X use global >/dev/null 2>&1
+
+section "add derives a usable name, or refuses without blaming one you never typed"
+# 1.1.6. `add ~/workspace/_lab` exited 2 with "invalid profile name '_lab'".
+for f in _lab .hidden "Proj X"; do
+  mkdir -p "$T/d_$f"; X add "$T/d_$f" >/dev/null 2>&1
+  n=$(awk -F'\t' -v p="$T/d_$f" '$1==p{print $2}' "$CLAUDE_ACCOUNTS_MAP")
+  printf '%s' "$n" | grep -qE '^[a-z0-9][a-z0-9._-]*$' && ok "derived a usable name from '$f' -> $n" || no "'$f' derived '$n'"
+done
+mkdir -p "$T/___"; aout=$(X add "$T/___" 2>&1); arc=$?
+[ "$arc" = 2 ] && ok "an underivable folder exits 2" || no "rc=$arc"
+grep -qi 'could not derive' <<<"$aout" && ok "…and says so instead of quoting a name you never typed" || no "$aout"
+
+section "add on an existing rule points at switch, not unbind-then-add"
+eout=$(X add "$T/d__lab" other 2>&1)
+grep -q 'claude-account switch' <<<"$eout" && ok "names switch" || no "$eout"
+
+section "add <path> global explains the two routes that actually work"
+mkdir -p "$T/G1"; gout=$(X add "$T/G1" global 2>&1)
+grep -q 'command not found' <<<"$gout" && no "a backtick executed in the refusal text" || ok "nothing in the refusal expands"
+grep -q 'claude-account switch <path> global' <<<"$gout" && ok "offers the pin" || no "no pin route"
+grep -q 'claude-account login <profile>' <<<"$gout" && ok "offers the profile" || no "no profile route"
+grep -qE 'claude-account pause  <path>' <<<"$gout" && no "still offers pause, which does the opposite" || ok "…and no longer offers pause/unbind, which follow the selection"
+
 finish
