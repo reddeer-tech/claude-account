@@ -428,4 +428,45 @@ grep -q 'claude-account switch <path> global' <<<"$gout" && ok "offers the pin" 
 grep -q 'claude-account login <profile>' <<<"$gout" && ok "offers the profile" || no "no profile route"
 grep -qE 'claude-account pause  <path>' <<<"$gout" && no "still offers pause, which does the opposite" || ok "…and no longer offers pause/unbind, which follow the selection"
 
+
+section "a credential that EXISTS but is empty is NOT signed in"
+# 1.1.7. When a refresh token dies, Claude Code POSTs it, gets invalid_grant, and writes
+# {"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,...}} over the slot.
+# The entry is then present, so a bare `find-generic-password` exit 0 read as SIGNED IN —
+# and plan/tier survive the blanking, so list/profiles printed a confident "team |
+# default_raven" for an account that cannot serve one request. This is the NORMAL end state
+# of an expired refresh token, not an edge case. Measured on a real profile 2026-09-24.
+mkdir -p "$T/Dead" "$T/Live"
+X add "$T/Dead" deadprof >/dev/null 2>&1; blank deadprof
+X add "$T/Live" liveprof >/dev/null 2>&1; sign liveprof
+
+lst=$(X list --no-refresh 2>&1)
+grep -q 'deadprof.*NOT LOGGED IN' <<<"$lst" && ok "list says NOT LOGGED IN" || no "list: $(grep deadprof <<<"$lst")"
+grep -qE 'deadprof.*default_raven' <<<"$lst" && no "list still prints the dead account's plan" || ok "…and not its surviving plan|tier"
+X profiles --no-refresh 2>&1 | grep -q 'deadprof.*NOT LOGGED IN' && ok "profiles agrees" || no "profiles disagrees"
+X doctor --no-refresh 2>&1 | grep -qE 'deadprof.*(NOT signed in|not signed in)' && ok "doctor agrees" || no "doctor: $(X doctor --no-refresh 2>&1 | grep deadprof)"
+X resume deadprof 2>&1 | grep -qi 'NOT signed in' && ok "resume agrees" || no "resume disagrees"
+
+# ⚠ the live blob carries an empty mcpOAuth accessToken too — a loose substring match on
+# "accessToken":"" would call a perfectly good credential dead.
+grep -q 'liveprof.*NOT LOGGED IN' <<<"$lst" && no "a live credential was poisoned by its own mcpOAuth empty token" || ok "a live credential with an empty mcpOAuth token is untouched"
+X doctor --no-refresh 2>&1 | grep -q 'liveprof: signed in' && ok "…and doctor still calls it signed in" || no "live profile broken"
+
+# ⚠ acct_identity COLOURS on a tty, so this decision must also be checked with colour ON —
+# the 1.1.0 incident was exactly a credential decision that flipped under a terminal.
+pout=$(PTYC "" list --no-refresh 2>&1)
+printf '%s' "$pout" | grep -q 'NOT LOGGED IN' && ok "under a real tty it still says NOT LOGGED IN" || no "tty output disagrees with piped"
+
+# the routing side: a blanked profile must fall back with the documented warning, not route
+# ⚠ env -u is load-bearing: BOTH shims return early when CLAUDE_SECURESTORAGE_CONFIG_DIR is
+# already set (an explicit choice is never overridden), and a suite run from inside a routed
+# session inherits it — the test would then pass or fail for reasons having nothing to do
+# with the credential.
+sout=$(cd "$T/Dead" && env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN \
+       bash "$REPO/bin/claude-shim" --version 2>&1)
+grep -qi 'not signed in' <<<"$sout" && ok "the launch shim warns instead of routing to a dead credential" || no "shim: $sout"
+wout=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN \
+       bash "$REPO/bin/claude-whoami" "$T/Dead" 2>&1)
+grep -qi 'not signed in\|NOT LOGGED IN' <<<"$wout" && ok "claude-whoami agrees" || no "whoami: $(grep -i account <<<"$wout")"
+
 finish

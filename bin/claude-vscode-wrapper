@@ -42,7 +42,15 @@ if [ -z "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" 
     # client's work quietly billed to the personal plan (or the reverse).
     # CLAUDE_ACCOUNTS_STRICT=1 restores the old fail-fast behaviour.
     svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-    security find-generic-password -s "$svc" >/dev/null 2>&1; _src=$?
+    _blob=$(security find-generic-password -s "$svc" -w 2>/dev/null); _src=$?
+    # ⚠ A credential can EXIST and be USELESS. When a refresh token dies, Claude Code
+    # writes {"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,...}} over
+    # the slot, so the entry is present and a bare exit-0 probe read it as signed in. That
+    # is the NORMAL end state of an expired refresh token. Treat it as exit 44 (not found)
+    # so this takes the documented not-signed-in path: global + a loud per-launch warning.
+    # Anchored at the START on purpose — an mcpOAuth entry inside the same blob carries its
+    # own "accessToken":"" and must never trigger this.
+    case "$_blob" in '{"claudeAiOauth":{"accessToken":"",'*) _src=44 ;; esac
     if [ "$_src" -eq 0 ]; then
       export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"
     elif [ "$_src" -ne 44 ]; then

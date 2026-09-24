@@ -37,8 +37,16 @@ ca_sandbox(){
 [ "${SEC_MODE:-}" = "err" ] && exit 36
 svc=""; w=0
 while [ $# -gt 0 ]; do [ "$1" = "-s" ] && svc="$2"; [ "$1" = "-w" ] && w=1; shift; done
+# A service in $T_BLANK is the state Claude Code leaves behind when a refresh token dies:
+# the entry EXISTS but its accessToken is "". Plan and tier survive, which is what used to
+# make it read as signed in. The mcpOAuth block carries its own empty accessToken on
+# purpose — a loose substring match on \"accessToken\":\"\" must not fire on a LIVE blob.
+if grep -qxF "$svc" "$T_BLANK" 2>/dev/null; then
+  [ "$w" = 1 ] && printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"team","rateLimitTier":"default_raven"},"mcpOAuth":{"srv":{"accessToken":""}}}'
+  exit 0
+fi
 if grep -qxF "$svc" "$T_SIGNED" 2>/dev/null; then
-  [ "$w" = 1 ] && printf '{"claudeAiOauth":{"accessToken":"stub","subscriptionType":"max","rateLimitTier":"demo","expiresAt":4102444800000}}'
+  [ "$w" = 1 ] && printf '{"claudeAiOauth":{"accessToken":"stub","subscriptionType":"max","rateLimitTier":"demo","expiresAt":4102444800000},"mcpOAuth":{"srv":{"accessToken":""}}}'
   exit 0
 fi
 exit 44
@@ -60,11 +68,14 @@ printf '{"limits":[{"kind":"session","percent":40,"severity":"normal","resets_at
 STUB
   chmod +x "$T/bin/security" "$T/bin/claude" "$T/bin/curl"
   export T_SIGNED="$T/signed"; : > "$T_SIGNED"
+  export T_BLANK="$T/blank";  : > "$T_BLANK"
   export PATH="$T/bin:$PATH"
 }
 
 svc_of(){ printf 'Claude Code-credentials-%s' "$(printf '%s' "$T/profiles/$1" | shasum -a 256 | cut -c1-8)"; }
 sign(){ svc_of "$1" >> "$T_SIGNED"; echo >> "$T_SIGNED"; }   # the newline matters: grep -qxF
+# Signed in once, then the refresh token died: the slot is present and useless.
+blank(){ svc_of "$1" >> "$T_BLANK"; echo >> "$T_BLANK"; }
 # The global account is the ABSENCE of a profile dir, so its Keychain service carries no
 # hash suffix. Anything reading global's own credential needs this, not sign().
 sign_global(){ printf 'Claude Code-credentials\n' >> "$T_SIGNED"; }

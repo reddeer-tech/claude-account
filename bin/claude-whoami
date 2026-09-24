@@ -41,7 +41,10 @@ if [ "$PORC" = 1 ]; then
   if [ -z "$line" ]; then printf '(global)\tnone\t-\n'; exit 0; fi
   pn=$(printf '%s' "$line" | cut -f1); pd=$(printf '%s' "$line" | cut -f2); pr=$(printf '%s' "$line" | cut -f3)
   src=rule; case "$pr" in "(fallback)") src=fallback ;; *" (worktree)") src=worktree ;; esac
-  security find-generic-password -s "Claude Code-credentials-$(printf '%s' "$pd" | shasum -a 256 | cut -c1-8)" >/dev/null 2>&1
+  _wb=$(security find-generic-password -s "Claude Code-credentials-$(printf '%s' "$pd" | shasum -a 256 | cut -c1-8)" -w 2>/dev/null) || return 1
+  # a blanked credential (see claude-shim) is present but unusable — not "signed in"
+  case "$_wb" in '{"claudeAiOauth":{"accessToken":"",'*) return 1 ;; esac
+  [ -n "$_wb" ]
   case $? in 0) si=yes ;; 44) si=no ;; *) si=error ;; esac
   printf '%s\t%s\t%s\n' "$pn" "$src" "$si"; exit 0
 fi
@@ -89,7 +92,8 @@ elif [ "$(printf '%s' "$line" | cut -f3)" = "(fallback)" ]; then
   fi
   echo "profile dir   : $pdir"
   svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-  security find-generic-password -s "$svc" >/dev/null 2>&1; _fsrc=$?
+  _wb=$(security find-generic-password -s "$svc" -w 2>/dev/null); _fsrc=$?
+  case "$_wb" in '{"claudeAiOauth":{"accessToken":"",'*) _fsrc=44 ;; esac   # blanked = not signed in
   if [ "$_fsrc" -eq 0 ]; then
     echo "login         : signed in"
   elif [ "$_fsrc" -ne 44 ]; then
@@ -110,7 +114,8 @@ else
   # This check is duplicated in claude-shim and claude-vscode-wrapper — keep the three
   # in step, or lift it into resolve.sh.
   svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-  security find-generic-password -s "$svc" >/dev/null 2>&1; _src=$?
+  _wb=$(security find-generic-password -s "$svc" -w 2>/dev/null); _src=$?
+    case "$_wb" in '{"claudeAiOauth":{"accessToken":"",'*) _src=44 ;; esac   # blanked = not signed in
   if [ "$_src" -eq 0 ]; then
     echo "login         : signed in"
   elif [ "$_src" -ne 44 ]; then
