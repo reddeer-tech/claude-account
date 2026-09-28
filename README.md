@@ -95,6 +95,7 @@ Day to day you run nothing: open the project and work.
 | `list --json` | the whole state as one JSON object, for scripts |
 | `list` / `profiles` / `verify` | what routes where, and which account each holds |
 | `usage [name\|--all]` | live session/weekly/model quotas and reset times |
+| `reset-page [name]` | open claude.ai → Settings → Usage, where a *limit reset* ("Reset for free") is used, and say which account to sign in as. `usage` and `overview` point here on their own when a weekly limit is spent. This tool cannot see whether an account has a reset — only claude.ai shows that |
 | `pause` / `resume` / `switch` | park a depleted account, or move paths to another one |
 | `unbind <path>` / `unbind <profile> --all` | that path stops using its profile - the rule goes, the login stays (named `remove` before 1.1.0) |
 | `forget <profile>` | delete the profile itself, its label and its login |

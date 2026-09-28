@@ -66,9 +66,18 @@ STUB
 A="${FAKE_RESETS_AT:-2030-01-01T15:40:00Z}"; B="${FAKE_RESETS_AT:-2030-01-03T15:00:00Z}"
 printf '{"limits":[{"kind":"session","percent":40,"severity":"normal","resets_at":"%s"},{"kind":"weekly_all","percent":34,"severity":"normal","resets_at":"%s"}]}' "$A" "$B"
 STUB
-  chmod +x "$T/bin/security" "$T/bin/claude" "$T/bin/curl"
+  # `open` must never reach a real browser from a test. Records what it was asked to open.
+  cat > "$T/bin/open" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$T_OPENED"
+STUB
+  chmod +x "$T/bin/security" "$T/bin/claude" "$T/bin/curl" "$T/bin/open"
   export T_SIGNED="$T/signed"; : > "$T_SIGNED"
   export T_BLANK="$T/blank";  : > "$T_BLANK"
+  # ⚠ $T itself is NOT exported, so a stub must use one of these exported paths — a stub
+  # writing to "$T/…" writes to "/…", fails silently, and every "nothing was opened"
+  # assertion then passes for the wrong reason.
+  export T_OPENED="$T/opened"; : > "$T_OPENED"
   export PATH="$T/bin:$PATH"
 }
 

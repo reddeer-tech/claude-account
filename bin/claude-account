@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.1.7"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.8"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # Locate resolve.sh: an explicit override, then next to this script (installed
@@ -539,6 +539,12 @@ profile_label(){ # <profile-dir> -> recorded email, or empty
 
 # The global account's equivalent. It has no profile dir, so its label lives in one
 # file beside them. Same trust as a profile label: recorded at login, never re-checked.
+label_email(){ # <label text> -> the first email-looking token, or empty
+  # Labels read "you@x.com (Org)" — the hint and reset-page want only the address. A label
+  # the user typed by hand may have none; print nothing rather than guess.
+  printf '%s' "${1:-}" | grep -oE '[^[:space:]()]+@[^[:space:]()]+' | head -1
+}
+
 global_label(){ # -> recorded global account, or empty
   head -1 "$PROFILES/.global-account" 2>/dev/null
 }
@@ -747,6 +753,24 @@ if not rows: print("  no usage buckets reported for this account")
 for name,pct,w,sev in rows:
     flag=" ⚠" if sev=="critical" else ""
     print(f"  {name:<22} {paint(f'{pct:5.1f}%', pct)}  [{bar(pct)}]  {w}{flag}")
+
+# A limit reset ("Reset for free", claude.ai → Settings → Usage) refills the weekly limits, so
+# the moment a WEEKLY limit is spent is the one moment worth pointing at it. It must never say
+# the account HAS a reset: this tool cannot see that — the usage endpoint refuses reset status
+# to any client but claude.ai and recent official Claude Code (ineligible_reason "surface").
+# Weekly only, on purpose: the 5-hour window reopens on its own within hours, and a reset is
+# scarce. The caller passes the name to type and the recorded email; no name, no hint.
+hint_name = os.environ.get("CA_HINT_NAME", "")
+def _spent_weekly(L):
+    wk = L.get("group") == "weekly" or str(L.get("kind", "")).startswith("weekly")
+    try: return wk and float(L.get("percent") or 0) >= 100
+    except (TypeError, ValueError): return False
+if hint_name and any(_spent_weekly(L) for L in (d.get("limits") or [])):
+    email = os.environ.get("CA_HINT_EMAIL", "")
+    D, R = "\033[2m" * COLOUR, "\033[0m" * COLOUR
+    print(f"  {D}weekly limit reached — if this account has a limit reset, it is on claude.ai{R}")
+    who = f"signed in as {email}" if email else "signed in as this account"
+    print(f"  {D}({who}):{R}  claude-account reset-page {hint_name}")
 
 ex=d.get("extra_usage") or {}
 if ex.get("is_enabled"):
@@ -1677,6 +1701,35 @@ cmd_refresh(){
   [ "$did" = 0 ] && dim "  nothing needed refreshing."
 }
 
+# Opens claude.ai → Settings → Usage, where a limit reset ("Reset for free") is used, and names
+# the account the browser must be signed in as — a reset applies to whichever claude.ai
+# account that is, not to a profile here. This tool cannot see whether an account HAS one and
+# never claims it does; see CLAUDE.md "Limit resets" for why it will not read or spend one
+# itself. No credential is read. The URL is a constant, measured from the official client.
+CA_RESET_URL="https://claude.ai/settings/usage"
+cmd_reset_page(){
+  local name label
+  if [ -z "${1:-}" ] || [ "$1" = "global" ]; then
+    [ "${1:-}" = "global" ] && { global_ambiguous reset-page || exit 1; }
+    name="global"; label=$(global_label)
+  else
+    name=$(to_profile "$1") || exit $?
+    label=$(profile_label "$PROFILES/$name")
+  fi
+  local email; email=$(label_email "$label")
+  echo "Limit resets are used on claude.ai → Settings → Usage → Resets:"
+  echo "    $CA_RESET_URL"
+  if [ -n "$email" ]; then
+    echo "Sign in there as  $email  — a reset applies to whichever account the browser is on."
+  else
+    echo "Sign in there as the account '$name' holds — a reset applies to whichever account the browser is on."
+    dim "  (no email recorded for '$name' — set one with:  claude-account label $name <email>)"
+  fi
+  dim "This tool cannot see whether that account has a reset. The page shows it, with its expiry."
+  # Only a human at a terminal gets a browser tab; a script or a pipe just gets the URL.
+  if [ -t 1 ] && command -v open >/dev/null 2>&1; then open "$CA_RESET_URL" >/dev/null 2>&1 || true; fi
+}
+
 cmd_usage(){
   # --all: every profile plus global, refreshing any expired token on the way.
   if [ "${1:-}" = "--all" ] || [ "${1:-}" = "-a" ]; then
@@ -1719,7 +1772,9 @@ cmd_usage(){
   fi
   local _why
   if _why=$(usage_problem "$body"); then red "  $_why"; exit 1; fi
-  printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" python3 -c "$USAGE_PY"
+  local _hn="global"; [ -n "$pdir" ] && _hn="$name"
+  printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" CA_HINT_NAME="$_hn" \
+      CA_HINT_EMAIL="$(label_email "$label")" python3 -c "$USAGE_PY"
   echo
   dim "  Live from api.anthropic.com/api/oauth/usage — the same source as /usage in-session."
 }
@@ -2061,7 +2116,10 @@ usage_bars(){ # <profile-dir or "" for global>
   fi
   local _why
   if _why=$(usage_problem "$body"); then red "  $_why"; return 0; fi
-  printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" python3 -c "$USAGE_PY"
+  local _hn="global" _hl; _hl=$(global_label)
+  if [ -n "$pdir" ]; then _hn=$(basename "$pdir"); _hl=$(profile_label "$pdir"); fi
+  printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" CA_HINT_NAME="$_hn" \
+      CA_HINT_EMAIL="$(label_email "$_hl")" python3 -c "$USAGE_PY"
 }
 
 # One command for the whole picture: what `list` + `profiles` + `usage --all` each show,
@@ -2691,11 +2749,11 @@ main(){
     # remove`, run from a folder containing a `vscode-status/` directory, silently
     # became `remove vscode-status`. A command name is never a profile or a path.
     case "$1" in
-      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|refresh|logout|switch|global|status|pause|resume|add|unbind|remove|rm      |login|forget|statusline|undo|vscode-status|help)
+      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|reset-page|refresh|logout|switch|global|status|pause|resume|add|unbind|remove|rm      |login|forget|statusline|undo|vscode-status|help)
         set -- "$@" ;;                      # a command: leave the order alone
       *)
     case "$2" in
-      usage|login|logout|pause|resume|unbind|remove|forget|label|verify|fallback|use)
+      usage|reset-page|login|logout|pause|resume|unbind|remove|forget|label|verify|fallback|use)
         if awk -F'\t' -v n="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" '$2==n{f=1} END{exit !f}' "$MAP" 2>/dev/null \
            || [ -d "$PROFILES/$1" ] || [ -d "$1" ]; then
           set -- "$2" "$1" "${@:3}"
@@ -2725,6 +2783,7 @@ case "${1:-list}" in
   export) cmd_export ;;
   import) shift; cmd_import "$@" ;;
   usage)  shift; cmd_usage "$@" ;;
+  reset-page) shift; cmd_reset_page "$@" ;;
   refresh) shift; cmd_refresh "$@" ;;
   logout) shift; cmd_logout "$@" ;;
   switch) shift; cmd_switch "$@" ;;
@@ -2781,6 +2840,7 @@ INSPECT
   claude-account refresh [profile|--all]     renew expired access tokens (default: all)
   claude-account usage [profile|path]        live quota: session, weekly, resets (omit = global)
   claude-account usage --all                 every profile + global (refreshes expired tokens)
+  claude-account reset-page [profile]        open claude.ai Settings > Usage, where a limit reset is used
   claude-account <profile> usage             same thing, read the other way round
   claude-whoami [dir]                        which account applies in a directory, and why
 

@@ -469,4 +469,55 @@ wout=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN \
        bash "$REPO/bin/claude-whoami" "$T/Dead" 2>&1)
 grep -qi 'not signed in\|NOT LOGGED IN' <<<"$wout" && ok "claude-whoami agrees" || no "whoami: $(grep -i account <<<"$wout")"
 
+
+section "reset-page points at the claude.ai reset, and never claims one exists"
+# 1.1.8. A limit reset ("Reset for free") is used on claude.ai → Settings → Usage. This tool
+# CANNOT see whether an account has one: the usage endpoint answers reset status with
+# eligible:false, ineligible_reason "surface" to any client but claude.ai and recent official
+# Claude Code. So it only points at the page and names the account to sign in as.
+mkdir -p "$T/R1"; X add "$T/R1" rprof >/dev/null 2>&1; sign rprof
+X label rprof "someone@example.com (Some Org)" >/dev/null 2>&1
+rout=$(X reset-page rprof 2>&1); rrc=$?
+[ "$rrc" = 0 ] && ok "reset-page exits 0" || no "rc=$rrc"
+grep -q 'https://claude.ai/settings/usage' <<<"$rout" && ok "…prints the Settings → Usage URL" || no "$rout"
+grep -q 'someone@example.com' <<<"$rout" && ok "…and the email to sign in as (not the org text)" || no "no email: $rout"
+grep -q 'Some Org' <<<"$rout" && no "the org text leaked into the sign-in line" || ok "…without the org in the sign-in line"
+grep -qi 'cannot see whether' <<<"$rout" && ok "…and says it cannot see whether a reset exists" || no "claims knowledge it lacks"
+open probe-that-the-stub-records; grep -q probe-that-the-stub-records "$T_OPENED" && ok "(the open stub records — so the next check is not vacuous)" || no "open stub records nothing; the next check would pass for the wrong reason"
+: > "$T_OPENED"; X reset-page rprof >/dev/null 2>&1
+[ ! -s "$T_OPENED" ] && ok "piped: no browser is opened" || no "opened a browser from a pipe: $(cat "$T/opened")"
+PTYC "" reset-page rprof >/dev/null 2>&1
+grep -q 'https://claude.ai/settings/usage' "$T_OPENED" 2>/dev/null && ok "on a terminal it opens the page" || no "terminal run did not open the page"
+: > "$T_OPENED"
+X reset-page nosuchprofile >/dev/null 2>&1; [ $? = 1 ] && ok "an unknown profile exits 1" || no "unknown profile rc"
+X label rprof >/dev/null 2>&1   # clear the label
+X reset-page rprof 2>&1 | grep -q 'no email recorded' && ok "no recorded email says so, and how to set one" || no "silent about a missing email"
+X rprof reset-page 2>&1 | grep -q 'claude.ai/settings/usage' && ok "word order works both ways" || no "<profile> reset-page"
+X reset-page 2>&1 | grep -q 'claude.ai/settings/usage' && ok "bare reset-page means the global account" || no "bare"
+
+section "the weekly-limit hint appears only when a weekly limit is spent"
+export CA_USAGE_RETRY_SLEEP=0
+X label rprof "someone@example.com (Some Org)" >/dev/null 2>&1
+lim(){ printf '#!/bin/bash\nprintf %%s %s\n' "'{\"limits\":[$1]}'" > "$T/bin/curl"; chmod +x "$T/bin/curl"; }
+W100='{"kind":"weekly_all","group":"weekly","percent":100,"resets_at":"2030-01-03T15:00:00Z"}'
+W99='{"kind":"weekly_all","group":"weekly","percent":99,"resets_at":"2030-01-03T15:00:00Z"}'
+F100='{"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"2030-01-03T15:00:00Z","scope":{"model":{"display_name":"Fable"}}}'
+S100='{"kind":"session","group":"session","percent":100,"resets_at":"2030-01-01T15:40:00Z"}'
+
+lim "$W100"; hout=$(X usage rprof 2>&1)
+grep -q 'weekly limit reached' <<<"$hout" && ok "weekly at 100% shows the hint" || no "no hint at 100%"
+grep -q 'claude-account reset-page rprof' <<<"$hout" && ok "…with the command for THIS profile" || no "$hout"
+grep -q 'someone@example.com' <<<"$hout" && ok "…and the email to sign in as" || no "hint missing email"
+grep -qi 'if this account has' <<<"$hout" && ok "…and never claims the account has a reset" || no "hint overclaims"
+lim "$F100"; X usage rprof 2>&1 | grep -q 'weekly limit reached' && ok "a spent Fable weekly limit shows it too" || no "Fable 100% no hint"
+lim "$W99";  X usage rprof 2>&1 | grep -q 'weekly limit reached' && no "hint at 99%" || ok "99% shows nothing"
+lim "$S100"; X usage rprof 2>&1 | grep -q 'weekly limit reached' && no "hint for a spent 5-hour window, which reopens by itself" || ok "a spent 5-hour window alone shows nothing"
+lim "$W100"; X overview --no-refresh 2>&1 | grep -q 'reset-page rprof' && ok "overview shows it on that account's card" || no "overview missing hint"
+sign_global; X usage global 2>&1 | grep -q 'reset-page global' && ok "the global account's hint names 'global'" || no "global hint"
+stub_curl(){ printf '#!/bin/bash\n%s\n' "$1" > "$T/bin/curl"; chmod +x "$T/bin/curl"; }
+stub_curl "printf '%s' '{\"error\":{\"type\":\"rate_limit_error\"}}'"
+X usage rprof 2>&1 | grep -q 'weekly limit reached' && no "a failed probe produced a hint" || ok "a failed probe shows no hint"
+PTYC "" usage rprof 2>&1 | grep -q 'command not found' && no "something in the hint executed" || ok "nothing in the hint expands on a terminal"
+unset CA_USAGE_RETRY_SLEEP
+
 finish
