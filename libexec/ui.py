@@ -7,6 +7,7 @@ type, so the CLI's own guards (the map lock, the backups, the refusals) apply he
 there is one writer. Python 3.9 compatible on purpose: it is what macOS ships.
 """
 import curses
+import datetime
 import json
 import locale
 import os
@@ -226,6 +227,26 @@ def pct(p):
     return " –" if p is None else ("%3.0f%%" % p)
 
 
+def left(ts):
+    """How long until a window resets, in its largest unit (2h, 45m, 3d), worked out at draw
+    time so it stays right between fetches. Three characters for any real window: the 5-hour
+    one is under 5h, the weekly ones under 7d. "" when there is no time to show."""
+    if not ts:
+        return ""
+    try:
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        s = (t - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    except (ValueError, TypeError):
+        return ""
+    if s < 60:
+        return "now"
+    if s >= 86400:
+        return "%dd" % (s // 86400)
+    if s >= 3600:
+        return "%dh" % (s // 3600)
+    return "%dm" % (s // 60)
+
+
 # ── the app ──────────────────────────────────────────────────────────────────────────
 
 class App(object):
@@ -300,17 +321,17 @@ class App(object):
     @staticmethod
     def short_rows(u):
         """5h, week, the first model-scoped weekly, and extra usage, as numbers."""
-        out = {"5h": None, "week": None, "scoped": None, "extra": None}
+        out = {"5h": None, "week": None, "scoped": None, "extra": None, "at": {}}
         if not u:
             return out
         for r in u.get("rows", []):
             k = r.get("kind", "")
             if k == "session" and out["5h"] is None:
-                out["5h"] = r.get("pct")
+                out["5h"] = r.get("pct"); out["at"]["5h"] = r.get("resets_at")
             elif k == "weekly_all" and out["week"] is None:
-                out["week"] = r.get("pct")
+                out["week"] = r.get("pct"); out["at"]["week"] = r.get("resets_at")
             elif k == "weekly_scoped" and out["scoped"] is None:
-                out["scoped"] = (r.get("label") or "model", r.get("pct"))
+                out["scoped"] = (r.get("label") or "model", r.get("pct")); out["at"]["scoped"] = r.get("resets_at")
         if u.get("extra"):
             out["extra"] = u["extra"].get("pct")
         return out
@@ -431,14 +452,19 @@ class App(object):
         if loading and not u:
             x = put(self.scr, y, x, "  loading usage…", curses.A_DIM)
         elif u and u.get("rows") is not None and not u.get("problem"):
+            # each windowed percentage carries a dim countdown to its reset (Alexy's pick,
+            # 2026-10-18): compact enough to keep the columns, the exact time is in the panel
             x = put(self.scr, y, x, "  5h ", curses.A_DIM)
             x = put(self.scr, y, x, pct(s["5h"]), P.band(s["5h"]))
+            x = put(self.scr, y, x, " %-3s" % left(s["at"].get("5h")), curses.A_DIM)
             x = put(self.scr, y, x, "  week ", curses.A_DIM)
             x = put(self.scr, y, x, pct(s["week"]), P.band(s["week"]))
+            x = put(self.scr, y, x, " %-3s" % left(s["at"].get("week")), curses.A_DIM)
             if s["scoped"]:
                 lbl, v = s["scoped"]
                 x = put(self.scr, y, x, "  %s " % lbl[:8], curses.A_DIM)
                 x = put(self.scr, y, x, pct(v), P.band(v))
+                x = put(self.scr, y, x, " %-3s" % left(s["at"].get("scoped")), curses.A_DIM)
             if s["extra"] is not None:
                 x = put(self.scr, y, x, "  extra ", curses.A_DIM)
                 x = put(self.scr, y, x, pct(s["extra"]), P.band(s["extra"]))

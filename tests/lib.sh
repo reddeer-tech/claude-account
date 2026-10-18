@@ -37,6 +37,43 @@ ca_sandbox(){
 # T_SECLOG=<file> records one line per call, so a test can assert a command read no login.
 [ -n "${T_SECLOG:-}" ] && echo "$*" >> "$T_SECLOG"
 [ "${SEC_MODE:-}" = "err" ] && exit 36
+# T_KC=<dir> (opt-in) makes this a real store for what rename does: add-generic-password, on
+# argv or through `security -i` on stdin, writes the bytes to $T_KC/<service>; find prints
+# them (-w) or the acct attribute (no -w); delete removes them. $T_KC/channel.log records how
+# each write arrived. Like the real tool, -i splits a line over 4096 characters and echoes the
+# rest as `unknown command "<rest>"`. SEC_ADD_MODE=drop claims success and stores nothing;
+# SEC_ADD_MODE=corrupt stores the copy one byte short.
+if [ -n "${T_KC:-}" ]; then
+  kc_add(){ # <channel> <the add-generic-password arguments…>
+    local ch=$1 s="" a="" hx="" pw="" how=""; shift
+    while [ $# -gt 0 ]; do case "$1" in -s) s=$2; shift ;; -a) a=$2; shift ;; -X) hx=$2; how=X; shift ;; -w) pw=$2; how=w; shift ;; esac; shift; done
+    echo "$ch ${#hx}${#pw}" >> "$T_KC/channel.log"
+    [ "${SEC_ADD_MODE:-}" = drop ] && return 0
+    if [ "$how" = X ]; then printf '%s' "$hx" | xxd -r -p > "$T_KC/$s.tmp"; else printf '%s' "$pw" > "$T_KC/$s.tmp"; fi
+    [ "${SEC_ADD_MODE:-}" = corrupt ] && { head -c "$(( $(wc -c < "$T_KC/$s.tmp") - 1 ))" "$T_KC/$s.tmp" > "$T_KC/$s.cut"; mv "$T_KC/$s.cut" "$T_KC/$s.tmp"; }
+    mv "$T_KC/$s.tmp" "$T_KC/$s"; printf '%s' "${a:-?}" > "$T_KC/$s.acct"
+  }
+  case "${1:-}" in
+    -i) while IFS= read -r line || [ -n "$line" ]; do
+          if [ "${#line}" -gt 4095 ]; then printf 'unknown command "%s"\n' "${line:4095}"; line=${line:0:4095}; fi
+          eval "set -- $line"; [ "${1:-}" = add-generic-password ] && { shift; kc_add stdin "$@"; }
+        done; exit 0 ;;
+    add-generic-password) shift; kc_add argv "$@"; exit 0 ;;
+  esac
+fi
+if [ -n "${T_KC:-}" ] && [ "${1:-}" = delete-generic-password ]; then
+  # an entry the store holds is removed; anything else falls through, so its exit code
+  # (0 for a T_SIGNED/T_BLANK service, 44 otherwise) is what it always was
+  prev=""; for x in "$@"; do [ "$prev" = "-s" ] && [ -f "$T_KC/$x" ] && { rm -f "$T_KC/$x" "$T_KC/$x.acct"; exit 0; }; prev=$x; done
+fi
+if [ -n "${T_KC:-}" ] && [ "${1:-}" = find-generic-password ]; then
+  s=""; wf=0; for x in "$@"; do [ "$prev" = "-s" ] && s=$x; [ "$x" = "-w" ] && wf=1; prev=$x; done
+  if [ -f "$T_KC/$s" ]; then
+    # like the real tool: plain ASCII prints as text, anything else as hex (measured 2026-10-18)
+    if [ "$wf" = 1 ]; then if LC_ALL=C grep -q '[^ -~]' "$T_KC/$s"; then xxd -p "$T_KC/$s" | tr -d '\n'; else cat "$T_KC/$s"; fi; else printf '    "acct"<blob>="%s"\n' "$(cat "$T_KC/$s.acct" 2>/dev/null)"; fi
+    exit 0
+  fi
+fi
 svc=""; w=0
 while [ $# -gt 0 ]; do [ "$1" = "-s" ] && svc="$2"; [ "$1" = "-w" ] && w=1; shift; done
 # A service in $T_BLANK is the state Claude Code leaves behind when a refresh token dies:
@@ -100,6 +137,8 @@ STUB
   # assertion then passes for the wrong reason.
   export T_OPENED="$T/opened"; : > "$T_OPENED"
   export T_CURLED="$T/curled"; : > "$T_CURLED"
+  # The security stub keeps what is written (rename copies a login and reads it back, 1.2.5)
+  export T_KC="$T/kc"; mkdir -p "$T_KC"
   # doctor's live-sessions scan looks only at this sandbox's stand-in sessions, never at the
   # real Claude sessions on the machine: results stop depending on what is open, and each of
   # the ~36 doctor runs stops paying a ps + lsof per real session. The path is one the

@@ -296,4 +296,20 @@ goto "$o2"; k '['; wait_for 'done: claude-account order' 90
 ! grep -q $'^group\t' "$G" && ok "…and makes no group" || no "$(cat "$G")"
 k q; wait_for 'UI-EXITED-0' 15
 
+section "each window shows how long until it resets"
+python3 -I -B - "$REPO/libexec/ui.py" <<'PY' && ok "the countdown is the largest unit: 2h, 45m, 3d, now, nothing without a time" || no "the countdown helper is wrong"
+import datetime, importlib.util, sys
+spec = importlib.util.spec_from_file_location("ui", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+now = datetime.datetime.now(datetime.timezone.utc)
+at = lambda **k: (now + datetime.timedelta(**k)).strftime("%Y-%m-%dT%H:%M:%SZ")
+assert m.left(at(hours=2, minutes=30)) == "2h"
+assert m.left(at(minutes=45, seconds=30)) == "45m"
+assert m.left(at(days=3, hours=8)) == "3d"
+assert m.left(at(seconds=-5)) == "now"
+assert m.left(None) == "" and m.left("not a time") == ""
+PY
+start "FAKE_RESETS_AT='$(date -u -v+2H -v+30M +%Y-%m-%dT%H:%M:%SZ)'"
+wait_for '5h +40% 2h +week +34% 2h' 60 && ok "the rows say it after each percentage: 5h 40% 2h · week 34% 2h" || no "$(scr | head -8)"
+k q; wait_for 'UI-EXITED-0' 15
+
 finish

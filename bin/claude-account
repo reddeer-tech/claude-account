@@ -9,7 +9,7 @@ set -uo pipefail
 # you ran claude-account from — a cloned repo, say — ran as you, and several of these sites
 # are handed a whole credential on stdin. -I leaves out the cwd, PYTHON* variables and user
 # site-packages; only the standard library is used. tests/test_core.sh fails on a bare one.
-CA_VERSION="1.2.4"   # kept in step with package.json by `make version`
+CA_VERSION="1.2.5"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # How close a credential's SIGN-IN end must be before every identity line and doctor say so.
@@ -811,13 +811,15 @@ if os.environ.get("CA_USAGE_JSON") == "1":
         name = {"session": "Session (5h)", "weekly_all": "Weekly (all models)",
                 "weekly_scoped": ("Weekly (%s)" % label) if label else "Weekly (scoped)"}.get(kind, kind)
         out["rows"].append({"kind": kind, "label": label, "name": name, "pct": float(p),
-                            "resets": when(L.get("resets_at")), "severity": L.get("severity", "")})
+                            "resets": when(L.get("resets_at")), "resets_at": L.get("resets_at"),
+                            "severity": L.get("severity", "")})
     if not out["rows"]:
         LEG = {"five_hour": ("session", "Session (5h)"), "seven_day": ("weekly_all", "Weekly")}
         for k, v in d.items():
             if isinstance(v, dict) and v.get("utilization") is not None and k in LEG:
                 out["rows"].append({"kind": LEG[k][0], "label": "", "name": LEG[k][1],
-                                    "pct": float(v["utilization"]), "resets": when(v.get("resets_at")), "severity": ""})
+                                    "pct": float(v["utilization"]), "resets": when(v.get("resets_at")),
+                                    "resets_at": v.get("resets_at"), "severity": ""})
     ex = d.get("extra_usage") or {}
     if ex.get("is_enabled"):
         out["extra"] = {"pct": float(ex.get("utilization") or 0), "used": ex.get("used_credits"),
@@ -973,6 +975,48 @@ cmd_undo(){
   dim "Sessions already open keep their account; new sessions see the restored rules."
 }
 
+# Write a login under another Keychain name the way Claude Code itself writes one (2.1.238,
+# read from its code): `add-generic-password -U -a <acct> -s <service> -X <hex>`, through
+# `security -i` on stdin when that line with its newline is at most 4032 characters, on argv
+# when it is not. A login over about 1.9 KB takes argv either way, which is every one measured
+# here (3-7.6 KB) and what Claude Code does on each token renewal. `security -i` gives no way
+# around that: it splits a line past ~4096 characters and has no continuation (measured
+# 2026-10-18). Output always goes to /dev/null, because a split line is echoed secret and all,
+# and the copy is judged by reading it back, never by an exit status.
+kc_copy(){ # <from-service> <to-service> <the value exactly as `security -w` printed it>
+  local acct hex line back
+  # `security -w` prints a value as TEXT when it is plain ASCII and as HEX when it is not
+  # (measured 2026-10-18 on a throwaway keychain: a login containing "é" came back as 7b22…).
+  # Either way it must decode to a JSON object, which every Claude Code login is; the bytes
+  # to write are then the text's own bytes, or the hex as printed. Anything else is refused:
+  # copying unrecognised text could store the wrong bytes and still read back identical.
+  hex=$(printf '%s' "$3" | python3 -I -c '
+import json, re, sys
+v = sys.stdin.read()
+try:
+    if isinstance(json.loads(v), dict):
+        print(v.encode("utf-8").hex()); sys.exit(0)
+except ValueError:
+    pass
+if re.fullmatch(r"(?:[0-9a-fA-F]{2})+", v):
+    try:
+        if isinstance(json.loads(bytes.fromhex(v).decode("utf-8")), dict):
+            print(v.lower()); sys.exit(0)
+    except (ValueError, UnicodeDecodeError):
+        pass
+sys.exit(1)') || return 1
+  acct=$(security find-generic-password -s "$1" 2>/dev/null | sed -n 's/^ *"acct"<blob>="\(.*\)"$/\1/p' | head -1)
+  printf '%s' "$acct" | grep -qE '^[A-Za-z0-9._@-]{1,64}$' || acct=$USER   # it goes inside "…" below
+  line="add-generic-password -U -a \"$acct\" -s \"$2\" -X \"$hex\""
+  if [ $(( ${#line} + 1 )) -le 4032 ]; then
+    printf '%s\n' "$line" | security -i >/dev/null 2>&1
+  else
+    security add-generic-password -U -a "$acct" -s "$2" -X "$hex" >/dev/null 2>&1
+  fi
+  back=$(security find-generic-password -s "$2" -w 2>/dev/null) || return 1
+  [ "$back" = "$3" ]
+}
+
 cmd_rename(){
   [ -z "${1:-}" ] || [ -z "${2:-}" ] && { red "usage: claude-account rename <old> <new>"; exit 2; }
   local old; old=$(to_profile "$1") || exit $?
@@ -982,8 +1026,37 @@ cmd_rename(){
   reserved_none "$new" || exit 2
   [ "$old" = "$new" ] && { yel "Already called '$new'."; exit 0; }
   [ -e "$PROFILES/$new" ] && { red "profile '$new' already exists"; exit 1; }
+  [ -d "$PROFILES/$old" ] || { red "profile '$old' has no folder under $PROFILES — nothing to rename"; exit 1; }
   backup "rename-$old-to-$new"
 
+  # Order matters (1.2.5): the stored login is copied and CHECKED first, then the folder and
+  # the rules move, and the old login is deleted last. Any step that fails undoes the ones
+  # before it, so a rename either happens whole or changes nothing — it used to move the
+  # folder first and trust `security`'s exit status, so a copy that silently failed left the
+  # profile with no login and deleted the only good one.
+  # The Keychain entry is keyed by sha256(profile_dir), so renaming the directory needs it
+  # under the new name too.
+  local osvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$old" | shasum -a 256 | cut -c1-8)"
+  local nsvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$new" | shasum -a 256 | cut -c1-8)"
+  local secret rc moved=0
+  secret=$(security find-generic-password -s "$osvc" -w 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 44 ]; then
+    red "could not read the stored login of '$old' (security exit $rc) — nothing was renamed"; exit 1
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$secret" ]; then
+    if ! kc_copy "$osvc" "$nsvc" "$secret"; then
+      security delete-generic-password -s "$nsvc" >/dev/null 2>&1    # never leave a half copy
+      red "Could not copy the stored login of '$old' to the new name — nothing was renamed."
+      dim "  Its login is untouched. Try again, or rename it and sign in again:  claude-account login $new"
+      exit 1
+    fi
+    moved=1
+  fi
+  undo_login(){ [ "$moved" = 1 ] && security delete-generic-password -s "$nsvc" >/dev/null 2>&1; return 0; }
+
+  if ! mv "$PROFILES/$old" "$PROFILES/$new"; then
+    undo_login; red "could not rename the folder of '$old' — nothing was renamed"; exit 1
+  fi
   local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
   local tmp; tmp=$(mktemp)
   python3 -I - "$MAP" "$old" "$new" "$tmp" <<'RNPY'
@@ -998,29 +1071,21 @@ for l in lines:
     else: out.append(l)
 open(tmp,"w").writelines(out)
 RNPY
-  write_map "$tmp" "$before" || exit 1
-  mv "$PROFILES/$old" "$PROFILES/$new"
+  if ! write_map "$tmp" "$before"; then
+    mv "$PROFILES/$new" "$PROFILES/$old"; undo_login
+    red "could not rewrite the path rules — nothing was renamed"; exit 1
+  fi
   # your groups and order name the profile too (1.2.0)
   [ -f "$CA_GROUPS_FILE" ] && groups_write rename-account "$old" "$new"
-
-  # The Keychain entry is keyed by sha256(profile_dir), so renaming the directory
-  # orphans it. Copy the secret across, then delete the old entry.
-  local osvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$old" | shasum -a 256 | cut -c1-8)"
-  local nsvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$new" | shasum -a 256 | cut -c1-8)"
-  local secret; secret=$(security find-generic-password -s "$osvc" -w 2>/dev/null)
-  if [ -n "$secret" ]; then
-    if security add-generic-password -s "$nsvc" -a "$USER" -w "$secret" -U >/dev/null 2>&1; then
-      security delete-generic-password -s "$osvc" >/dev/null 2>&1
-      dim "Moved its stored login to the new name."
-    else
-      yel "Could not copy the credential — sign in again:  claude-account login $new"
-    fi
-  fi
   # the fallback names the profile by name — a rename must follow it, or every
   # unrouted path starts warning about a profile that no longer exists
   if [ "$(get_fallback 2>/dev/null)" = "$old" ]; then
     write_line "$PROFILES/.fallback" "$new"
     dim "Repointed the fallback to '$new'."
+  fi
+  if [ "$moved" = 1 ]; then
+    security delete-generic-password -s "$osvc" >/dev/null 2>&1
+    dim "Moved its stored login to the new name (checked: the copy reads back identical)."
   fi
   grn "Renamed profile '$old' -> '$new'."
 }

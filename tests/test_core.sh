@@ -842,4 +842,52 @@ done
 [ ! -e "$T/evil/RAN" ] && ok "…but no claude-account command run from that folder imports them" || no "imported: $(sort -u "$T/evil/RAN" | tr '\n' ' ')"
 X group --delete Planted >/dev/null 2>&1
 
+section "rename copies the login the way Claude Code writes it, checks it, and only then moves anything"
+# T_KC turns the security stub into a real store (see lib.sh). A login is written as hex
+# through `security -i` on stdin when the line fits Claude Code's 4032-character limit, on argv
+# when it does not, exactly as Claude Code 2.1.238 does; the copy must read back identical, and
+# a failure at any step must leave the profile, its rules and its login as they were.
+KC="$T_KC"
+mk_login(){ # <profile> <approximate size in bytes>
+  mkdir -p "$T/profiles/$1"
+  python3 -I -c 'import json,sys; n=int(sys.argv[1]); print(json.dumps({"claudeAiOauth":{"accessToken":"tok-"+sys.argv[2],"refreshToken":"ref-"+sys.argv[2],"expiresAt":4102444800000,"subscriptionType":"max","rateLimitTier":"demo"},"pad":"p"*max(0,n-170)}), end="")' "$2" "$1" > "$KC/$(svc_of "$1")"
+  printf 'alexy-test' > "$KC/$(svc_of "$1").acct"
+}
+mkdir -p "$T/RenSmall"; mk_login rsmall 1200; X add "$T/RenSmall" rsmall >/dev/null 2>&1
+cp "$KC/$(svc_of rsmall)" "$T/rsmall.orig"; : > "$KC/channel.log"
+out=$(T_KC="$KC" X rename rsmall rsmall2 2>&1); rc=$?
+[ $rc = 0 ] && cmp -s "$KC/$(svc_of rsmall2)" "$T/rsmall.orig" && ok "a 1.2 KB login moves to the new name byte for byte" || no "rc=$rc: $out"
+[ ! -e "$KC/$(svc_of rsmall)" ] && ok "…and the old entry is gone" || no "the old entry is still there"
+[ "$(cat "$KC/$(svc_of rsmall2).acct")" = alexy-test ] && ok "…under the account name the old entry had" || no "acct: $(cat "$KC/$(svc_of rsmall2).acct" 2>&1)"
+grep -q '^stdin ' "$KC/channel.log" && ! grep -q '^argv ' "$KC/channel.log" && ok "…written through stdin, never on the command line" || no "channels: $(cat "$KC/channel.log")"
+grep -q 'tok-rsmall\|ref-rsmall' <<<"$out" && no "rename printed the login" || ok "…and nothing of it was printed"
+awk -F'\t' -v p="$T/RenSmall" '$1==p && $2=="rsmall2"{f=1} END{exit !f}' "$CLAUDE_ACCOUNTS_MAP" && [ -d "$T/profiles/rsmall2" ] && ok "…with its rule and folder renamed" || no "$(cat "$CLAUDE_ACCOUNTS_MAP")"
+
+mk_login rbig 3000; cp "$KC/$(svc_of rbig)" "$T/rbig.orig"; : > "$KC/channel.log"
+out=$(T_KC="$KC" X rename rbig rbig2 2>&1); rc=$?
+[ $rc = 0 ] && cmp -s "$KC/$(svc_of rbig2)" "$T/rbig.orig" && ok "a 3 KB login, too long for stdin, moves byte for byte" || no "rc=$rc: $out"
+grep -q '^argv ' "$KC/channel.log" && ! grep -q '^stdin ' "$KC/channel.log" && ok "…on the command line, as Claude Code writes a login that size" || no "channels: $(cat "$KC/channel.log")"
+
+for mode in drop corrupt; do
+  mk_login "r$mode" 1200; cp "$KC/$(svc_of "r$mode")" "$T/r$mode.orig"; mkdir -p "$T/Ren$mode"; X add "$T/Ren$mode" "r$mode" >/dev/null 2>&1
+  mapb=$(cat "$CLAUDE_ACCOUNTS_MAP")
+  out=$(T_KC="$KC" SEC_ADD_MODE=$mode X rename "r$mode" "r${mode}2" 2>&1); rc=$?
+  [ $rc = 1 ] && grep -q 'nothing was renamed' <<<"$out" && ok "a copy that $( [ $mode = drop ] && echo 'claims success and stores nothing' || echo 'reads back one byte short') is refused" || no "rc=$rc: $out"
+  [ -d "$T/profiles/r$mode" ] && [ ! -e "$T/profiles/r${mode}2" ] && [ "$(cat "$CLAUDE_ACCOUNTS_MAP")" = "$mapb" ] && ok "…the folder and the rules are untouched" || no "$(ls "$T/profiles"); $(cat "$CLAUDE_ACCOUNTS_MAP")"
+  cmp -s "$KC/$(svc_of "r$mode")" "$T/r$mode.orig" && [ ! -e "$KC/$(svc_of "r${mode}2")" ] && ok "…the login is where it was, and no half copy is left" || no "$(ls "$KC")"
+done
+
+mkdir -p "$T/profiles/rhex"; printf '6869207468657265' > "$KC/$(svc_of rhex)"; cp "$KC/$(svc_of rhex)" "$T/rhex.orig"; : > "$KC/channel.log"
+out=$(X rename rhex rhex2 2>&1); rc=$?
+[ $rc = 1 ] && [ -d "$T/profiles/rhex" ] && cmp -s "$KC/$(svc_of rhex)" "$T/rhex.orig" && [ ! -e "$KC/$(svc_of rhex2)" ] && [ ! -s "$KC/channel.log" ] \
+  && ok "a value that is neither a JSON object nor the hex of one is never copied: nothing renamed, nothing written" || no "rc=$rc: $out; $(ls "$KC")"
+mkdir -p "$T/profiles/rutf"; printf '{"claudeAiOauth":{"accessToken":"tok-utf"},"mcpOAuth":{"Café|1a2b":{}}}' > "$KC/$(svc_of rutf)"; cp "$KC/$(svc_of rutf)" "$T/rutf.orig"
+out=$(X rename rutf rutf2 2>&1); rc=$?
+[ $rc = 0 ] && cmp -s "$KC/$(svc_of rutf2)" "$T/rutf.orig" && ok "a login with non-ASCII in it, which security prints as hex, moves byte for byte" || no "rc=$rc: $out"
+mkdir -p "$T/profiles/rnone"; : > "$KC/channel.log"
+T_KC="$KC" X rename rnone rnone2 >/dev/null 2>&1 && [ -d "$T/profiles/rnone2" ] && [ ! -s "$KC/channel.log" ] && ok "a profile with no login renames, and writes nothing to the Keychain" || no "$(cat "$KC/channel.log")"
+SEC_MODE=err X rename rsmall2 rsmall3 >/dev/null 2>&1; rc=$?
+[ $rc = 1 ] && [ -d "$T/profiles/rsmall2" ] && ok "a Keychain probe error refuses the rename instead of leaving the login behind" || no "rc=$rc"
+grep -c 'security add-generic-password' "$CA" | grep -qx 1 && ok "one place in the CLI writes a login" || no "$(grep -n 'security add-generic-password' "$CA")"
+
 finish

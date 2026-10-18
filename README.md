@@ -93,7 +93,8 @@ claude-account            # in a terminal; also: claude-account ui
 ```
 
 Every account in one screen, with its live usage, its paths and what each one is doing, in your
-own groups and order. Arrow keys move, Enter opens what you can do with the account or path under
+own groups and order. Each percentage is followed by how long until that window resets
+(`5h 7% 2h  week 45% 3d`); the exact times are in the panel under the list. Arrow keys move, Enter opens what you can do with the account or path under
 the cursor, `→` `←` show and hide an account's paths and `e` shows or hides every account's at
 once, `[` `]` move an account inside its group, `g` puts it in groups, `s` sorts for a moment
 by usage left or by when the sign-in ends, `r` fetches every account's usage again, and `m` has
