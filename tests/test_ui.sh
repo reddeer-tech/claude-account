@@ -63,6 +63,8 @@ s=$(scr)
 grep -qE '▶ ● \(global\)' <<<"$s" && ok "the cursor starts on the first account, (global), marked as the machine's" || no "$s"
 grep -q 'gamma.*floating — no path' <<<"$s" && grep -q 'alpha.*1 path' <<<"$s" && ok "each row says what uses the account" || no "$s"
 grep -q '⏎ actions' <<<"$s" && ok "the keys are always on screen" || no "no key hints"
+grep -qE "└ $T/A +in use" <<<"$s" && grep -q "└ $T/B" <<<"$s" && ok "it opens with every account's paths showing (1.2.6)" || no "$s"
+! grep -q '└ no paths' <<<"$s" && ok "…except the one with no path (gamma), which stays closed" || no "$s"
 # each key bold, what it does dim (1.2.4) — read from the attributes tmux reports for the last line
 TM capture-pane -p -e -t ui | tail -1 | python3 -I -c '
 import re, sys
@@ -83,22 +85,20 @@ assert "groups" in dim and "quit" in dim, dim
 
 section "moving, and an account's paths"
 k Down; wait_for '▶ +alpha' 10 && ok "↓ moves to the next account" || no "$(scr | head -8)"
-k Right; wait_for "└ $T/A +in use" 10 && ok "→ shows its paths, and what each is doing" || no "$(scr | head -10)"
+k Left; wait_gone "└ $T/A" 10 && ok "← hides its paths" || no "$(scr | head -10)"
+k Right; wait_for "└ $T/A +in use" 10 && ok "→ shows them again, and what each is doing" || no "$(scr | head -10)"
 
-section "e shows every account's paths at once, and hides them again"
-scr | grep -q 'e expand all' && ok "the key line offers e to expand all" || no "$(scr | tail -2)"
-# alpha is open already, beta is not: e opens the rest rather than closing alpha
+section "e hides every account's paths at once, and shows them again"
+scr | grep -q 'e collapse all' && ok "with every account open, the key line offers e to collapse all" || no "$(scr | tail -2)"
+k Down; wait_for "▶ +└ $T/A" 10      # on a path row, which is about to disappear
+k e; wait_gone "└ $T/" 10 && ok "e hides them all" || no "$(scr | head -12)"
+wait_for '▶ +alpha' 5 && ok "…the cursor goes from the hidden path to its account" || no "$(scr | head -8)"
+scr | grep -q 'e expand all' && ok "…and the key line offers to expand again" || no "$(scr | tail -2)"
 k e; wait_for "└ $T/B" 10 && scr | grep -q "└ $T/A" && ok "e opens every account that has a path" || no "$(scr | head -12)"
 ! scr | grep -q '└ no paths' && ok "…and leaves the one with no path (gamma) closed" || no "$(scr | head -12)"
-scr | grep -q 'e collapse all' && ok "…and the key line now offers to collapse them" || no "$(scr | tail -2)"
 # One closed by hand while all were open: e opens them all again, it does not close the rest
 k Left; wait_gone "└ $T/A" 10; scr | grep -q 'e expand all' && ok "← on one: the key line offers to expand all again" || no "$(scr | tail -2)"
 k e; wait_for "└ $T/A" 10 && scr | grep -q "└ $T/B" && ok "…and e re-opens every one" || no "$(scr | head -12)"
-k Down; wait_for "▶ +└ $T/A" 10      # on a path row, which is about to disappear
-k e; wait_gone "└ $T/" 10 && ok "e again hides them all" || no "$(scr | head -12)"
-wait_for '▶ +alpha' 5 && ok "…the cursor goes from the hidden path to its account" || no "$(scr | head -8)"
-scr | grep -q 'e expand all' && ok "…and the key line offers to expand again" || no "$(scr | tail -2)"
-k Right; wait_for "└ $T/A +in use" 10     # alpha open again, as the sections below expect
 
 section "a key the terminal does not know is ignored, never read as quit"
 # A bare ESC, then raw sequences no terminfo entry here defines. curses hands those over as
@@ -310,6 +310,8 @@ assert m.left(None) == "" and m.left("not a time") == ""
 PY
 start "FAKE_RESETS_AT='$(date -u -v+2H -v+30M +%Y-%m-%dT%H:%M:%SZ)'"
 wait_for '5h +40% 2h +week +34% 2h' 60 && ok "the rows say it after each percentage: 5h 40% 2h · week 34% 2h" || no "$(scr | head -8)"
+mkdir -p "$T/E"; X add "$T/E" epsilon >/dev/null 2>&1; sign epsilon
+k r; wait_for "└ $T/E" 60 && ok "an account added while the view is open shows its path too" || no "$(scr | head -16)"
 k q; wait_for 'UI-EXITED-0' 15
 
 finish

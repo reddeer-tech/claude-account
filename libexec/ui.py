@@ -256,6 +256,7 @@ class App(object):
         self.paint = Paint()
         self.sort = 0
         self.expanded = set()
+        self.seen = set()           # accounts already shown: only NEW ones are opened for you
         self.cursor = 0            # index into self.items, always a selectable item
         self.top = 0
         self.items = []
@@ -265,6 +266,14 @@ class App(object):
     # ── data ──
     def load(self, usage_for=None):
         self.m.reload()
+        # Every account that has a path opens expanded (Alexy, 2026-10-18) — at start, and when
+        # one appears later (added, renamed). One you closed stays closed; one with no path
+        # stays closed too, as `e` leaves it: opening it only adds a "no paths" line.
+        for a in self.m.state.get("accounts", []):
+            if a["name"] not in self.seen:
+                self.seen.add(a["name"])
+                if a.get("paths"):
+                    self.expanded.add(a["name"])
         accts = [a["name"] for a in self.m.state.get("accounts", [])]
         if usage_for is None:
             usage_for = [n for n in accts if n not in self.m.usage and n not in self.m.loading]
