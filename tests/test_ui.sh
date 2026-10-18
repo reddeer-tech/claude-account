@@ -29,7 +29,7 @@ wait_gone(){ local n=$(( ${2:-60} * 4 )) i=0; while [ $i -lt $n ]; do scr | grep
 k(){ TM send-keys -t ui "$@"; sleep 0.3; }
 lit(){ TM send-keys -t ui -l "$1"; sleep 0.3; }
 # Everything a session runs gets the sandbox PATH spelled out, whatever a shell does.
-SANDBOX_ENV="HOME='$T/home' PATH='$PATH' LANG=en_US.UTF-8 TERM=xterm-256color"
+SANDBOX_ENV="HOME='$T/home' PATH='$PATH' LANG=en_US.UTF-8 TERM=xterm-256color T_SECLOG='$T/seclog'"
 start(){ # [extra env…] — the view in a 160×50 pane; the pane stays after it exits
   TM kill-session -t ui >/dev/null 2>&1
   TM new-session -d -s ui -x 160 -y 50 \
@@ -80,14 +80,27 @@ scr | grep -qE '▶ ● \(global\)' && ok "…and ESC OF / ESC[H work the same w
 scr | grep -q 'UI-EXITED' && no "an escape sequence quit the view" || ok "Esc and unknown escape sequences leave the view open"
 [ ! -f "$G" ] && ok "…and move nothing (no order was written)" || no "an escape sequence reordered: $(cat "$G")"
 
+section "refreshing usage, for one account and for all"
+goto alpha
+wait_gone 'loading usage' 60; : > "$T_CURLED"
+k Enter; wait_for '▶ Refresh its usage' 15 && ok "⏎'s first item refreshes the account's usage" || no "$(scr)"
+k Enter; wait_for "refreshing alpha's usage" 15 && ok "…and says so" || no "$(scr | tail -4)"
+for _ in $(seq 1 240); do [ "$(grep -c '^args:' "$T_CURLED")" -ge 1 ] && scr | grep -qE '▶ +alpha .*week +34%' && break; sleep 0.25; done
+[ "$(grep -c '^args:' "$T_CURLED")" = 1 ] && ok "…asking the usage endpoint once, for that account only" || no "$(grep -c '^args:' "$T_CURLED") usage calls"
+: > "$T_CURLED"
+k m; wait_for '▶ Refresh every account.s usage' 15 && ok "m's first item refreshes every account's usage" || no "$(scr)"
+k Enter; wait_for 'refreshing usage' 15
+for _ in $(seq 1 240); do [ "$(grep -c '^args:' "$T_CURLED")" -ge 4 ] && ! scr | grep -q 'loading usage' && break; sleep 0.25; done
+[ "$(grep -c '^args:' "$T_CURLED")" = 4 ] && ok "…one usage call per signed-in account, four here" || no "$(grep -c '^args:' "$T_CURLED") usage calls"
+
 section "a confirm defaults to No"
 goto alpha
 k Enter; wait_for 'Pause its 1 path' 15 && ok "⏎ opens what you can do with the account" || no "$(scr)"
-k Down; k Enter; wait_for 'Pause alpha.s 1 path' 15 && k Enter
+k Down; k Down; k Enter; wait_for 'Pause alpha.s 1 path' 15 && k Enter
 sleep 1; grep -q 'paused' "$M" && no "Enter on the confirm paused it — No was not the default" || ok "⏎ straight through the confirm changes nothing"
 
 section "an action runs the command, shows what it said, and the screen follows"
-k Enter; wait_for 'Pause its 1 path' 15; k Down; k Enter; yes
+k Enter; wait_for 'Pause its 1 path' 15; k Down; k Down; k Enter; yes
 wait_for 'claude-account pause alpha' 60 && ok "the action's output appears, titled with the command it ran" || no "$(scr)"
 popup_close
 grep -qP "^$T/A\talpha\tpaused" "$M" 2>/dev/null || awk -F'\t' -v p="$T/A" '$1==p && $3=="paused"{f=1} END{exit !f}' "$M" \
@@ -102,27 +115,42 @@ awk -F'\t' -v p="$T/A" '$1==p && $3==""{f=1} END{exit !f}' "$M" && ok "resume fr
 k Left; wait_for '▶ +alpha' 10 && ok "← hides the paths and goes back to the account" || no "$(scr | head -8)"
 
 section "using an account for every path with no rule, and back"
-k Enter; wait_for 'Use it for every path with no rule' 15; k Enter; yes; popup_close
+k Enter; wait_for 'Use it for every path with no rule' 15; k Down; k Enter; yes; popup_close
 wait_for "this machine: alpha" 30 && [ "$(cat "$T/profiles/.fallback" 2>/dev/null)" = alpha ] && ok "use, from the view, selects it — and the header says so" || no "$(scr | head -3)"
-k Enter; wait_for 'Stop using it' 15; k Enter; yes; popup_close
+k Enter; wait_for 'Stop using it' 15; k Down; k Enter; yes; popup_close
 wait_for 'this machine: \(global\)' 30 && [ ! -f "$T/profiles/.fallback" ] && ok "…and back to (global)" || no "$(scr | head -3)"
 
 section "groups, from the view"
 k g; wait_for 'Groups for alpha' 15 && ok "g opens the account's groups" || no "$(scr)"
 k Enter; wait_for 'Name of the new group' 15; lit "Clients"; k Enter
-wait_for '\[x\] Clients' 60 && ok "＋ New group makes it, with the account already in" || no "$(scr)"
-k Escape; wait_for '── Clients \(1\)' 30 && ok "the screen now has a Clients section" || no "$(scr | head -12)"
+wait_for 'alpha is in Clients' 60 && ok "＋ New group makes it, with the account already in" || no "$(scr)"
+# One pick and back to the main screen — not the groups menu again (Alexy, 2026-10-18)
+wait_for '── Clients \(1\)' 30 && ! scr | grep -q 'Groups for' && ok "…straight back to the main screen, which has a Clients section" || no "$(scr | head -12)"
 grep -qxF "$(printf 'group\tClients\talpha')" "$G" && ok "…written to groups.tsv by the same group command" || no "$(cat "$G" 2>&1)"
 # beta is in the Ungrouped section below; put it in Clients as well
 goto beta
-k g; wait_for '\[ \] Clients' 15; k Enter; wait_for '\[x\] Clients' 60; k Escape
-grep -qxF "$(printf 'group\tClients\tbeta')" "$G" && ok "toggling a group on adds the account" || no "$(cat "$G")"
-wait_for '── Clients \(2\)' 30 && ok "…and the section counts it" || no "$(scr | head -12)"
+k g; wait_for '\[ \] Clients' 15; k Enter; wait_for 'beta is in Clients' 60
+grep -qxF "$(printf 'group\tClients\tbeta')" "$G" && ok "picking a group puts the account in it" || no "$(cat "$G")"
+wait_for '── Clients \(2\)' 30 && ! scr | grep -q 'Groups for' && ok "…the section counts it, and the menu is gone" || no "$(scr | head -12)"
+# and out again, also one pick — the other one way round
+goto beta
+k g; wait_for '\[x\] Clients' 15; k Enter; wait_for 'beta is out of Clients' 60
+! grep -qxF "$(printf 'group\tClients\tbeta')" "$G" && wait_for '── Clients \(1\)' 30 && ! scr | grep -q 'Groups for' \
+  && ok "picking a group it is in takes it out, and back to the main screen" || no "$(cat "$G"; scr | head -12)"
+k g; wait_for '\[ \] Clients' 15; k Enter; wait_for 'beta is in Clients' 60; wait_for '── Clients \(2\)' 30
+# G, the groups manager, the same way: ＋ New group… is the item after the one group
+k G; wait_for 'Groups — ' 15; k Down; k Enter; wait_for 'Name of the new group' 15; lit "Spare"; k Enter
+wait_for '── Spare \(0\)' 60 && ! scr | grep -q 'Groups — ' && grep -qxF "$(printf 'group\tSpare')" "$G" \
+  && ok "the groups manager does one thing too, then back to the main screen" || no "$(cat "$G"; scr | head -14)"
 
 section "reordering, and a sort that is not saved"
 goto alpha
+wait_gone 'loading usage' 60; [ -s "$T/seclog" ] && ok "the Keychain stub records the view's reads" || no "the stub recorded nothing"
+: > "$T/seclog"
 k ']'; wait_for 'done: claude-account order --in Clients beta alpha' 90
 [ "$(grep $'^group\tClients\t' "$G" | cut -f3 | tr '\n' ' ')" = "beta alpha " ] && ok "] moves the account down inside its group, and saves it" || no "$(cat "$G")"
+# It used to read every login back afterwards (1.1-1.6 s for 8 accounts), which is why [ ] lagged.
+[ ! -s "$T/seclog" ] && ok "…without reading any login back, so the screen updates at once" || no "a reorder read the Keychain: $(wc -l < "$T/seclog") call(s)"
 before=$(cat "$G")
 k s; wait_for 'sort: most weekly left' 10 && ok "s switches to a temporary sort, named in the header" || no "$(scr | head -2)"
 [ "$(cat "$G")" = "$before" ] && ok "…which writes nothing" || no "the sort wrote to groups.tsv"
@@ -149,11 +177,11 @@ popup_close
 
 section "the menu: adding a path"
 k m; wait_for 'Add a path' 15 && ok "m opens the menu" || no "$(scr)"
-k Enter; wait_for 'Bind a folder to which account' 15; k Enter
+k Down; k Enter; wait_for 'Bind a folder to which account' 15; k Enter
 wait_for 'Folder to bind' 15; lit "$T/D"; k Enter; yes
 wait_for 'claude-account add' 60 && popup_close
 awk -F'\t' -v p="$T/D" '$1==p && $2=="alpha"{f=1} END{exit !f}' "$M" && ok "a folder bound from the menu lands in paths.map" || no "$(cat "$M")"
-k m; wait_for 'Add a path' 15; k Enter; wait_for 'Bind a folder' 15; k Enter
+k m; wait_for 'Add a path' 15; k Down; k Enter; wait_for 'Bind a folder' 15; k Enter
 wait_for 'Folder to bind' 15; lit "$T/no-such-folder"; k Enter; yes
 wait_for 'failed \(exit [0-9]+\): claude-account add' 60 && ok "a command that fails says so, with its exit code and output" || no "$(scr)"
 popup_close
@@ -164,7 +192,7 @@ k Enter; wait_for 'Rename' 15; k Up; k Up; k Up; k Up; k Enter
 wait_for 'New name for the profile gamma' 15; TM send-keys -t ui C-u; lit "delta"; k Enter; yes
 wait_for "claude-account rename gamma delta" 60 && popup_close
 [ -d "$T/profiles/delta" ] && [ ! -d "$T/profiles/gamma" ] && ok "rename from the view moves the profile" || no "$(ls "$T/profiles")"
-k m; wait_for 'Show a printed view' 15; for _ in 1 2 3 4 5 6 7; do k Down; done; k Enter
+k m; wait_for 'Show a printed view' 15; for _ in 1 2 3 4 5 6 7 8; do k Down; done; k Enter
 wait_for 'Show the printed view' 15; k Enter
 wait_for 'CLAUDE ACCOUNTS' 60 && ok "the printed overview opens inside the view" || no "$(scr)"
 popup_close
@@ -174,7 +202,7 @@ popup_close
 section "a sign-in leaves the screen for the terminal and comes back"
 goto alpha
 k Enter; wait_for 'Sign in again' 15
-for _ in $(seq 1 6); do k Down; done; k Enter
+for _ in $(seq 1 7); do k Down; done; k Enter
 wait_for 'How to sign in' 15 && ok "sign in again offers the browser, an email, SSO or Console" || no "$(scr)"
 k Enter; wait_for 'press Enter to go back to the view' 60 && ok "…runs the real login in the terminal" || no "$(scr)"
 scr | grep -q '\$ claude-account login alpha' && ok "…showing the command it ran" || no "$(scr)"
@@ -205,6 +233,18 @@ fi
 start LANG=C LC_ALL=C
 wait_for ' - this machine:' 60 && wait_for '^ -- Clients' 15 && wait_for '^ > ' 15 && ! scr | grep -q '[▶─█]' \
   && ok "in the C locale it draws plain ASCII instead of garbage" || no "$(scr | head -5)"
+k q; wait_for 'UI-EXITED-0' 15
+
+section "with no groups, [ and ] arrange the accounts all the same"
+rm -f "$G"
+start
+wait_for 'this machine:' 60
+# a group's heading carries its count, "── Clients (2) ──"; the detail panel's "── (global) ──" does not
+scr | grep -qE '^ ── .+ \([0-9]+\) ─' && no "a section line with no groups: $(scr | head -6)" || ok "no groups, so no section lines"
+read -r o1 o2 orest <<<"$(X _ui-groups | python3 -I -c 'import json,sys; print(" ".join(json.load(sys.stdin)["order"]))')"
+goto "$o2"; k '['; wait_for 'done: claude-account order' 90
+[ "$(grep $'^order\t' "$G" | cut -f2 | tr '\n' ' ')" = "$o2 $o1 ${orest:+$orest }" ] && ok "[ moves $o2 above $o1, saved as your own order" || no "$(cat "$G" 2>&1)"
+! grep -q $'^group\t' "$G" && ok "…and makes no group" || no "$(cat "$G")"
 k q; wait_for 'UI-EXITED-0' 15
 
 finish

@@ -34,6 +34,8 @@ ca_sandbox(){
   # "not signed in" — the rule that stops a locked Keychain silently billing global.
   cat > "$T/bin/security" <<'STUB'
 #!/bin/bash
+# T_SECLOG=<file> records one line per call, so a test can assert a command read no login.
+[ -n "${T_SECLOG:-}" ] && echo "$*" >> "$T_SECLOG"
 [ "${SEC_MODE:-}" = "err" ] && exit 36
 svc=""; w=0
 while [ $# -gt 0 ]; do [ "$1" = "-s" ] && svc="$2"; [ "$1" = "-w" ] && w=1; shift; done

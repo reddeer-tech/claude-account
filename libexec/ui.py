@@ -73,6 +73,26 @@ class Model(object):
             self.error = "could not read claude-account's state: " + out[:200]
             return False
 
+    def reload_groups(self):
+        """After a `group` or `order`, which change nothing about an account: read back only
+        the groups, order and layout. A full reload reads every login and took 1.1-1.6 s for
+        8 accounts, so [ and ] lagged. False means the caller must reload everything."""
+        if not self.state:
+            return False
+        rc, out = ca(["_ui-groups"])
+        if rc != 0:
+            return False
+        try:
+            g = json.loads(out)
+        except ValueError:
+            return False
+        known = set(self.accounts())
+        if any(m not in known for sec in g.get("layout", []) for m in sec.get("members", [])):
+            return False                # an account made elsewhere since: show it too
+        for k in ("groups", "order", "layout"):
+            self.state[k] = g.get(k, [])
+        return True
+
     def accounts(self):
         return {a["name"]: a for a in self.state.get("accounts", [])}
 
@@ -229,6 +249,23 @@ class App(object):
             usage_for = [n for n in accts if n not in self.m.usage]
         if usage_for:
             self.m.fetch_usage([n for n in usage_for if n in accts])
+
+    def refresh_usage(self, names=None):
+        """Fetch usage again: one account from its own menu, every account from m or r.
+        Only the usage is read for a single account; all of them reloads the state too."""
+        if names is None:
+            with self.m.lock:
+                self.m.usage.clear()
+            self.load()
+            self.msg = ("refreshing usage…", 0)
+        else:
+            with self.m.lock:
+                for n in names:
+                    self.m.usage.pop(n, None)
+            self.m.fetch_usage(names)
+            self.msg = ("refreshing %s's usage…" % ", ".join(names), 0)
+        self.remember()
+        self.build()
 
     def usage_of(self, name):
         with self.m.lock:
@@ -647,7 +684,8 @@ class App(object):
         self.draw()
         rc, out = ca(args)
         cmd = "claude-account " + " ".join(args)
-        self.load(usage_for=refetch or [])
+        if not (args[0] in ("group", "order") and self.m.reload_groups()):
+            self.load(usage_for=refetch or [])
         self.build()
         if rc == 0:
             self.msg = ("done: " + cmd, 1)
@@ -689,59 +727,60 @@ class App(object):
         i = self.menu(title, names)
         return None if i is None else names[i]
 
+    # Both group menus do ONE thing and go back to the main screen, where the change shows:
+    # most accounts sit in one group (Alexy, 2026-10-18), so coming back to the menu after
+    # each pick was one more Esc almost every time. g again for a second group.
     def groups_for(self, name):
-        while True:
-            groups = self.m.state.get("groups", [])
-            opts = ["[%s] %s" % ("x" if name in g.get("members", []) else " ", g["name"]) for g in groups]
-            opts.append("＋ New group…")
-            i = self.menu("Groups for %s  (⏎ toggles, esc done)" % name, opts,
-                          hint="↑↓ choose · ⏎ toggle · esc done")
-            if i is None:
-                return
-            if i == len(groups):
-                g = self.ask("Name of the new group")
-                if g:
-                    self.run(["group", g.strip(), target(name)], quiet_ok=True)
-                continue
-            g = groups[i]["name"]
-            if name in groups[i].get("members", []):
-                self.run(["group", g, "--remove", target(name)], quiet_ok=True)
-            else:
-                self.run(["group", g, target(name)], quiet_ok=True)
+        groups = self.m.state.get("groups", [])
+        opts = ["[%s] %s" % ("x" if name in g.get("members", []) else " ", g["name"]) for g in groups]
+        opts.append("＋ New group…")
+        i = self.menu("Groups for %s" % name, opts, hint="↑↓ choose · ⏎ put it in, or take it out · esc back")
+        if i is None:
+            return
+        if i == len(groups):
+            g = (self.ask("Name of the new group") or "").strip()
+            if g and self.run(["group", g, target(name)], quiet_ok=True) == 0:
+                self.msg = ("%s is in %s — g again to put it in another group too" % (name, g), 1)
+            return
+        g = groups[i]["name"]
+        if name in groups[i].get("members", []):
+            if self.run(["group", g, "--remove", target(name)], quiet_ok=True) == 0:
+                self.msg = ("%s is out of %s" % (name, g), 1)
+        elif self.run(["group", g, target(name)], quiet_ok=True) == 0:
+            self.msg = ("%s is in %s — g again to put it in another group too" % (name, g), 1)
 
     def groups_manager(self):
-        while True:
-            groups = self.m.state.get("groups", [])
-            opts = ["%s  (%d)" % (g["name"], len(g.get("members", []))) for g in groups] + ["＋ New group…",
-                                                                                         "Reset your order to the default"]
-            i = self.menu("Groups — ⏎ on one to rename, delete or move it", opts)
-            if i is None:
-                return
-            if i == len(groups) + 1:
-                if self.confirm("Forget your own order? Groups and their members stay."):
-                    self.run(["order", "--reset"], quiet_ok=True)
-                continue
-            if i == len(groups):
-                g = self.ask("Name of the new group")
-                if g:
-                    self.run(["group", "--new", g.strip()], quiet_ok=True)
-                continue
-            g = groups[i]["name"]
-            names = [x["name"] for x in groups]
-            acts = ["Rename…", "Move up", "Move down", "Delete the group (its accounts stay)", "Back"]
-            k = self.menu("Group %s" % g, acts)
-            if k == 0:
-                new = self.ask("New name for %s" % g, g)
-                if new and new.strip() != g:
-                    self.run(["group", "--rename", g, new.strip()], quiet_ok=True)
-            elif k in (1, 2):
-                j = i - 1 if k == 1 else i + 1
-                if 0 <= j < len(names):
-                    names[i], names[j] = names[j], names[i]
-                    self.run(["order", "--groups"] + names, quiet_ok=True)
-            elif k == 3:
-                if self.confirm("Delete the group %s? Its accounts are not touched." % g):
-                    self.run(["group", "--delete", g], quiet_ok=True)
+        groups = self.m.state.get("groups", [])
+        opts = ["%s  (%d)" % (g["name"], len(g.get("members", []))) for g in groups] + ["＋ New group…",
+                                                                                     "Reset your order to the default"]
+        i = self.menu("Groups — ⏎ on one to rename, delete or move it", opts)
+        if i is None:
+            return
+        if i == len(groups) + 1:
+            if self.confirm("Forget your own order? Groups and their members stay."):
+                self.run(["order", "--reset"], quiet_ok=True)
+            return
+        if i == len(groups):
+            g = self.ask("Name of the new group")
+            if g:
+                self.run(["group", "--new", g.strip()], quiet_ok=True)
+            return
+        g = groups[i]["name"]
+        names = [x["name"] for x in groups]
+        acts = ["Rename…", "Move up", "Move down", "Delete the group (its accounts stay)", "Back"]
+        k = self.menu("Group %s" % g, acts)
+        if k == 0:
+            new = self.ask("New name for %s" % g, g)
+            if new and new.strip() != g:
+                self.run(["group", "--rename", g, new.strip()], quiet_ok=True)
+        elif k in (1, 2):
+            j = i - 1 if k == 1 else i + 1
+            if 0 <= j < len(names):
+                names[i], names[j] = names[j], names[i]
+                self.run(["order", "--groups"] + names, quiet_ok=True)
+        elif k == 3:
+            if self.confirm("Delete the group %s? Its accounts are not touched." % g):
+                self.run(["group", "--delete", g], quiet_ok=True)
 
     # ── reordering ──
     def reorder(self, d):
@@ -781,7 +820,9 @@ class App(object):
         active = [p for p in paths if p["state"] == "active"]
         paused = [p for p in paths if p["state"] == "paused"]
         glob = a.get("global")
-        acts = []
+        # First, so ⏎ ⏎ is always harmless: it only reads. It is also the retry for a usage
+        # check that failed (rate limited, say), which otherwise shows until the next r.
+        acts = [("Refresh its usage", "usage")]
         signed = a.get("state") == "signed-in"
         if not a.get("machine"):
             acts.append(("Use it for every path with no rule" + ("" if signed or glob else " (it is not signed in)"), "use"))
@@ -811,7 +852,9 @@ class App(object):
         if i is None:
             return
         act, t = acts[i][1], target(name)
-        if act == "use":
+        if act == "usage":
+            self.refresh_usage([name])
+        elif act == "use":
             if signed or glob:
                 if self.confirm("Use %s for every path with no rule?" % name):
                     self.run(["use", t])
@@ -985,7 +1028,8 @@ class App(object):
 
     def main_menu(self):
         fb = self.m.state.get("fallback")
-        acts = [("Add a path…", "add"), ("Create a profile… (signs in through the browser)", "create"),
+        acts = [("Refresh every account's usage", "usage"),
+                ("Add a path…", "add"), ("Create a profile… (signs in through the browser)", "create"),
                 ("Groups…", "groups"), ("Which account does a folder use?", "whoami")]
         if fb:
             acts.append(("Send paths with no rule back to (global)", "use-global"))
@@ -997,7 +1041,9 @@ class App(object):
         if i is None:
             return True
         act = acts[i][1]
-        if act == "add":
+        if act == "usage":
+            self.refresh_usage()
+        elif act == "add":
             names = [a["name"] for a in self.m.state.get("accounts", []) if not a.get("global")]
             NEW = "＋ a new profile, named after the folder"
             i = self.menu("Bind a folder to which account?", names + [NEW])
@@ -1052,13 +1098,14 @@ class App(object):
         self.show_text("Keys", "\n".join([
             "↑ ↓  or  k j      move",
             "→  or  l          show the account's paths      ←  or  h  hide them",
-            "⏎                 what you can do with the account or path under the cursor",
+            "⏎                 what you can do with the account or path under the cursor,",
+            "                  first of all refresh its usage",
             "[  ]              move the account up / down in its group (shift+↑↓ too)",
             "g                 the account's groups          G  manage groups",
             "m                 menu: add a path, create a profile, undo, health check",
             "s                 sort for a moment by usage left, sign-in end or name",
             "                  (your saved order comes back when you press s round to it)",
-            "r                 refresh usage                 q  quit",
+            "r                 refresh every account's usage (m has it too)     q  quit",
             "",
             "Every change runs the same claude-account command you could type,",
             "and shows what it printed. Things that cannot be undone ask you to",
@@ -1137,11 +1184,7 @@ class App(object):
                 self.build()
                 self.msg = ("sort: %s%s" % (SORTS[self.sort], "" if self.sort == 0 else " — for this view only, nothing saved"), 0)
             elif c == ord("r"):
-                self.m.usage.clear()
-                self.load()
-                self.remember()
-                self.build()
-                self.msg = ("refreshing usage…", 0)
+                self.refresh_usage()
             elif c == ord("?"):
                 self.help()
             elif c == curses.KEY_RESIZE:

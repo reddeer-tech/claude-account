@@ -95,6 +95,13 @@ st=$(X _ui-state 2>&1)
 python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); a={x["name"]:x for x in d["accounts"]}; assert "(global)" in a and "alpha" in a; assert d["machine"]=="(global)"; assert [s["section"] for s in d["layout"]][:2]==["Clients","Personal"]; assert a["alpha"]["paths"][0]["state"]=="active"' "$st" \
   && ok "_ui-state: accounts, the machine account, paths and the layout, as JSON" || no "$st"
 grep -q 'stub' <<<"$st" && no "_ui-state printed the access token" || ok "…and never the credential itself"
+# What the view reads back after a group or order: those three keys only, and no login.
+: > "$T/seclog"; T_SECLOG="$T/seclog" X _ui-state >/dev/null 2>&1
+[ -s "$T/seclog" ] && ok "_ui-state reads the logins (the Keychain stub records it)" || no "the stub recorded nothing"
+: > "$T/seclog"; gj=$(T_SECLOG="$T/seclog" X _ui-groups 2>&1)
+python3 -I -c 'import json,sys; a=json.loads(sys.argv[1]); b=json.loads(sys.argv[2]); assert all(a[k]==b[k] for k in ("groups","order","layout"))' "$gj" "$st" \
+  && ok "_ui-groups: the same groups, order and layout as _ui-state" || no "$gj"
+[ ! -s "$T/seclog" ] && ok "…without reading a single login" || no "_ui-groups called security: $(cat "$T/seclog")"
 us=$(X _ui-usage alpha 2>&1)
 python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); k=[r["kind"] for r in d["rows"]]; assert k==["session","weekly_all"], k; assert d["rows"][0]["pct"]==40' "$us" \
   && ok "_ui-usage: the usage rows as JSON" || no "$us"

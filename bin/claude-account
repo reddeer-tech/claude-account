@@ -4,7 +4,7 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.2.0"   # kept in step with package.json by `make version`
+CA_VERSION="1.2.1"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # How close a credential's SIGN-IN end must be before every identity line and doctor say so.
@@ -3668,7 +3668,7 @@ main(){
     # remove`, run from a folder containing a `vscode-status/` directory, silently
     # became `remove vscode-status`. A command name is never a profile or a path.
     case "$1" in
-      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|reset-page|refresh|logout|switch|global|status|pause|resume|add|unbind|remove|rm      |login|forget|statusline|undo|vscode-status|help|group|groups|order|ui|_ui-state|_ui-usage)
+      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|reset-page|refresh|logout|switch|global|status|pause|resume|add|unbind|remove|rm      |login|forget|statusline|undo|vscode-status|help|group|groups|order|ui|_ui-state|_ui-groups|_ui-usage)
         set -- "$@" ;;                      # a command: leave the order alone
       *)
     case "$2" in
@@ -3689,6 +3689,9 @@ case "${1:-list}" in
   group|groups)      shift; cmd_group "$@" ;;
   order)             shift; cmd_order "$@" ;;
   _ui-state)         cmd_ui_state ;;
+  # Only the groups, order and layout keys of _ui-state, which are all a `group` or `order`
+  # can change. _ui-state reads every login (~1.5 s for 8 accounts), this reads none.
+  _ui-groups)        groups_py json ;;
   _ui-usage)         shift; cmd_ui_usage "$@" ;;
   # ⚠️ FORWARD "$@". These arms used to call the function with no arguments, so the
   # `case " $* "` --no-refresh guard inside each one saw an empty $* and the flag was
