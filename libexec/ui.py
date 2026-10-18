@@ -267,6 +267,28 @@ class App(object):
         self.remember()
         self.build()
 
+    def with_paths(self):
+        return {a["name"] for a in self.m.state.get("accounts", []) if a.get("paths")}
+
+    def all_expanded(self):
+        wp = self.with_paths()
+        return bool(wp) and wp <= self.expanded
+
+    def toggle_all(self):
+        """e: every account's paths at once, or none (asked for by Alexy, 2026-10-18). An
+        account with no path is left closed: opening it only adds a "no paths" line."""
+        if not self.with_paths():
+            self.msg = ("no account has a path to show", 0)
+            return
+        if self.all_expanded():
+            self.expanded.clear()
+            self.msg = ("paths hidden — e shows them all again", 0)
+        else:
+            self.expanded |= self.with_paths()
+            self.msg = ("every account's paths — e hides them all", 0)
+        self.remember()                 # on a path that is now hidden: lands on its account
+        self.build()
+
     def usage_of(self, name):
         with self.m.lock:
             return self.m.usage.get(name), name in self.m.loading
@@ -492,7 +514,8 @@ class App(object):
         if w - len(right) - 1 > x + 2:
             put(scr, 0, w - len(right) - 1, right, curses.A_DIM)
 
-        foot = " ↑↓ move  ⏎ actions  → paths  [ ] reorder  g groups  m menu  s sort  r refresh  q quit"
+        foot = " ↑↓ move  ⏎ actions  → paths  e %s all  [ ] reorder  g groups  m menu  s sort  r refresh  q quit" % (
+            "collapse" if self.all_expanded() else "expand")
         detail = self.detail_lines() if h >= 22 else []
         dh = min(len(detail), max(0, h - 14)) if detail else 0
         list_top, list_bot = 2, h - 3 - (dh + 1 if dh else 0)
@@ -1098,6 +1121,7 @@ class App(object):
         self.show_text("Keys", "\n".join([
             "↑ ↓  or  k j      move",
             "→  or  l          show the account's paths      ←  or  h  hide them",
+            "e                 every account's paths at once, or hide them all again",
             "⏎                 what you can do with the account or path under the cursor,",
             "                  first of all refresh its usage",
             "[  ]              move the account up / down in its group (shift+↑↓ too)",
@@ -1158,6 +1182,8 @@ class App(object):
                 self.expanded.discard(it["name"])
                 self.want = ("account", it["name"], None, it.get("group"))
                 self.build()
+            elif c == ord("e"):
+                self.toggle_all()
             elif c in (curses.KEY_ENTER, 10, 13) and it:
                 if it["kind"] == "account":
                     self.account_menu(it["name"])

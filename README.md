@@ -94,7 +94,8 @@ claude-account            # in a terminal; also: claude-account ui
 
 Every account in one screen, with its live usage, its paths and what each one is doing, in your
 own groups and order. Arrow keys move, Enter opens what you can do with the account or path under
-the cursor, `[` `]` move an account inside its group, `g` puts it in groups, `s` sorts for a moment
+the cursor, `→` `←` show and hide an account's paths and `e` shows or hides every account's at
+once, `[` `]` move an account inside its group, `g` puts it in groups, `s` sorts for a moment
 by usage left or by when the sign-in ends, `r` fetches every account's usage again, and `m` has
 the rest. The first item when you press Enter on an account refreshes just its usage, and the
 first item in `m` refreshes everyone's. Everything the commands below do

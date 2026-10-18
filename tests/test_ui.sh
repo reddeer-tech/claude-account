@@ -68,6 +68,21 @@ section "moving, and an account's paths"
 k Down; wait_for '▶ +alpha' 10 && ok "↓ moves to the next account" || no "$(scr | head -8)"
 k Right; wait_for "└ $T/A +in use" 10 && ok "→ shows its paths, and what each is doing" || no "$(scr | head -10)"
 
+section "e shows every account's paths at once, and hides them again"
+scr | grep -q 'e expand all' && ok "the key line offers e to expand all" || no "$(scr | tail -2)"
+# alpha is open already, beta is not: e opens the rest rather than closing alpha
+k e; wait_for "└ $T/B" 10 && scr | grep -q "└ $T/A" && ok "e opens every account that has a path" || no "$(scr | head -12)"
+! scr | grep -q '└ no paths' && ok "…and leaves the one with no path (gamma) closed" || no "$(scr | head -12)"
+scr | grep -q 'e collapse all' && ok "…and the key line now offers to collapse them" || no "$(scr | tail -2)"
+# One closed by hand while all were open: e opens them all again, it does not close the rest
+k Left; wait_gone "└ $T/A" 10; scr | grep -q 'e expand all' && ok "← on one: the key line offers to expand all again" || no "$(scr | tail -2)"
+k e; wait_for "└ $T/A" 10 && scr | grep -q "└ $T/B" && ok "…and e re-opens every one" || no "$(scr | head -12)"
+k Down; wait_for "▶ +└ $T/A" 10      # on a path row, which is about to disappear
+k e; wait_gone "└ $T/" 10 && ok "e again hides them all" || no "$(scr | head -12)"
+wait_for '▶ +alpha' 5 && ok "…the cursor goes from the hidden path to its account" || no "$(scr | head -8)"
+scr | grep -q 'e expand all' && ok "…and the key line offers to expand again" || no "$(scr | tail -2)"
+k Right; wait_for "└ $T/A +in use" 10     # alpha open again, as the sections below expect
+
 section "a key the terminal does not know is ignored, never read as quit"
 # A bare ESC, then raw sequences no terminfo entry here defines. curses hands those over as
 # ESC plus loose bytes; the view used to quit on the ESC and could read "[" as "move up".
