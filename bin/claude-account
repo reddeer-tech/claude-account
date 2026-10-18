@@ -4,9 +4,13 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.1.8"   # kept in step with package.json by `make version`
+CA_VERSION="1.1.9"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
+# How close a credential's SIGN-IN end must be before every identity line and doctor say so.
+# The sign-in is the refresh token's hard end, ~4 weeks after `login`, and use does not
+# extend it (measured 2026-10-08) — see acct_signin.
+CA_SIGNIN_WARN_SECS=$((5*86400))
 # Locate resolve.sh: an explicit override, then next to this script (installed
 # layout: bin/../libexec), then the per-user config dir. Keeps a from-source run,
 # a Homebrew install and an npm install all working from one file.
@@ -54,7 +58,7 @@ real_claude(){ local d self; self="$HOME/bin/claude"
 # `claude auth status` is read-only, fast, and honours CLAUDE_SECURESTORAGE_CONFIG_DIR.
 # Parses the Keychain credential blob; prints only non-secret, per-profile fields.
 read -r -d "" ACCT_PY <<'ACCTPY' || true
-import json,sys,datetime
+import json,sys,datetime,os
 try:
     d = json.load(sys.stdin)
 except Exception:
@@ -71,6 +75,11 @@ if not (o.get("accessToken") or ""):
     print("NOT LOGGED IN"); raise SystemExit
 # 12-hour with am/pm. %-I is not portable, so strip the leading zero by hand.
 def hm(t): return t.strftime("%I:%M %p").lstrip("0")
+# Spell the month. A numeric "09-11" reads as 11 Sep or 9 Nov depending on who is
+# looking, and this line is the one people check when an account misbehaves. No
+# weekday here, unlike a quota reset: an expiry needs no action from you (it renews
+# itself on use), so it does not want the prominence of a day you might plan around.
+def dm(t): return "%d %s " % (t.day, t.strftime("%b"))
 
 # This is the ACCESS TOKEN's expiresAt, NOT a quota reset — different field, different
 # source, different meaning. `usage` reads resets_at from the API for the quota window.
@@ -80,16 +89,31 @@ if exp:
     t = datetime.datetime.fromtimestamp(exp/1000)
     now = datetime.datetime.now()
     mins = (t - now).total_seconds() / 60
-    # Spell the month. A numeric "09-11" reads as 11 Sep or 9 Nov depending on who is
-    # looking, and this line is the one people check when an account misbehaves. No
-    # weekday here, unlike a quota reset: an expiry needs no action from you (it renews
-    # itself on use), so it does not want the prominence of a day you might plan around.
-    def dm(t): return "%d %s " % (t.day, t.strftime("%b"))
     if mins < 0:      when = " EXPIRED " + dm(t) + hm(t)
     elif mins < 60:   when = " EXPIRES IN %dm " % int(mins) + hm(t)
     else:             when = " exp " + dm(t) + hm(t)
+# The SIGN-IN's end — the refresh token's hard end. Measured 2026-10-08: on every profile it
+# sits 27-30 days after `claude-account login`, and use does NOT extend it (the busiest
+# account had the soonest date). Once it passes, the next refresh is refused, Claude Code
+# blanks the slot, and the account stops mid-work — how kindly died on 2026-09-23. Say so in
+# the last few days, with the command, wherever this line is printed.
+# ⚠ Never put "EXPIRED", "EXPIRES IN", "NOT LOGGED IN" or "KEYCHAIN ERROR" in this text:
+# doctor and list pattern-match those words ON THIS LINE, and "EXPIRED" would make doctor
+# advise a refresh — which cannot work once the sign-in has ended.
+signin = ""
+r = o.get("refreshTokenExpiresAt")
+if isinstance(r, (int, float)) and not isinstance(r, bool) and r > 0:
+    rt = datetime.datetime.fromtimestamp(r/1000)
+    left = (rt - datetime.datetime.now()).total_seconds()
+    cmd = "claude-account login " + (os.environ.get("CA_ID_NAME") or "<profile>")
+    try: warn = int(os.environ.get("CA_SIGNIN_WARN_SECS") or 432000)
+    except ValueError: warn = 432000
+    # The command goes in parentheses: in `profiles` the paths column follows this text, and
+    # "login x /path" read as one command.
+    if left <= 0:     signin = "  · sign-in ended " + dm(rt) + hm(rt) + " (" + cmd + ")"
+    elif left < warn: signin = "  · sign in again by " + dm(rt) + hm(rt) + " (" + cmd + ")"
 plan = o.get("subscriptionType", "?"); tier = o.get("rateLimitTier", "?")
-print(plan + " | " + tier + when)
+print(plan + " | " + tier + when + signin)
 ACCTPY
 
 acct_identity(){ # <profile-dir or "" for global>
@@ -118,12 +142,14 @@ acct_identity(){ # <profile-dir or "" for global>
     # so this printed a confident `team | default_raven` for an account that cannot serve a
     # single request. acct_state already folds that into `absent`; the PRINT side has to
     # agree, or list/profiles/overview keep showing a plan for a dead credential.
-    out=$(printf '%s' "$blob" | python3 -c "$ACCT_PY")
+    local _idn="global"; [ -n "${1:-}" ] && _idn=$(basename "$1")
+    out=$(printf '%s' "$blob" | CA_ID_NAME="$_idn" CA_SIGNIN_WARN_SECS="$CA_SIGNIN_WARN_SECS" \
+          python3 -c "$ACCT_PY")
   fi
   if _use_colour; then
     case "$out" in
-      "NOT LOGGED IN"|*EXPIRED*|"KEYCHAIN ERROR"*) printf '\033[31m%s\033[0m\n' "$out" ;;   # red
-      *"EXPIRES IN"*)            printf '\033[38;5;208m%s\033[0m\n' "$out" ;;  # orange
+      "NOT LOGGED IN"|*EXPIRED*|"KEYCHAIN ERROR"*|*"sign-in ended"*) printf '\033[31m%s\033[0m\n' "$out" ;;   # red
+      *"EXPIRES IN"*|*"sign in again by"*) printf '\033[38;5;208m%s\033[0m\n' "$out" ;;  # orange
       *)                         printf '%s\n' "$out" ;;
     esac
   else printf '%s\n' "$out"; fi
@@ -450,7 +476,7 @@ cmd_resume(){
   # pause deliberately does NOT do this: parking a profile should not touch credentials, and
   # you may well be pausing it precisely because it is spent.
   local nm2; nm2=$(awk -F'\t' -v t="$(printf '%s' "$hits" | head -1)" '$1==t{print $2}' "$MAP" 2>/dev/null | head -1)
-  local state="ok"
+  local state="ok" _rsl="" _rsd=""
   if [ -n "$nm2" ]; then
     local pdir="$PROFILES/$nm2"
     if [ "$(acct_state "$pdir")" = absent ]; then
@@ -458,6 +484,13 @@ cmd_resume(){
     elif acct_is_expired "$pdir"; then
       dim "  '$nm2': access token expired — renewing…"
       if refresh_token_if_needed "$pdir" >/dev/null 2>&1; then state="renewed"; else state="dead"; fi
+    fi
+    # Never "credential valid" for a sign-in that has ENDED: the access token in the slot still
+    # works for a few hours, and nothing can renew it after that. (An expired token on an
+    # ended sign-in never gets here as ok: the renewal above refuses it, and that is "dead".)
+    if [ "$state" = ok ] || [ "$state" = renewed ]; then
+      IFS=$'\t' read -r _rsl _rsd <<<"$(acct_signin "$pdir")"
+      if [ -n "$_rsl" ] && [ "$_rsl" -le 0 ]; then state="ended"; fi
     fi
   fi
   case "$state" in
@@ -471,7 +504,12 @@ cmd_resume(){
              dim "    claude-account login $nm2" ;;
     dead)    red "Resumed $n path(s), but '$nm2' could NOT be renewed — its refresh token is dead too."
              red "    Sign in again before using those paths:  claude-account login $nm2" ;;
+    ended)   yel "Resumed $n path(s), but the sign-in of '$nm2' ENDED $_rsd — it keeps working only until"
+             yel "    its current access token runs out. Sign in again:  claude-account login $nm2" ;;
   esac
+  if { [ "$state" = ok ] || [ "$state" = renewed ]; } && [ -n "$_rsl" ] && [ "$_rsl" -lt "$CA_SIGNIN_WARN_SECS" ]; then
+    yel "  its sign-in ends $_rsd (in $(secs_human "$_rsl")) — sign in again before then: claude-account login $nm2"
+  fi
 }
 
 # The OAuth token has no identity in it, but Claude Code caches the account of the
@@ -1434,8 +1472,26 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
       else
         bad "$(gtag) is NOT signed in and nothing is selected — every unrouted path has no account (claude-account login global, or: claude-account use <name>)"
       fi ;;
-    *) if [ -n "$_gsel" ]; then ok_ "$(gtag): signed in, standing by while '$_gsel' is selected$( [ "${_gpins:-0}" -gt 0 ] && printf ', serving %s pinned rule(s)' "$_gpins" )"
-       else ok_ "$(gtag): signed in$( [ "${_gpins:-0}" -gt 0 ] && printf ', %s pinned rule(s)' "$_gpins" )"; fi ;;
+    *) local _gsl="" _gsd=""; IFS=$'\t' read -r _gsl _gsd <<<"$(acct_signin "")"
+       if [ -n "$_gsl" ] && [ "$_gsl" -le 0 ] && acct_is_expired ""; then
+         # DEAD: nothing can use it, so the verdicts of NOT signed in above apply — pins or
+         # nothing selected is a problem — and what depends on it fails rather than falls back
+         if [ "${_gpins:-0}" -gt 0 ]; then
+           bad "$(gtag): $(signin_ended_msg 1 "$_gsd" global "the $_gpins rule(s) pinned to it by switch <x> global fail")"
+         elif [ -n "$_gsel" ]; then
+           wrn "$(gtag): $(signin_ended_msg 1 "$_gsd" global "it is not used while '$_gsel' is selected, and cannot be")"
+         else
+           bad "$(gtag): $(signin_ended_msg 1 "$_gsd" global "every unrouted path fails")"
+         fi
+       elif [ -n "$_gsl" ] && [ "$_gsl" -le 0 ]; then
+         wrn "$(gtag): $(signin_ended_msg 0 "$_gsd" global)"
+       else
+         if [ -n "$_gsel" ]; then ok_ "$(gtag): signed in, standing by while '$_gsel' is selected$( [ "${_gpins:-0}" -gt 0 ] && printf ', serving %s pinned rule(s)' "$_gpins" )"
+         else ok_ "$(gtag): signed in$( [ "${_gpins:-0}" -gt 0 ] && printf ', %s pinned rule(s)' "$_gpins" )"; fi
+         if [ -n "$_gsl" ] && [ "$_gsl" -lt "$CA_SIGNIN_WARN_SECS" ]; then
+           wrn "$(gtag): sign-in ends $_gsd (in $(secs_human "$_gsl")) — sign in again before then: claude-account login global"
+         fi
+       fi ;;
   esac
   for d in "$PROFILES"/*/; do
     [ -d "$d" ] || continue
@@ -1451,18 +1507,41 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
     local parked=$(( used - active ))
     local id; id=$(acct_identity "${d%/}")
     local _dfb; _dfb=$(get_fallback) || _dfb=""
-    if [ "$(acct_state "${d%/}")" = absent ]; then
+    local _pst; _pst=$(acct_state "${d%/}")
+    if [ "$_pst" = absent ]; then
       if [ "$nm" = "$_dfb" ]; then wrn "$nm: is the FALLBACK but NOT signed in — every unrouted launch warns"
       elif [ "$active" -gt 0 ]; then wrn "$nm: $active rule(s) but NOT signed in — those paths use global + warn"
       elif [ "$parked" -gt 0 ]; then ok_ "$nm: not signed in, and its $parked rule(s) are parked — nothing routes to it, nothing warns"
       else wrn "$nm: floating and not signed in — claude-account login $nm  (no longer wanted? claude-account forget $nm)"; fi
+    elif [ "$_pst" = error ]; then
+      # A probe FAILURE is not "signed in" either; this used to fall through to the ✓ below.
+      wrn "$nm: could not read the credential — $id (a probe failure, NOT proof either way)"
     else
+      # The sign-in's end DECIDES first. Once it has passed, the "access token EXPIRED —
+      # claude-account refresh" advice below would be wrong: no refresh can work any more,
+      # only a new sign-in. Decided from acct_signin, never from the display text in $id.
+      local _sl="" _sd=""; IFS=$'\t' read -r _sl _sd <<<"$(acct_signin "${d%/}")"
+      if [ -n "$_sl" ] && [ "$_sl" -le 0 ] && acct_is_expired "${d%/}"; then
+        # DEAD: what depends on it decides, as in the NOT-signed-in branch. But a dead slot is
+        # not blank, so the launchers still route to it and those chats FAIL instead of falling
+        # back to global: a problem where not-signed-in is only a warning.
+        if [ "$nm" = "$_dfb" ]; then bad "$nm: $(signin_ended_msg 1 "$_sd" "$nm" "every unrouted path, which uses it as the selected account, fails")"
+        elif [ "$active" -gt 0 ]; then bad "$nm: $(signin_ended_msg 1 "$_sd" "$nm" "its $active rule(s) fail")"
+        elif [ "$parked" -gt 0 ]; then ok_ "$nm: its sign-in ended $_sd, and its $parked rule(s) are parked — nothing routes to it (sign in again before resuming: claude-account login $nm)"
+        else wrn "$nm: floating, and $(signin_ended_msg 1 "$_sd" "$nm")"; fi
+      elif [ -n "$_sl" ] && [ "$_sl" -le 0 ]; then
+        wrn "$nm: $(signin_ended_msg 0 "$_sd" "$nm")"
+      else
       case "$id" in
         *EXPIRED*)    wrn "$nm: access token EXPIRED — claude-account refresh $nm  (a paused profile is never used, so it drifts)";;
         *"EXPIRES IN"*) ok_ "$nm: signed in (access token renews itself on next use)$( [ "$used" -gt 0 ] && printf ', %s rule(s)' "$used" )";;
         *) if [ "$nm" = "$_dfb" ]; then ok_ "$nm: signed in, FALLBACK — every unrouted path uses it$( [ "$used" -gt 0 ] && printf ', plus %s rule(s)' "$used" )"
            elif [ "$used" -gt 0 ]; then ok_ "$nm: signed in, $used rule(s)"
            else ok_ "$nm: signed in, floating — select it: claude-account use $nm  (or bind a path: claude-account add <path> $nm)"; fi ;; esac
+        if [ -n "$_sl" ] && [ "$_sl" -lt "$CA_SIGNIN_WARN_SECS" ]; then
+          wrn "$nm: sign-in ends $_sd (in $(secs_human "$_sl")) — sign in again before then: claude-account login $nm"
+        fi
+      fi
     fi
   done
 
@@ -1486,37 +1565,138 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
   # doctor said "all good". Compare each live session's env against what its cwd resolves
   # to; a mismatch on a rule whose profile IS signed in means the launch bypassed the shim.
   echo; echo "live sessions"
-  local lp lcwd lwant lhave lsvc unrouted=0 total=0 ulist=""
-  local prefb=0 lline lsrc
-  for lp in $(pgrep -f 'native-binary/claude|\.local/bin/claude' 2>/dev/null); do
+  local lp lcwd lline lwant ldir lsrc lstate lenv lhave lhd ldesc lpwd lres
+  local total=0 stale=0 slist="" unrouted=0 ulist="" inh=0 ilist="" unread=0 rlist=""
+  # A running session is frozen to the routing in force when it LAUNCHED. So a session that
+  # disagrees with its folder is one of four different things, and the remedy differs:
+  #   started BEFORE the routing last changed -> simply stale: reopen that one chat
+  #   started AFTER it, with no account var   -> its launcher bypassed the shim: restart the editor
+  #   started AFTER it, carrying ANOTHER one  -> it was handed that account at launch (explicitly,
+  #                                              or inherited); the shims never override that
+  #   environment unreadable                  -> unknown, and said so
+  # Measured 2026-10-08: a TuringLabs chat opened on 5 Oct while that rule was paused was
+  # reported as a bypass with "QUIT and reopen VS Code", while sibling chats from the same
+  # VS Code carried their profiles.
+  # "When the routing last changed" = the newest of the map; the profiles dir (.fallback is
+  # written by rename into it, and removed from it); the plumbing the launcher runs — the
+  # shims and THEIR resolver, not this CLI's, because a Homebrew build's own copy carries its
+  # source mtime rather than when it took effect here; and, per folder below, when its
+  # profile was last signed in. Erring late only ever turns a bypass verdict into the gentler
+  # stale one, and a reopened chat that is still wrong is a bypass on the next run.
+  local _now _et _age _rules_at _pa _since
+  _rules_at=$(stat -f %m "$MAP" 2>/dev/null || echo 0)
+  for _pa in "$PROFILES" "$HOME/.config/claude-accounts/resolve.sh" "$dbin/claude" "$dbin/claude-vscode-wrapper"; do
+    _pa=$(stat -f %m "$_pa" 2>/dev/null || echo 0); [ "$_pa" -gt "$_rules_at" ] && _rules_at=$_pa
+  done
+  # CA_DOCTOR_PROC_MATCH exists for the test suite only: it narrows which processes are
+  # inspected, so a test sees its own stand-in session and not the real ones on the machine.
+  for lp in $(pgrep -f "${CA_DOCTOR_PROC_MATCH:-native-binary/claude|\.local/bin/claude}" 2>/dev/null); do
     lcwd=$(lsof -a -p "$lp" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'); [ -z "$lcwd" ] && continue
+    # NAMES only, plus the values of the two variables that are paths: the routing variable
+    # and PWD. Another process's environment can hold credentials — a token override among
+    # them — and a captured value would print under `set -x`. ps separates variables with
+    # spaces and quotes nothing, so a kept value is rebuilt from the tokens up to the next
+    # NAME=. Empty variables are left out, as the shims' own -n tests leave them out.
+    lenv=$(ps eww -o command= -p "$lp" 2>/dev/null | tr ' ' '\n' | awk -F= '
+      function keep() { if (cur != "") print cur; cur = "" }
+      /^[A-Za-z_][A-Za-z0-9_]*=/ { keep()
+        if ($1 == "CLAUDE_SECURESTORAGE_CONFIG_DIR" || $1 == "PWD") cur = $0
+        else if (length($0) > length($1) + 1) print $1
+        next }
+      cur != "" { cur = cur " " $0 }
+      END { keep() }')
     total=$((total+1))
-    lline=$("$RESOLVE" "$lcwd" 2>/dev/null)
-    lwant=$(printf '%s' "$lline" | cut -f1); [ -z "$lwant" ] && continue
-    lsrc=$(printf '%s' "$lline" | cut -f3)
-    if [ "$lsrc" = "(fallback)" ]; then
-      # launched before the fallback was set — the launcher did nothing wrong
-      lhave=$(ps eww -p "$lp" 2>/dev/null | tr ' ' '\n' | grep '^CLAUDE_SECURESTORAGE_CONFIG_DIR=' | sed 's/.*profiles\///')
-      [ "$lhave" != "$lwant" ] && prefb=$((prefb+1))
+    # ps shows another process's environment only where the OS allows it: macOS 27 hides it
+    # for Apple's own binaries (measured 2026-10-08 — nothing at all for a /bin/bash process,
+    # 41-45 variables for every real claude session). No PATH means no environment was shown
+    # at all, and unreadable is NOT "no account variable": never report it as (global).
+    # ⚠ Here-strings, never `printf | grep -q`: under pipefail, grep -q exiting on its match
+    # can kill printf mid-write with SIGPIPE, and the test then reads FALSE. Measured under
+    # load: a readable session reported unreadable, a token override called a bypass.
+    if ! grep -qx PATH <<<"$lenv"; then
+      ps -p "$lp" >/dev/null 2>&1 || { total=$((total-1)); continue; }   # gone since pgrep
+      unread=$((unread+1)); rlist="$rlist
+      pid $lp  ${lcwd/#$HOME/~}"
       continue
     fi
-    lsvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$lwant" | shasum -a 256 | cut -c1-8)"
-    security find-generic-password -s "$lsvc" >/dev/null 2>&1 || continue   # unsigned: falls back by design
-    lhave=$(ps eww -p "$lp" 2>/dev/null | tr ' ' '\n' | grep '^CLAUDE_SECURESTORAGE_CONFIG_DIR=' | sed 's/.*profiles\///')
-    if [ "$lhave" != "$lwant" ]; then
+    if grep -qx CLAUDE_CODE_OAUTH_TOKEN <<<"$lenv"; then lhave="(token override)"
+    else lhave=$(sed -n 's/^CLAUDE_SECURESTORAGE_CONFIG_DIR=//p' <<<"$lenv" | sed 's/.*profiles\///'); fi
+    # Judge the folder the LAUNCHER resolved. The shims resolve $PWD, the logical path, while
+    # lsof gives the physical one, so a rule stored through a symlink matched one and not the
+    # other. Trust the session's PWD the way bash does — only when it names the same
+    # directory, because a launcher that never ran leaves its parent's PWD (VS Code's "/"),
+    # and that is the bypass this stanza exists to catch — or when it no longer exists: the
+    # folder moved after launch, and where it was is what the launcher saw.
+    lpwd=$(sed -n 's/^PWD=//p' <<<"$lenv")
+    lres=$lcwd
+    if [ -n "$lpwd" ] && { [ "$lpwd" -ef "$lcwd" ] || [ ! -e "$lpwd" ]; }; then lres=$lpwd; fi
+    lline=$("$RESOLVE" "$lres" 2>/dev/null)
+    lwant=$(printf '%s' "$lline" | cut -f1); ldir=$(printf '%s' "$lline" | cut -f2)
+    lsrc=$(printf '%s' "$lline" | cut -f3)
+    [ "$lhave" = "$lwant" ] && continue
+    # The shims send a profile with no usable credential — absent, or blanked by an expired
+    # refresh token — to the real global account (or keep it under STRICT, which is the
+    # equality above). A bare exit-0 Keychain probe here called the blanked case signed in,
+    # and so flagged every correctly-global chat in that folder as a bypass.
+    # A Keychain probe ERROR leaves it unknown whether the profile is usable now, so a chat
+    # with no account variable cannot be judged there: say nothing rather than "bypass".
+    lstate=""; [ -n "$lwant" ] && lstate=$(acct_state "$ldir")
+    [ -n "$lwant" ] && [ "$lstate" != signed-in ] && [ -z "$lhave" ] && continue
+    if [ -z "$lwant" ]; then ldesc="(global)"
+    elif [ "$lstate" = absent ]; then ldesc="(global), because '$lwant' is not signed in"
+    elif [ "$lsrc" = "(fallback)" ]; then ldesc="'$lwant', the account selected with use"
+    else ldesc="'$lwant'"; fi
+    case "$lhave" in "") lhd="(global)" ;; "("*) lhd=$lhave ;; *) lhd="'$lhave'" ;; esac
+    # elapsed time as [[dd-]hh:]mm:ss -> seconds; "now" read beside it, because doctor can
+    # take tens of seconds to reach this process and the start time must not drift with it
+    _now=$(date +%s); _et=$(ps -o etime= -p "$lp" 2>/dev/null | tr -d ' ')
+    [ -z "$_et" ] && { total=$((total-1)); continue; }   # gone since pgrep listed it
+    _age=$(printf '%s' "$_et" | awk -F'[-:]' '{n=NF; s=$n+$(n-1)*60; if(n>=3)s+=$(n-2)*3600; if(n>=4)s+=$(n-3)*86400; print s+0}')
+    # Signing the folder's profile in is a routing change neither file records: a chat opened
+    # while it was signed out went to (global) by design. `login` leaves .login-attempted
+    # behind; the profile dir's own mtime is useless here, because Claude Code's lock files
+    # churn inside it all day (measured 2026-10-08: every profile dir modified that day).
+    _since=$_rules_at
+    if [ -n "$lwant" ]; then
+      _pa=$(stat -f %m "$ldir/.login-attempted" 2>/dev/null || echo 0); [ "$_pa" -gt "$_since" ] && _since=$_pa
+    fi
+    # A token override is never stale: no launcher sets one, so reopening the chat the same
+    # way hands it the same token again. It is always "handed an account".
+    if [ "$lhave" != "(token override)" ] && [ $(( _now - ${_age:-0} )) -lt "$_since" ]; then
+      stale=$((stale+1)); slist="$slist
+      pid $lp  ${lres/#$HOME/~}  →  still on $lhd from when it opened; the folder now uses $ldesc"
+    elif [ -z "$lhave" ]; then
       unrouted=$((unrouted+1)); ulist="$ulist
-      pid $lp  ${lcwd/#$HOME/~}  →  should be '$lwant', is ${lhave:-(global)}"
+      pid $lp  ${lres/#$HOME/~}  →  is on (global); the folder uses $ldesc"
+    else
+      inh=$((inh+1)); ilist="$ilist
+      pid $lp  ${lres/#$HOME/~}  →  carries $lhd; the folder uses $ldesc"
     fi
   done
-  [ "$prefb" -gt 0 ] && wrn "$prefb session(s) predate the fallback — they spend the global account until restarted (claude -c)"
   if [ "$total" = 0 ]; then dim "  (no claude sessions running)"
-  elif [ "$unrouted" = 0 ]; then ok_ "$total live session(s), every routed folder carries its profile"
+  elif [ "$((stale+unrouted+inh+unread))" = 0 ]; then ok_ "$total live session(s), each on its folder's account"
   else
-    bad "$unrouted of $total live session(s) are NOT routed although their folder has a signed-in rule:$ulist"
-    echo "      They spend the GLOBAL account. Their launcher bypassed the shim — for VS Code that"
-    echo "      means it was started before the wrapper setting took effect: QUIT and reopen VS Code,"
-    echo "      then resume the sessions from history (claude -c in a terminal). /login in one of"
-    echo "      these windows would overwrite your GLOBAL credential, not the profile's."
+    if [ "$stale" -gt 0 ]; then
+      wrn "$stale live session(s) opened before the routing last changed, so they still use the account they started on:$slist"
+      echo "      Reopen just those chats — from history in VS Code, or claude -c in that folder. No"
+      echo "      context is lost, and the editor does not need restarting."
+    fi
+    if [ "$inh" -gt 0 ]; then
+      wrn "$inh live session(s) were handed an account when they launched, and the shims never override one:$ilist"
+      echo "      Either it was set on purpose, or it was inherited — from a claude session's own shell,"
+      echo "      or an editor started from one. To use the folder's account, open the chat again from"
+      echo "      a fresh terminal, or an editor started from the Dock."
+    fi
+    if [ "$unread" -gt 0 ]; then
+      wrn "could not read the environment of $unread live session(s), so which account they use is unknown:$rlist"
+    fi
+    if [ "$unrouted" -gt 0 ]; then
+      bad "$unrouted of $total live session(s) opened after the routing last changed, yet do not carry their folder's account:$ulist"
+      echo "      Their launcher bypassed the shim — for VS Code that means it was started before the"
+      echo "      wrapper setting took effect: QUIT and reopen VS Code, then resume the sessions from"
+      echo "      history (claude -c in a terminal). /login in one of these windows writes to the"
+      echo "      account it launched with, not to this folder's profile."
+    fi
   fi
 
   echo
@@ -1820,6 +2000,45 @@ sys.exit(0 if e and e/1000 <= time.time() else 1)
 " 2>/dev/null
 }
 
+# A credential's SIGN-IN end: "<seconds left>\t<12 Oct 1:17 PM>", negative once it has
+# passed. The sign-in is the refresh token's hard end — ~4 weeks after `login`, NOT extended
+# by use (measured 2026-10-08 on every profile). This DECIDES; acct_identity only prints.
+# Prints nothing when there is no usable credential or no such field: no claim without
+# evidence. Only the timestamp leaves this function; the blob never does.
+acct_signin(){ # <profile-dir or "" for global>
+  local svc="Claude Code-credentials"
+  [ -n "${1:-}" ] && svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
+  # Piped straight into python, never held in a variable: an assignment prints its value
+  # under `bash -x`, and this one would be the whole credential.
+  security find-generic-password -s "$svc" -w 2>/dev/null | python3 -c '
+import json,sys,time,datetime
+try: o=json.load(sys.stdin).get("claudeAiOauth") or {}
+except Exception: raise SystemExit
+r=o.get("refreshTokenExpiresAt")
+if not o.get("accessToken") or isinstance(r,bool) or not isinstance(r,(int,float)) or r<=0: raise SystemExit
+t=datetime.datetime.fromtimestamp(r/1000)
+print("%d\t%d %s %s" % (int(r/1000-time.time()), t.day, t.strftime("%b"), t.strftime("%I:%M %p").lstrip("0")))
+' 2>/dev/null || true
+}
+
+# doctor's sentence for a sign-in that has ENDED. Whether it still works depends on the access
+# token already in the slot, which no refresh can replace any more. A DEAD one (both gone) is
+# still routed to — its slot is not blank yet — so what depends on it FAILS rather than falling
+# back; the caller names that as the 4th argument.
+signin_ended_msg(){ # <dead 0|1> <date> <login target> [what fails meanwhile]
+  if [ "$1" = 1 ]; then
+    printf 'its sign-in ENDED %s and its access token has expired too — %s until you sign in again: claude-account login %s' "$2" "${4:-it cannot be used}" "$3"
+  else
+    printf 'its sign-in ENDED %s — it keeps working only until its current access token runs out: claude-account login %s' "$2" "$3"
+  fi
+}
+
+# 3d 21h / 5h 12m / 41m — the same coarsening the usage countdown uses (1.1.3).
+secs_human(){ local s="${1:-0}"; [ "$s" -lt 0 ] && s=$(( -s ))
+  if   [ "$s" -ge 86400 ]; then printf '%dd %dh' $((s/86400)) $((s%86400/3600))
+  elif [ "$s" -ge 3600 ];  then printf '%dh %dm' $((s/3600)) $((s%3600/60))
+  else printf '%dm' $((s/60)); fi; }
+
 # Refresh EXPIRED access tokens before an inspection command reports on them, so it shows
 # reality instead of a stale EXPIRED that one refresh would have fixed. A PAUSED profile is
 # never used, so it drifts into expiry and looks broken when it is merely idle.
@@ -1997,13 +2216,30 @@ cmd_use(){
   # An unsigned fallback would warn on EVERY claude launch in EVERY unrouted folder on
   # the machine (and fail-fast machine-wide under CLAUDE_ACCOUNTS_STRICT). Refuse
   # unless forced — the same moment-of-dependence check resume and switch make.
-  local svc="Claude Code-credentials-$(printf '%s' "$PROFILES/$name" | shasum -a 256 | cut -c1-8)"
-  if ! security find-generic-password -s "$svc" >/dev/null 2>&1 && [ "${2:-}" != "--force" ]; then
-    red "profile '$name' is not signed in — a fallback with no login would warn on"
-    red "EVERY claude launch, machine-wide."
-    dim "  sign in first:  claude-account login $name"
-    dim "  (or force it:   claude-account use $name --force)"
-    exit 1
+  # acct_state, not a bare exit status: a slot blanked by a dead refresh token EXISTS (see
+  # 1.1.7), and a probe error is not "not signed in". A DEAD credential — sign-in ended and
+  # access token expired — is not blank, so the launchers would route every unrouted chat
+  # to it and each would fail: refused the same way.
+  if [ "${2:-}" != "--force" ]; then
+    local _ust _usl="" _usd=""; _ust=$(acct_state "$PROFILES/$name")
+    IFS=$'\t' read -r _usl _usd <<<"$(acct_signin "$PROFILES/$name")"
+    if [ "$_ust" = error ]; then
+      red "could not read the credential of '$name' (a Keychain probe failure) — not selecting it."
+      dim "  try again, or force it:  claude-account use $name --force"
+      exit 1
+    elif [ "$_ust" != signed-in ]; then
+      red "profile '$name' is not signed in — a fallback with no login would warn on"
+      red "EVERY claude launch, machine-wide."
+      dim "  sign in first:  claude-account login $name"
+      dim "  (or force it:   claude-account use $name --force)"
+      exit 1
+    elif [ -n "$_usl" ] && [ "$_usl" -le 0 ] && acct_is_expired "$PROFILES/$name"; then
+      red "the sign-in of '$name' ENDED $_usd and its access token has expired — every unrouted"
+      red "chat would fail on it, machine-wide."
+      dim "  sign in first:  claude-account login $name"
+      dim "  (or force it:   claude-account use $name --force)"
+      exit 1
+    fi
   fi
   local prev=""; [ -f "$PROFILES/.fallback" ] && IFS= read -r prev < "$PROFILES/.fallback"
   write_line "$PROFILES/.fallback" "$name"

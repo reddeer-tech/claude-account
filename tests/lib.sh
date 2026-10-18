@@ -45,8 +45,12 @@ if grep -qxF "$svc" "$T_BLANK" 2>/dev/null; then
   [ "$w" = 1 ] && printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"team","rateLimitTier":"default_raven"},"mcpOAuth":{"srv":{"accessToken":""}}}'
   exit 0
 fi
+# FAKE_ACCESS_EXPIRES_MS / FAKE_SIGNIN_ENDS_MS shape the signed-in blob: the access token's
+# expiry (default year 2100) and the refresh token's hard end, refreshTokenExpiresAt (default
+# absent — older credentials do not carry it, and absence must claim nothing).
 if grep -qxF "$svc" "$T_SIGNED" 2>/dev/null; then
-  [ "$w" = 1 ] && printf '{"claudeAiOauth":{"accessToken":"stub","subscriptionType":"max","rateLimitTier":"demo","expiresAt":4102444800000},"mcpOAuth":{"srv":{"accessToken":""}}}'
+  [ "$w" = 1 ] && printf '{"claudeAiOauth":{"accessToken":"stub","subscriptionType":"max","rateLimitTier":"demo","expiresAt":%s%s},"mcpOAuth":{"srv":{"accessToken":""}}}' \
+    "${FAKE_ACCESS_EXPIRES_MS:-4102444800000}" "${FAKE_SIGNIN_ENDS_MS:+,\"refreshTokenExpiresAt\":$FAKE_SIGNIN_ENDS_MS}"
   exit 0
 fi
 exit 44
@@ -78,6 +82,12 @@ STUB
   # writing to "$T/…" writes to "/…", fails silently, and every "nothing was opened"
   # assertion then passes for the wrong reason.
   export T_OPENED="$T/opened"; : > "$T_OPENED"
+  # doctor's live-sessions scan looks only at this sandbox's stand-in sessions, never at the
+  # real Claude sessions on the machine: results stop depending on what is open, and each of
+  # the ~36 doctor runs stops paying a ps + lsof per real session. The path is one the
+  # production pattern (native-binary/claude, .local/bin/claude) does NOT match, so a stand-in
+  # left running by an interrupted test can never show up in a real doctor run.
+  export CA_DOCTOR_PROC_MATCH="$T/fake/stand-in/claude"
   export PATH="$T/bin:$PATH"
 }
 

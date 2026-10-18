@@ -520,4 +520,214 @@ X usage rprof 2>&1 | grep -q 'weekly limit reached' && no "a failed probe produc
 PTYC "" usage rprof 2>&1 | grep -q 'command not found' && no "something in the hint executed" || ok "nothing in the hint expands on a terminal"
 unset CA_USAGE_RETRY_SLEEP
 
+
+section "a sign-in about to end says so, with the command — and never reads as EXPIRED"
+# 1.1.9. Refresh tokens end ~4 weeks after `login` and use does not extend them (measured
+# 2026-10-08 on every profile). Nothing warned ahead of that date; after it the next refresh
+# is refused, the slot is blanked and the account stops mid-work (kindly, 2026-09-23).
+now_ms(){ echo $(( $(date +%s) * 1000 )); }
+mkdir -p "$T/SI"; X add "$T/SI" siprof >/dev/null 2>&1; sign siprof
+SOON=$(( $(now_ms) + 3*86400*1000 )); LATER=$(( $(now_ms) + 20*86400*1000 )); GONE=$(( $(now_ms) - 3600*1000 ))
+
+pout=$(FAKE_SIGNIN_ENDS_MS=$SOON X profiles --no-refresh 2>&1)
+grep 'siprof' <<<"$pout" | grep -q 'sign in again by' && ok "3 days left: profiles says 'sign in again by <date>'" || no "$(grep siprof <<<"$pout")"
+grep 'siprof' <<<"$pout" | grep -q 'claude-account login siprof' && ok "…with the command for that profile" || no "no command on the line"
+grep 'siprof' <<<"$pout" | grep -q '(claude-account login siprof)' && ok "…in parentheses, so the paths column cannot run into it" || no "$(grep siprof <<<"$pout")"
+FAKE_SIGNIN_ENDS_MS=$SOON X list --no-refresh 2>&1 | grep 'siprof' | grep -q 'sign in again by' && ok "list says it too" || no "list silent"
+FAKE_SIGNIN_ENDS_MS=$SOON X overview --no-refresh 2>&1 | grep -q 'sign in again by' && ok "overview says it too" || no "overview silent"
+dout=$(FAKE_SIGNIN_ENDS_MS=$SOON X doctor --no-refresh 2>&1)
+grep -q 'siprof: sign-in ends .*claude-account login siprof' <<<"$dout" && ok "doctor warns ahead of the end, with the command" || no "doctor: $(grep siprof <<<"$dout")"
+grep 'siprof' <<<"$dout" | grep -q 'claude-account refresh' && no "doctor advised a refresh" || ok "…and never advises a refresh for it"
+
+FAKE_SIGNIN_ENDS_MS=$LATER X profiles --no-refresh 2>&1 | grep 'siprof' | grep -q 'sign in again\|sign-in ended' && no "warned 20 days out" || ok "20 days left: says nothing"
+FAKE_SIGNIN_ENDS_MS=$LATER X doctor --no-refresh 2>&1 | grep -q 'siprof: sign-in\|siprof: its sign-in' && no "doctor warned 20 days out" || ok "…and doctor says nothing"
+X profiles --no-refresh 2>&1 | grep 'siprof' | grep -q 'sign in again\|sign-in ended' && no "warned without evidence" || ok "no such field in the credential: says nothing, claims nothing"
+
+eout=$(FAKE_SIGNIN_ENDS_MS=$GONE X profiles --no-refresh 2>&1)
+grep 'siprof' <<<"$eout" | grep -q 'sign-in ended' && ok "an ended sign-in says so" || no "$(grep siprof <<<"$eout")"
+dout=$(FAKE_SIGNIN_ENDS_MS=$GONE X doctor --no-refresh 2>&1)
+grep -q 'siprof: its sign-in ENDED .*claude-account login siprof' <<<"$dout" && ok "doctor: ended -> sign in again" || no "doctor: $(grep siprof <<<"$dout")"
+grep -q 'siprof: its sign-in ENDED .*keeps working only until its current access token runs out' <<<"$dout" && ok "…and says it works until its access token runs out" || no "$(grep siprof <<<"$dout")"
+grep 'siprof' <<<"$dout" | grep -q 'siprof: signed in' && no "doctor called an ended sign-in 'signed in'" || ok "…and does not also call it signed in"
+# ⚠ THE dangerous case: ended sign-in AND an expired access token. doctor used to read the
+# display line, see EXPIRED, and advise `refresh` — which is refused on a dead sign-in.
+dout=$(FAKE_SIGNIN_ENDS_MS=$GONE FAKE_ACCESS_EXPIRES_MS=$(( $(now_ms) - 60000 )) X doctor --no-refresh 2>&1)
+grep 'siprof' <<<"$dout" | grep -q 'claude-account refresh' && no "doctor advised a refresh on an ended sign-in" || ok "ended sign-in + expired access token: doctor never advises refresh"
+grep -q 'claude-account login siprof' <<<"$dout" && ok "…it gives the login command instead" || no "no login command: $(grep siprof <<<"$dout")"
+grep -q '✗ siprof: its sign-in ENDED .*its 1 rule(s) fail until you sign in again' <<<"$dout" && ok "…and a DEAD credential a rule depends on is a problem: those chats fail" || no "$(grep siprof <<<"$dout")"
+
+for v in SOON GONE; do
+  eval "ms=\$$v"
+  FAKE_SIGNIN_ENDS_MS=$ms X profiles --no-refresh 2>&1 | grep 'siprof' | grep -qE 'EXPIRED|EXPIRES IN|NOT LOGGED IN|KEYCHAIN ERROR' \
+    && no "the $v text contains a word doctor/list decide on" || ok "the $v text avoids every word doctor and list decide on"
+done
+cout=$(FAKE_SIGNIN_ENDS_MS=$SOON PTYC "" profiles --no-refresh 2>&1)
+grep 'siprof' <<<"$cout" | grep -q $'\033\[38;5;208m' && ok "on a terminal, ending soon is orange" || no "not orange"
+cout=$(FAKE_SIGNIN_ENDS_MS=$GONE PTYC "" profiles --no-refresh 2>&1)
+grep 'siprof' <<<"$cout" | grep -q $'\033\[31m' && ok "…and ended is red" || no "not red"
+sign_global
+FAKE_SIGNIN_ENDS_MS=$SOON X doctor --no-refresh 2>&1 | grep -q '(global): sign-in ends .*claude-account login global' \
+  && ok "the global account warns too, with 'login global'" || no "global not warned"
+dout=$(FAKE_SIGNIN_ENDS_MS=$SOON X doctor --no-refresh 2>&1)
+grep -qE 'siprof: sign-in ends .* \(in [0-9]+d [0-9]+h\)' <<<"$dout" && ok "doctor counts down to it" || no "$(grep siprof <<<"$dout")"
+dout=$(FAKE_SIGNIN_ENDS_MS=$GONE X doctor --no-refresh 2>&1)
+grep -q '(global): its sign-in ENDED .*keeps working only until its current access token runs out: claude-account login global' <<<"$dout" \
+  && ok "the global account's ended sign-in is reported too" || no "$(grep global <<<"$dout")"
+# A DEAD credential (sign-in ended AND access token expired) gets the verdict NOT signed in
+# gets in the same position — it is just as unusable — so the verdict does not flip when
+# Claude Code later blanks the slot.
+PAST=$(( $(now_ms) - 60000 ))
+dout=$(FAKE_SIGNIN_ENDS_MS=$GONE FAKE_ACCESS_EXPIRES_MS=$PAST X doctor --no-refresh 2>&1); drc=$?
+# ✗ either way: "every unrouted path fails", or — when earlier sections left pins — "the N
+# rule(s) pinned to it … fail". Both are problems, as for an unsigned global account.
+grep -q '✗ (global): its sign-in ENDED .* fail until you sign in again' <<<"$dout" && [ "$drc" = 1 ] \
+  && ok "a DEAD global account with nothing selected is a problem, as an unsigned one is" || no "rc=$drc $(grep global <<<"$dout")"
+X pause siprof >/dev/null 2>&1
+dout=$(FAKE_SIGNIN_ENDS_MS=$GONE FAKE_ACCESS_EXPIRES_MS=$PAST X doctor --no-refresh 2>&1)
+grep -q '✓ siprof: its sign-in ended .*parked — nothing routes to it' <<<"$dout" \
+  && ok "a DEAD profile whose rules are all parked is fine, as an unsigned one is" || no "$(grep siprof <<<"$dout")"
+rout=$(FAKE_SIGNIN_ENDS_MS=$GONE X resume siprof 2>&1)
+grep -q "the sign-in of 'siprof' ENDED" <<<"$rout" && ok "resume says when the sign-in has ended" || no "$rout"
+grep -q 'credential valid' <<<"$rout" && no "resume called an ended sign-in valid: $rout" || ok "…and never calls it 'credential valid'"
+X pause siprof >/dev/null 2>&1
+rout=$(FAKE_SIGNIN_ENDS_MS=$SOON X resume siprof 2>&1)
+grep -q 'credential valid' <<<"$rout" && grep -q 'its sign-in ends .*claude-account login siprof' <<<"$rout" \
+  && ok "resume warns when the sign-in ends soon" || no "$rout"
+mkdir -p "$T/profiles/blk"; blank blk
+X use blk >/dev/null 2>&1; urc=$?
+[ "$urc" = 1 ] && [ ! -f "$T/profiles/.fallback" ] && ok "use refuses a profile whose slot was blanked by a dead refresh token" || no "use selected a blanked profile (rc=$urc)"
+uo=$(FAKE_SIGNIN_ENDS_MS=$GONE FAKE_ACCESS_EXPIRES_MS=$PAST X use siprof 2>&1); urc=$?
+[ "$urc" = 1 ] && grep -q "the sign-in of 'siprof' ENDED" <<<"$uo" && ok "…and a DEAD one, which every unrouted chat would fail on" || no "rc=$urc $uo"
+uo=$(SEC_MODE=err X use siprof 2>&1); urc=$?
+[ "$urc" = 1 ] && grep -q 'could not read the credential' <<<"$uo" && ok "…and calls a probe failure one, not 'not signed in'" || no "rc=$urc $uo"
+X use siprof >/dev/null 2>&1 && ok "…while a signed-in profile is selected as before" || no "use refused a signed-in profile"
+X use global >/dev/null 2>&1
+dout=$(SEC_MODE=err X doctor --no-refresh 2>&1)
+grep -q 'siprof: could not read the credential' <<<"$dout" && ok "doctor reports a Keychain probe error on a profile as one" || no "$(grep siprof <<<"$dout")"
+grep -q '✓ siprof: signed in' <<<"$dout" && no "doctor called a probe error 'signed in'" || ok "…and never as signed in"
+
+section "doctor judges each live session the way the launcher would"
+# 1.1.9. A session keeps the routing it LAUNCHED with. doctor reported a chat opened while its
+# rule was paused as a launcher bypass and said to QUIT the editor; reopening that one chat
+# was all it needed. It also called a session (global) when it could not read its environment
+# at all, and expected a profile whose credential was blanked by an expired refresh token.
+# Stand-ins are python, on purpose: macOS 27 hides the environment of Apple's own binaries
+# (/bin/bash) from ps, so a bash stand-in passes every "is (global)" assertion for the wrong
+# reason. They live at a path the production pattern (native-binary/claude, .local/bin/claude)
+# does NOT match, end on their own after ten minutes, and the trap kills them when this file
+# exits: an interrupted run must not leave sessions behind for a real doctor to report.
+FAKE="$T/fake/stand-in/claude"; mkdir -p "$T/fake/stand-in" "$T/LS" "$T/UN" "$T/BL"
+printf 'import time\nfor _ in range(600): time.sleep(1)\n' > "$FAKE"
+trap 'kill $(jobs -p) 2>/dev/null' EXIT
+fake(){ local d=$1; shift; ( cd "$d" && exec env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN "$@" python3 "$FAKE" ) & }
+stop(){ kill "$@" 2>/dev/null; wait "$@" 2>/dev/null; }
+live(){ X doctor --no-refresh 2>&1 | sed -n '/^live sessions/,$p'; }
+
+fake "$T/LS"; SA=$!                                              # opens with no rule anywhere
+fake "$T/UN" CLAUDE_SECURESTORAGE_CONFIG_DIR="$T/profiles/lsprof"; SU=$!   # opens on a profile
+fake "$T/LS" CLAUDE_CODE_OAUTH_TOKEN=sk-test-NEVERPRINTME; ST=$!           # a token override
+sleep 2
+X add "$T/LS" lsprof >/dev/null 2>&1; sign lsprof               # the routing changes AFTER all three
+X add "$T/BL" blprof >/dev/null 2>&1; blank blprof              # a refresh token that died
+lout=$(live)
+grep -q '2 live session(s) opened before the routing last changed' <<<"$lout" && ok "chats older than the last routing change are reported as stale" || no "$lout"
+grep -q "pid $SA .*still on (global) from when it opened; the folder now uses 'lsprof'" <<<"$lout" && ok "…naming the account it is on and the one its folder uses" || no "$lout"
+grep -q "pid $SU .*still on 'lsprof' from when it opened; the folder now uses (global)" <<<"$lout" && ok "…including a chat on a profile in a folder that now uses (global)" || no "$lout"
+grep -q "pid $ST .*carries (token override)" <<<"$lout" && ok "a token override is 'handed an account' even when it predates the change: reopening cannot fix it" || no "$lout"
+grep -q 'QUIT and reopen' <<<"$lout" && no "told to restart the editor for a stale chat" || ok "…and nothing is told to restart the editor"
+stop "$SA" "$SU" "$ST"
+
+sleep 2                                                          # every chat below opens AFTER
+fake "$T/LS"; B1=$!                                              # the launcher skipped the shim
+fake "$T/LS" CLAUDE_SECURESTORAGE_CONFIG_DIR="$T/profiles/lsprof"; B2=$!   # correct
+fake "$T/LS" CLAUDE_SECURESTORAGE_CONFIG_DIR="$T/profiles/other"; B3=$!    # handed another
+fake "$T/LS" CLAUDE_CODE_OAUTH_TOKEN=sk-test-NEVERPRINTME; B4=$!           # token override
+fake "$T/BL"; B5=$!                                              # blanked: global IS correct
+fake "$T/BL" CLAUDE_SECURESTORAGE_CONFIG_DIR="$T/profiles/blprof"; B6=$!   # STRICT keeps it
+fake "$T/UN"; B7=$!                                              # unrouted, on global: correct
+sleep 1
+full=$(X doctor --no-refresh 2>&1); lout=$(sed -n '/^live sessions/,$p' <<<"$full")
+grep -q '1 of 7 live session(s) opened after the routing last changed' <<<"$lout" && ok "a newer chat with no account variable is the one real bypass" || no "$lout"
+grep -q "pid $B1 .*is on (global); the folder uses 'lsprof'" <<<"$lout" && ok "…named, with the account its folder uses" || no "$lout"
+grep -q 'QUIT and reopen VS Code' <<<"$lout" && ok "…with the restart-the-editor remedy" || no "no editor remedy"
+grep -q '2 live session(s) were handed an account when they launched' <<<"$lout" && ok "a chat handed another account is not called a bypass" || no "$lout"
+grep -q "pid $B3 .*carries 'other'; the folder uses 'lsprof'" <<<"$lout" && ok "…naming the account it carries" || no "$lout"
+grep -q "pid $B4 .*carries (token override)" <<<"$lout" && ok "a token override is named as one" || no "$lout"
+grep -q NEVERPRINTME <<<"$full" && no "doctor printed a token override's VALUE" || ok "…and its value is never printed"
+for p in "$B2" "$B5" "$B6" "$B7"; do grep -q "pid $p " <<<"$lout" && no "pid $p was flagged: $lout"; done
+grep -q "pid $B5 \\|pid $B6 " <<<"$lout" || ok "a profile blanked by a dead refresh token expects (global), as the launcher does"
+grep -q "pid $B2 \\|pid $B7 " <<<"$lout" || ok "chats on their folder's account are not flagged"
+# A Keychain probe ERROR is not "signed in": whether the profile is usable now is unknown, so a
+# chat with no account variable cannot be called a bypass.
+eout=$(SEC_MODE=err X doctor --no-refresh 2>&1 | sed -n '/^live sessions/,$p')
+grep -q "pid $B1 " <<<"$eout" && no "a Keychain probe error became a bypass verdict: $eout" || ok "a Keychain probe error leaves a chat with no account variable unjudged"
+stop "$B1" "$B2" "$B3" "$B4" "$B5" "$B6" "$B7"
+
+# The launchers resolve the LOGICAL path ($PWD) and lsof gives the physical one. A rule stored
+# through a symlink (add keeps that spelling) must not make a correctly routed chat look wrong;
+# but a PWD naming some other directory is a parent's, left behind by a launcher that never
+# ran, and must not hide a bypass. A folder that moved after launch is judged where it was.
+mkdir -p "$T/real/Proj" "$T/MV/Proj" "$T/RR"; ln -s "$T/real" "$T/link"
+X add "$T/link/Proj" lnprof >/dev/null 2>&1; sign lnprof
+X add "$T/RR" rrprof >/dev/null 2>&1; sign rrprof
+sleep 2
+fake "$T/link/Proj" CLAUDE_SECURESTORAGE_CONFIG_DIR="$T/profiles/lnprof"; K1=$!
+( cd "$T/LS" && exec env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN PWD=/ python3 "$FAKE" ) & K2=$!
+fake "$T/MV/Proj"; K3=$!                                         # unrouted, on global: correct
+sleep 1
+mv "$T/MV/Proj" "$T/RR/Proj"                                     # …then moved under a routed root
+lout=$(live)
+grep -q "pid $K1 " <<<"$lout" && no "a chat routed through a symlinked rule was flagged: $lout" || ok "a rule stored through a symlink: the correctly routed chat is not flagged"
+grep -q "pid $K2 .*is on (global); the folder uses 'lsprof'" <<<"$lout" && ok "…while a parent's leftover PWD does not hide a bypass" || no "$lout"
+grep -q "pid $K3 " <<<"$lout" && no "a folder moved after launch was judged where it is now: $lout" || ok "a folder moved after launch is judged where the launcher saw it"
+stop "$K1" "$K2" "$K3"
+
+# Signing a folder's profile in changes where its new chats go, but moves neither the map nor
+# profiles/. A chat opened while the profile was signed out went to (global) by design, so it
+# is stale afterwards, never a bypass. The REAL login writes the marker — in a sandbox HOME, so
+# it cannot read the label from this machine's ~/.claude.json.
+mkdir -p "$T/LI" "$T/home"; X add "$T/LI" liprof >/dev/null 2>&1    # rule first, profile not signed in
+sleep 2
+fake "$T/LI"; L1=$!                                              # the launcher fell back to (global)
+sleep 2
+sign liprof; HOME="$T/home" PTY "" login liprof >/dev/null 2>&1
+[ -f "$T/profiles/liprof/.login-attempted" ] && ok "login leaves its marker behind" || no "login wrote no .login-attempted"
+lout=$(live)
+grep -q "pid $L1 .*still on (global) from when it opened; the folder now uses 'liprof'" <<<"$lout" && ok "a chat opened before its profile was signed in is stale, not a bypass" || no "$lout"
+stop "$L1"
+
+# `use` is a routing change that lives in profiles/, not in the map.
+mkdir -p "$T/FB" "$T/profiles/fbprof"; sign fbprof
+fake "$T/FB"; F1=$!                                              # unrouted, on global: correct then
+sleep 2
+X use fbprof >/dev/null 2>&1
+sleep 2
+fake "$T/FB"; F2=$!                                              # after it, with no account
+sleep 1
+lout=$(live)
+grep -q "pid $F1 .*still on (global) from when it opened; the folder now uses 'fbprof', the account selected with use" <<<"$lout" && ok "a chat opened before 'use' is stale afterwards" || no "$lout"
+grep -q "pid $F2 .*is on (global); the folder uses 'fbprof', the account selected with use" <<<"$lout" && ok "…and one opened after it with no account is a bypass" || no "$lout"
+stop "$F1" "$F2"; X use global >/dev/null 2>&1
+
+fake "$T/LS" CLAUDE_SECURESTORAGE_CONFIG_DIR="$T/profiles/lsprof"; G1=$!
+fake "$T/UN"; G2=$!
+sleep 1
+live | grep -q '2 live session(s), each on its folder.s account' && ok "all-correct chats get the all-clear" || no "$(live)"
+stop "$G1" "$G2"
+
+# An environment ps cannot read. Built from bash, which this macOS hides; where an OS does show
+# it, the case cannot be staged this way and is skipped rather than passed.
+printf 'for i in $(seq 600); do sleep 1; done\n' > "$FAKE-sh"
+( cd "$T/LS" && exec env PROBE_SEEN=1 bash "$FAKE-sh" ) & H1=$!
+sleep 1
+if ps eww -o command= -p "$H1" | tr ' ' '\n' | grep -qx 'PROBE_SEEN=1'; then
+  echo "  SKIP  this OS shows a bash process's environment, so an unreadable one cannot be staged"
+else
+  lout=$(live)
+  grep -q 'could not read the environment of 1 live session(s)' <<<"$lout" && ok "an unreadable environment is reported as unknown" || no "$lout"
+  grep -q "pid $H1 .*(global)" <<<"$lout" && no "an unreadable environment was called (global)" || ok "…and never as (global)"
+  grep -q 'QUIT and reopen' <<<"$lout" && no "an unreadable environment was called a bypass" || ok "…or as a bypass"
+fi
+stop "$H1"
+
 finish

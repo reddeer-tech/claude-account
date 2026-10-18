@@ -102,7 +102,7 @@ Day to day you run nothing: open the project and work.
 | `create <profile>` | new profile with no path bound, and the browser sign-in, in one command - bind a path later with `add <path> <profile>`, or never |
 | `use <profile>` / `use global` | point every path with no rule at that profile / back at your global account - switch the machine's "default" account at ease; no credential is copied or replaced (`fallback` is the older name, same command) |
 | `use` / `use -q` | show what is selected / just the name, for scripts |
-| `login` / `logout` / `refresh` | credentials; `refresh` renews an expired access token |
+| `login` / `logout` / `refresh` | credentials; `refresh` renews an expired access token. A sign-in itself lasts about four weeks from `login`, however much it is used - `list`, `profiles` and `doctor` warn five days ahead, and only `login` renews it |
 | `doctor` / `setup` | health check; and one-time PATH + VS Code wiring |
 | `export` / `import` | move rules and labels to another machine |
 
@@ -119,7 +119,8 @@ Resolved **once, at process launch**, by a `PATH` shim for the terminal and by
 so a `PATH` shim never reaches it.
 
 A running session is therefore frozen to its launch-time routing. After `pause` or `switch`,
-restart the session - `claude -c` resumes it with full context.
+restart the session - `claude -c` resumes it with full context. `claude-account doctor` lists
+any open chat still on the account it started with.
 
 ## Caveats
 
