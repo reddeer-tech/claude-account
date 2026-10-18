@@ -4,7 +4,12 @@
 # history always stay shared from ~/.claude.
 # Docs: https://github.com/reddeer-tech/claude-account
 set -uo pipefail
-CA_VERSION="1.2.2"   # kept in step with package.json by `make version`
+# ⚠ Every python3 here runs with -I (1.2.3, found by a security review). `python3 -c` and
+# `python3 -` put the CURRENT directory first on sys.path, so a json.py or re.py in the folder
+# you ran claude-account from — a cloned repo, say — ran as you, and several of these sites
+# are handed a whole credential on stdin. -I leaves out the cwd, PYTHON* variables and user
+# site-packages; only the standard library is used. tests/test_core.sh fails on a bare one.
+CA_VERSION="1.2.3"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # How close a credential's SIGN-IN end must be before every identity line and doctor say so.
@@ -148,7 +153,7 @@ acct_identity(){ # <profile-dir or "" for global>
     # agree, or list/profiles/overview keep showing a plan for a dead credential.
     local _idn="global"; [ -n "${1:-}" ] && _idn=$(basename "$1")
     out=$(printf '%s' "$blob" | CA_ID_NAME="$_idn" CA_SIGNIN_WARN_SECS="$CA_SIGNIN_WARN_SECS" \
-          python3 -c "$ACCT_PY")
+          python3 -I -c "$ACCT_PY")
   fi
   if _use_colour; then
     case "$out" in
@@ -537,7 +542,7 @@ cmd_resume(){
 # MOST RECENT login in the shared ~/.claude.json. So capture it right after a login
 # and label the profile. Recorded-at-login, not live — labelled as such everywhere.
 capture_label(){ # <profile-dir>
-  local out; out=$(python3 - <<'CAPPY'
+  local out; out=$(python3 -I - <<'CAPPY'
 import json,os
 try:
     d=json.load(open(os.path.expanduser("~/.claude.json")))
@@ -900,7 +905,7 @@ if isinstance(e,dict):
     sys.exit(0)
 sys.exit(1)
 UPROBE
-usage_problem(){ printf '%s' "${1:-}" | python3 -c "$USAGE_PROBE_PY" 2>/dev/null; }
+usage_problem(){ printf '%s' "${1:-}" | python3 -I -c "$USAGE_PROBE_PY" 2>/dev/null; }
 
 # One fetch for both surfaces. `overview` fires one of these per credential back to back,
 # which can itself provoke the 429 it would then have to report, so a rate-limited answer
@@ -981,7 +986,7 @@ cmd_rename(){
 
   local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
   local tmp; tmp=$(mktemp)
-  python3 - "$MAP" "$old" "$new" "$tmp" <<'RNPY'
+  python3 -I - "$MAP" "$old" "$new" "$tmp" <<'RNPY'
 import sys
 m,old,new,tmp=sys.argv[1:5]
 lines=open(m).readlines()                      # READ FIRST
@@ -1394,7 +1399,7 @@ cmd_doctor(){
       # routed under a VS Code older than the setting, doctor all green.
       epid=$(pgrep -f "/Applications/$ea.app/Contents/MacOS/" 2>/dev/null | head -1)
       if [ -n "$epid" ]; then
-        est=$(ps -o lstart= -p "$epid" 2>/dev/null | python3 -c 'import sys,time
+        est=$(ps -o lstart= -p "$epid" 2>/dev/null | python3 -I -c 'import sys,time
 s=sys.stdin.read().strip()
 print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else "")' 2>/dev/null)
         emt=$(stat -f %m "$es" 2>/dev/null)
@@ -1435,7 +1440,7 @@ print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else "")' 2
     # "too old" (probe-honesty rule).
     local cver vres
     cver=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR "$rcb" --version 2>/dev/null | head -1)
-    vres=$(printf '%s' "$cver" | python3 -c "
+    vres=$(printf '%s' "$cver" | python3 -I -c "
 import sys
 toks = sys.stdin.read().split()
 tok = toks[0].lstrip('v') if toks else ''
@@ -1831,7 +1836,7 @@ cmd_switch(){
   # and unquoted argv would split a path containing a space — there are several here.
   # Repointing also clears any paused state — switching means "use this account now".
   local plist; plist=$(mktemp); printf '%s\n' "$hits" > "$plist"
-  python3 - "$MAP" "$target" "$tmp" "$plist" <<'SWPY'
+  python3 -I - "$MAP" "$target" "$tmp" "$plist" <<'SWPY'
 import sys
 m,target,tmp,plist=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
 paths={l.rstrip("\n") for l in open(plist) if l.strip()}
@@ -1929,19 +1934,19 @@ refresh_token_if_needed(){ # <profile-dir or "" for global> ; 0=ok 1=still bad 2
   local blob; blob=$(security find-generic-password -s "$svc" -w 2>/dev/null)
   [ -z "$blob" ] && return 3                      # no credential at all
   local exp rexp
-  exp=$(printf '%s' "$blob"  | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('expiresAt',0))" 2>/dev/null)
-  rexp=$(printf '%s' "$blob" | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('refreshTokenExpiresAt',0) or 0)" 2>/dev/null)
+  exp=$(printf '%s' "$blob"  | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('expiresAt',0))" 2>/dev/null)
+  rexp=$(printf '%s' "$blob" | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('refreshTokenExpiresAt',0) or 0)" 2>/dev/null)
   [ -z "$exp" ] || [ "$exp" = 0 ] && return 1
-  local now0; now0=$(python3 -c 'import time;print(int(time.time()*1000))')
+  local now0; now0=$(python3 -I -c 'import time;print(int(time.time()*1000))')
   # If the REFRESH token itself has expired, no amount of refreshing helps.
   [ -n "$rexp" ] && [ "$rexp" != 0 ] && [ "$rexp" -lt "$now0" ] && return 4
-  local now; now=$(python3 -c 'import time;print(int(time.time()*1000))')
+  local now; now=$(python3 -I -c 'import time;print(int(time.time()*1000))')
   [ "$exp" -gt "$now" ] && return 2      # still valid
   local rc2; rc2=$(real_claude) || return 1
   ( cd / && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
       ${pdir:+CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"} "$rc2" -p "hi" >/dev/null 2>&1 ) || true
   local exp2; exp2=$(security find-generic-password -s "$svc" -w 2>/dev/null \
-      | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('expiresAt',0))" 2>/dev/null)
+      | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('expiresAt',0))" 2>/dev/null)
   [ -n "$exp2" ] && [ "$exp2" -gt "$now" ] && return 0 || return 1
 }
 
@@ -2020,7 +2025,7 @@ cmd_usage(){
   local svc="Claude Code-credentials"
   [ -n "$pdir" ] && svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
   local tok; tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
-      | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
+      | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
   if [ -z "$tok" ]; then red "No login for '$name'."; dim "  claude-account login $name"; exit 1; fi
   echo "USAGE — $name${label:+  ($label)}"
   echo
@@ -2033,7 +2038,7 @@ cmd_usage(){
     dim "  access token expired — refreshing…"
     if refresh_token_if_needed "$pdir"; then
       tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
-            | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
+            | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
       body=$(usage_fetch "$tok")
     fi
     printf '%s' "$body" | grep -q 'authentication_error' && { red "  could not refresh — sign in again:  claude-account login $name"; exit 1; }
@@ -2042,7 +2047,7 @@ cmd_usage(){
   if _why=$(usage_problem "$body"); then red "  $_why"; exit 1; fi
   local _hn="global"; [ -n "$pdir" ] && _hn="$name"
   printf '%s' "$body" | CA_COLOUR="$CA_COLOUR" CA_HINT_NAME="$_hn" \
-      CA_HINT_EMAIL="$(label_email "$label")" python3 -c "$USAGE_PY"
+      CA_HINT_EMAIL="$(label_email "$label")" python3 -I -c "$USAGE_PY"
   echo
   dim "  Live from api.anthropic.com/api/oauth/usage — the same source as /usage in-session."
 }
@@ -2056,7 +2061,7 @@ cmd_global(){
         yel "Interactive — run in your own terminal:"; echo; echo "    claude-account global login"; exit 3; fi
       env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN "$rc" auth login --claudeai
       mkdir -p "$PROFILES"
-      python3 - <<'GLPY' > "$PROFILES/.global-account" 2>/dev/null || true
+      python3 -I - <<'GLPY' > "$PROFILES/.global-account" 2>/dev/null || true
 import json,os
 try:
     a=(json.load(open(os.path.expanduser("~/.claude.json"))).get("oauthAccount") or {})
@@ -2079,7 +2084,7 @@ acct_is_expired(){ # <profile-dir or "" for global> ; 0 = expired
   [ -n "${1:-}" ] && svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
   local blob; blob=$(security find-generic-password -s "$svc" -w 2>/dev/null)
   [ -z "$blob" ] && return 1
-  printf '%s' "$blob" | python3 -c "
+  printf '%s' "$blob" | python3 -I -c "
 import json,sys,time
 try: d=json.load(sys.stdin).get('claudeAiOauth') or {}
 except Exception: sys.exit(1)
@@ -2098,7 +2103,7 @@ acct_signin(){ # <profile-dir or "" for global>
   [ -n "${1:-}" ] && svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
   # Piped straight into python, never held in a variable: an assignment prints its value
   # under `bash -x`, and this one would be the whole credential.
-  security find-generic-password -s "$svc" -w 2>/dev/null | python3 -c '
+  security find-generic-password -s "$svc" -w 2>/dev/null | python3 -I -c '
 import json,sys,time,datetime
 try: o=json.load(sys.stdin).get("claudeAiOauth") or {}
 except Exception: raise SystemExit
@@ -2448,7 +2453,7 @@ usage_get(){ # <profile-dir or "" for global>
   CA_UG_KIND=err; CA_UG_TEXT=""; CA_UG_BODY=""
   [ -n "$pdir" ] && svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
   tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
-      | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
+      | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
   if [ -z "$tok" ]; then CA_UG_KIND=note; CA_UG_TEXT="(not signed in — no usage to fetch)"; return 0; fi
   body=$(usage_fetch "$tok")
   if printf '%s' "$body" | grep -q 'authentication_error\|token has expired'; then
@@ -2457,7 +2462,7 @@ usage_get(){ # <profile-dir or "" for global>
     refresh_token_if_needed "$pdir" >/dev/null 2>&1; local _rrc=$?
     if [ "$_rrc" = 0 ] || [ "$_rrc" = 2 ]; then
       tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
-            | python3 -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
+            | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
       body=$(usage_fetch "$tok")
     fi
     if printf '%s' "$body" | grep -q 'authentication_error'; then
@@ -2483,7 +2488,7 @@ usage_bars(){ # <profile-dir or "" for global>
   local _hn="global" _hl; _hl=$(global_label)
   if [ -n "$pdir" ]; then _hn=$(basename "$pdir"); _hl=$(profile_label "$pdir"); fi
   printf '%s' "$CA_UG_BODY" | CA_COLOUR="$CA_COLOUR" CA_HINT_NAME="$_hn" \
-      CA_HINT_EMAIL="$(label_email "$_hl")" python3 -c "$USAGE_PY"
+      CA_HINT_EMAIL="$(label_email "$_hl")" python3 -I -c "$USAGE_PY"
 }
 
 # One command for the whole picture: what `list` + `profiles` + `usage --all` each show,
@@ -2645,7 +2650,7 @@ cmd_list_json(){
       local si; case "$(acct_state "${d%/}")" in signed-in) si=true ;; absent) si=false ;; *) si=error ;; esac
       printf 'profile\t%s\t%s\t%s\n' "$nm2" "$si" "$(profile_label "${d%/}")"
     done
-  } | python3 -c '
+  } | python3 -I -c '
 import json, sys
 out = {"version": "", "fallback": None, "rules": [], "profiles": []}
 for line in sys.stdin:
@@ -2903,7 +2908,7 @@ cmd_unbind(){
             # emptied the map), and unquoted argv would split a path with a space.
             local plist; plist=$(mktemp); printf '%s\n' "$hits" > "$plist"
             local tmp; tmp=$(mktemp)
-            python3 - "$MAP" "$tmp" "$plist" <<'RMPY'
+            python3 -I - "$MAP" "$tmp" "$plist" <<'RMPY'
 import sys
 m,tmp,plist=sys.argv[1],sys.argv[2],sys.argv[3]
 drop={l.rstrip("\n") for l in open(plist) if l.strip()}
@@ -2936,7 +2941,7 @@ RMPY
   local nmatch; nmatch=$(awk -F'\t' -v p="$path" '$1 !~ /^[ \t]*#/ && $1==p' "$MAP" 2>/dev/null | grep -c .)
   [ "$nmatch" -gt 1 ] && yel "note: $nmatch duplicate rows for this path — removing all of them."
   local tmp; tmp=$(mktemp)
-  python3 - "$MAP" "$path" "$tmp" <<'PY'
+  python3 -I - "$MAP" "$path" "$tmp" <<'PY'
 import sys
 m,p,tmp=sys.argv[1],sys.argv[2],sys.argv[3]
 lines=open(m).readlines()                      # READ FIRST — open(...,"w") truncates
@@ -3159,7 +3164,7 @@ cmd_forget(){
       local before; before=$(grep -v '^#' "$MAP" | grep -c . || true)
       local nrm; nrm=$(printf '%s' "$still" | grep -c .)
       local tmp; tmp=$(mktemp)
-      python3 - "$MAP" "$name" "$tmp" <<'FGPY'
+      python3 -I - "$MAP" "$name" "$tmp" <<'FGPY'
 import sys
 m,n,tmp=sys.argv[1],sys.argv[2],sys.argv[3]
 def keep(l):
@@ -3453,12 +3458,13 @@ GROUPSPY
 
 # The accounts that exist, in the default order: (global) first, then the profiles by name.
 ca_accounts(){ printf '(global)\n'; local d; for d in "$PROFILES"/*/; do [ -d "$d" ] && basename "$d"; done; }
-groups_py(){ CA_ACCOUNTS="$(ca_accounts)" python3 -c "$GROUPS_PY" "$CA_GROUPS_FILE" "$@"; }
+groups_py(){ CA_ACCOUNTS="$(ca_accounts)" python3 -I -c "$GROUPS_PY" "$CA_GROUPS_FILE" "$@"; }
 # Arranged at all? Until you make a group or an order, every view looks exactly as before.
 groups_on(){ [ -f "$CA_GROUPS_FILE" ] && groups_py configured; }
 groups_write(){ # <subcommand> [args…]
   map_lock || exit 1
-  if [ -f "$CA_GROUPS_FILE" ]; then mkdir -p "$BK"; cp "$CA_GROUPS_FILE" "$BK/groups.tsv.$(date +%Y%m%d-%H%M%S)-$1" 2>/dev/null; fi
+  # -$$: two writes in one second (holding ] in the view) must not share one backup name
+  if [ -f "$CA_GROUPS_FILE" ]; then mkdir -p "$BK"; cp "$CA_GROUPS_FILE" "$BK/groups.tsv.$(date +%Y%m%d-%H%M%S)-$1-$$" 2>/dev/null; fi
   groups_py "$@"
 }
 
@@ -3564,14 +3570,14 @@ ui_path(){
   done
   return 1
 }
-ui_ready(){ ui_path >/dev/null && python3 -c 'import curses' >/dev/null 2>&1; }
+ui_ready(){ ui_path >/dev/null && python3 -I -c 'import curses' >/dev/null 2>&1; }
 cmd_ui(){
   local ui; ui=$(ui_path) || { red "the full-screen view is not installed here (ui.py not found)"; dim "  claude-account overview prints the same picture"; exit 1; }
   if [ ! -t 0 ] || [ ! -t 1 ]; then
     red "claude-account ui needs a terminal — in a script use: claude-account overview"; exit 2; fi
-  python3 -c 'import curses' >/dev/null 2>&1 || { red "this python3 has no curses module, which the full-screen view needs"; dim "  claude-account overview prints the same picture"; exit 1; }
+  python3 -I -c 'import curses' >/dev/null 2>&1 || { red "this python3 has no curses module, which the full-screen view needs"; dim "  claude-account overview prints the same picture"; exit 1; }
   local self; self="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)/$(basename "$_ca_self")"
-  CA_SELF="$self" exec python3 "$ui"
+  CA_SELF="$self" exec python3 -I "$ui"
 }
 
 # Everything the view shows, as one JSON object. No network and no refresh: usage comes
@@ -3603,7 +3609,7 @@ for name, state, ident, label, sl, sd in accts:
     is_g = name == GLOBAL
     paths = []
     if is_g:
-        paths = [{"path": p, "state": "pinned", "dest": GLOBAL} for p, n, st, why in rules if st == "paused" and why == "global"]
+        paths = [{"path": p, "state": "pinned", "dest": GLOBAL, "bound": n} for p, n, st, why in rules if st == "paused" and why == "global"]
     else:
         for p, n, st, why in rules:
             if n != name: continue
@@ -3632,24 +3638,45 @@ print(json.dumps({"version": version, "fallback": fb, "machine": machine, "accou
 UISTATEPY
 cmd_ui_state(){
   local fb; fb=$(get_fallback 2>/dev/null) || fb=""
+  # Each account's line reads its login three times (identity, state, sign-in end), about
+  # 0.18 s an account, and the view waits for this after every action: one after another it
+  # took 1.4-1.5 s for 8 accounts (2026-10-18). So the lines are read side by side, each into
+  # its own numbered file, and printed in order. No temp dir: one after another, as before.
+  local par n=0 d j rc
+  par=$(mktemp -d "${TMPDIR:-/tmp}/ca-ui.XXXXXX" 2>/dev/null) || par=""   # the view parses stdout+stderr as JSON
+  if [ -n "$par" ]; then
+    ui_acct_line "" "(global)" > "$par/0" &
+    for d in "$PROFILES"/*/; do
+      [ -d "$d" ] || continue; n=$((n + 1))
+      ui_acct_line "${d%/}" "$(basename "$d")" > "$par/$n" &
+    done
+    wait
+  fi
   {
     printf 'meta\t%s\t%s\t%s\n' "$CA_VERSION" "$fb" "$CA_SIGNIN_WARN_SECS"
-    ui_acct_line "" "(global)"
-    local d; for d in "$PROFILES"/*/; do [ -d "$d" ] || continue; ui_acct_line "${d%/}" "$(basename "$d")"; done
+    if [ -n "$par" ]; then
+      for ((j = 0; j <= n; j++)); do cat "$par/$j"; done
+    else
+      ui_acct_line "" "(global)"
+      for d in "$PROFILES"/*/; do [ -d "$d" ] || continue; ui_acct_line "${d%/}" "$(basename "$d")"; done
+    fi
     while IFS=$'\t' read -r pth nm st why _r || [ -n "${pth:-}" ]; do
       case "$pth" in ''|\#*) continue;; esac; [ -z "${nm:-}" ] && continue
       printf 'rule\t%s\t%s\t%s\t%s\n' "$pth" "$nm" "${st:-active}" "${why:-}"
     done < "$MAP"
-  } | CA_GROUPS_JSON="$(groups_py json)" python3 -c "$UISTATE_PY"
+  } | CA_GROUPS_JSON="$(groups_py json)" python3 -I -c "$UISTATE_PY"
+  rc=$?
+  [ -n "$par" ] && [ -d "$par" ] && rm -rf -- "$par"
+  return "$rc"
 }
 cmd_ui_usage(){ # <profile|global> -> one JSON object
   local t="${1:-global}" pdir=""
   [ "$t" != global ] && pdir="$PROFILES/$t"
   usage_get "$pdir"
   case "$CA_UG_KIND" in
-    ok)   printf '%s' "$CA_UG_BODY" | CA_USAGE_JSON=1 python3 -c "$USAGE_PY" ;;
-    note) python3 -c 'import json,sys; print(json.dumps({"rows": [], "note": sys.argv[1]}))' "$CA_UG_TEXT" ;;
-    *)    python3 -c 'import json,sys; print(json.dumps({"rows": [], "problem": sys.argv[1]}))' "$CA_UG_TEXT" ;;
+    ok)   printf '%s' "$CA_UG_BODY" | CA_USAGE_JSON=1 python3 -I -c "$USAGE_PY" ;;
+    note) python3 -I -c 'import json,sys; print(json.dumps({"rows": [], "note": sys.argv[1]}))' "$CA_UG_TEXT" ;;
+    *)    python3 -I -c 'import json,sys; print(json.dumps({"rows": [], "problem": sys.argv[1]}))' "$CA_UG_TEXT" ;;
   esac
 }
 

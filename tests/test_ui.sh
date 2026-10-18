@@ -132,8 +132,23 @@ k Left; wait_for '▶ +alpha' 10 && ok "← hides the paths and goes back to the
 section "using an account for every path with no rule, and back"
 k Enter; wait_for 'Use it for every path with no rule' 15; k Down; k Enter; yes; popup_close
 wait_for "this machine: alpha" 30 && [ "$(cat "$T/profiles/.fallback" 2>/dev/null)" = alpha ] && ok "use, from the view, selects it — and the header says so" || no "$(scr | head -3)"
+# a paused path goes to the selected account, so the menu must not say (global) (review, 1.2.3)
+goto beta; k Enter; wait_for 'Pause its 1 path.s. — they use alpha meanwhile' 15 \
+  && ok "with alpha selected, pausing says beta's path would use alpha, not (global)" || no "$(scr)"
+k Escape; goto alpha
 k Enter; wait_for 'Stop using it' 15; k Down; k Enter; yes; popup_close
 wait_for 'this machine: \(global\)' 30 && [ ! -f "$T/profiles/.fallback" ] && ok "…and back to (global)" || no "$(scr | head -3)"
+
+section "a path pinned to (global) names the profile it goes back to"
+X switch "$T/B" global >/dev/null 2>&1
+k r; goto '\(global\)'; k Right; wait_for "└ $T/B +in use · pinned" 30 && ok "the pinned path shows under (global)" || no "$(scr | head -14)"
+k Down; wait_for "▶ +└ $T/B" 10
+k Enter; wait_for 'Send this path back to beta \(resume\)' 15 && ! scr | grep -q 'Resume this path on \(global\)' \
+  && ok "its menu says resume sends it back to beta — not 'resume on (global)'" || no "$(scr)"
+k Up; k Enter; wait_for 'Unbind .* from beta\? Its login stays' 15 && ok "…and unbind names beta too" || no "$(scr)"
+k Enter; sleep 1                      # No is highlighted: nothing changes
+awk -F'\t' -v p="$T/B" '$1==p && $4=="global"{f=1} END{exit !f}' "$M" && ok "…and saying No left it pinned" || no "$(cat "$M")"
+k Left; X resume "$T/B" >/dev/null 2>&1; k r; goto alpha
 
 section "groups, from the view"
 k g; wait_for 'Groups for alpha' 15 && ok "g opens the account's groups" || no "$(scr)"
@@ -202,11 +217,13 @@ wait_for 'failed \(exit [0-9]+\): claude-account add' 60 && ok "a command that f
 popup_close
 
 section "rename, label, the printed views, help"
+sign delta      # the security stub cannot copy a login on rename: give the new name one, so its usage can load
 goto gamma
 k Enter; wait_for 'Rename' 15; k Up; k Up; k Up; k Up; k Enter
 wait_for 'New name for the profile gamma' 15; TM send-keys -t ui C-u; lit "delta"; k Enter; yes
 wait_for "claude-account rename gamma delta" 60 && popup_close
 [ -d "$T/profiles/delta" ] && [ ! -d "$T/profiles/gamma" ] && ok "rename from the view moves the profile" || no "$(ls "$T/profiles")"
+wait_for 'delta +max .*week +34%' 60 && ok "…and the renamed account's usage loads without pressing r" || no "$(scr | head -12)"
 k m; wait_for 'Show a printed view' 15; for _ in 1 2 3 4 5 6 7 8; do k Down; done; k Enter
 wait_for 'Show the printed view' 15; k Enter
 wait_for 'CLAUDE ACCOUNTS' 60 && ok "the printed overview opens inside the view" || no "$(scr)"

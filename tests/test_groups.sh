@@ -102,6 +102,19 @@ grep -q 'stub' <<<"$st" && no "_ui-state printed the access token" || ok "…and
 python3 -I -c 'import json,sys; a=json.loads(sys.argv[1]); b=json.loads(sys.argv[2]); assert all(a[k]==b[k] for k in ("groups","order","layout"))' "$gj" "$st" \
   && ok "_ui-groups: the same groups, order and layout as _ui-state" || no "$gj"
 [ ! -s "$T/seclog" ] && ok "…without reading a single login" || no "_ui-groups called security: $(cat "$T/seclog")"
+# _ui-state reads the accounts side by side (1.2.3). With no temp dir it reads them one after
+# another, as before — the two must print the same thing, accounts in the same order.
+for p in p1 p2 p3 p4 p5 p6; do mkdir -p "$T/profiles/$p"; sign "$p"; done
+mkdir -p "$T/tmpdir"
+par=$(TMPDIR="$T/tmpdir" X _ui-state 2>&1); seq_=$(TMPDIR="$T/no-such-dir" X _ui-state 2>&1)
+[ -n "$par" ] && [ "$par" = "$seq_" ] && ok "_ui-state side by side prints exactly what one-after-another does" || no "they differ:
+$par
+---
+$seq_"
+python3 -I -c 'import json,sys; n=[a["name"] for a in json.loads(sys.argv[1])["accounts"]]; assert n[0]=="(global)" and n[1:]==sorted(n[1:]), n' "$par" \
+  && ok "…(global) first, then the profiles in name order" || no "$par"
+[ -z "$(ls -A "$T/tmpdir")" ] && ok "…and leaves no temp dir behind" || no "_ui-state left: $(ls -A "$T/tmpdir")"
+for p in p1 p2 p3 p4 p5 p6; do rm -rf "$T/profiles/$p"; done
 us=$(X _ui-usage alpha 2>&1)
 python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); k=[r["kind"] for r in d["rows"]]; assert k==["session","weekly_all"], k; assert d["rows"][0]["pct"]==40' "$us" \
   && ok "_ui-usage: the usage rows as JSON" || no "$us"

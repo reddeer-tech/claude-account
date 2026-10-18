@@ -825,4 +825,21 @@ else
 fi
 stop "$H1"
 
+section "a json.py in the folder you run it from is never imported"
+# `python3 -c` / `python3 -` put the cwd first on sys.path: before 1.2.3 a planted json.py ran
+# as you, with a credential on its stdin at some sites. Every python3 now runs with -I.
+bare=$(grep -nE 'python3( |$)' "$CA" | grep -vE '^[0-9]+: *#' | grep -vE 'python3 -I|python3 has')
+[ -z "$bare" ] && ok "every python3 in the CLI runs with -I" || no "bare python3: $bare"
+mkdir -p "$T/evil"
+for m in json re curses; do printf 'open("%s", "a").write("%s\\n")\n' "$T/evil/RAN" "$m" > "$T/evil/$m.py"; done
+( cd "$T/evil" && python3 -c 'import json' ) >/dev/null 2>&1
+[ -s "$T/evil/RAN" ] && ok "the planted modules do run for a plain python3 -c here (the probe works)" || no "the probe never fired"
+rm -f "$T/evil/RAN"
+X group Planted alpha >/dev/null 2>&1        # groups.tsv exists, so the views run the groups program too
+for v in list profiles verify overview group _ui-state _ui-groups "_ui-usage alpha" "usage alpha" doctor; do
+  ( cd "$T/evil" && X $v ) >/dev/null 2>&1
+done
+[ ! -e "$T/evil/RAN" ] && ok "…but no claude-account command run from that folder imports them" || no "imported: $(sort -u "$T/evil/RAN" | tr '\n' ' ')"
+X group --delete Planted >/dev/null 2>&1
+
 finish

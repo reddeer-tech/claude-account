@@ -115,8 +115,8 @@ class Model(object):
                     n = queue.pop(0)
                 one(n)
 
-        queue = [n for n in names]
         with self.lock:
+            queue = [n for n in dict.fromkeys(names) if n not in self.loading]
             self.loading.update(queue)
         # Two at a time: one call per account back to back is what provoked the 429s
         # overview had to learn to retry, and the CLI's fetch still retries once.
@@ -246,7 +246,7 @@ class App(object):
         self.m.reload()
         accts = [a["name"] for a in self.m.state.get("accounts", [])]
         if usage_for is None:
-            usage_for = [n for n in accts if n not in self.m.usage]
+            usage_for = [n for n in accts if n not in self.m.usage and n not in self.m.loading]
         if usage_for:
             self.m.fetch_usage([n for n in usage_for if n in accts])
 
@@ -266,6 +266,10 @@ class App(object):
             self.msg = ("refreshing %s's usage…" % ", ".join(names), 0)
         self.remember()
         self.build()
+
+    def machine(self):
+        """Where a paused path goes: the account selected with `use`, else (global)."""
+        return self.m.state.get("fallback") or GLOBAL
 
     def with_paths(self):
         return {a["name"] for a in self.m.state.get("accounts", []) if a.get("paths")}
@@ -351,7 +355,7 @@ class App(object):
                     for p in paths:
                         items.append({"kind": "path", "name": n, "path": p["path"],
                                       "state": p["state"], "dest": p.get("dest", ""),
-                                      "group": sec.get("section")})
+                                      "bound": p.get("bound") or n, "group": sec.get("section")})
                     if not paths:
                         items.append({"kind": "nopath", "name": n, "group": sec.get("section")})
         self.items = items
@@ -708,7 +712,7 @@ class App(object):
         rc, out = ca(args)
         cmd = "claude-account " + " ".join(args)
         if not (args[0] in ("group", "order") and self.m.reload_groups()):
-            self.load(usage_for=refetch or [])
+            self.load(usage_for=refetch)        # None: only accounts with no usage yet
         self.build()
         if rc == 0:
             self.msg = ("done: " + cmd, 1)
@@ -738,7 +742,7 @@ class App(object):
             pass
         curses.reset_prog_mode()
         self.scr.refresh()
-        self.load(usage_for=refetch or [])
+        self.load(usage_for=refetch)            # None: only accounts with no usage yet
         self.build()
         self.msg = (("done: " if rc == 0 else "exit %d: " % rc) + "claude-account " + " ".join(args),
                     1 if rc == 0 else -1)
@@ -852,7 +856,7 @@ class App(object):
         elif not glob:
             acts.append(("Stop using it for paths with no rule (back to (global))", "use-global"))
         if active and not glob:
-            acts.append(("Pause its %d path(s) — they use (global) meanwhile" % len(active), "pause"))
+            acts.append(("Pause its %d path(s) — they use %s meanwhile" % (len(active), self.machine()), "pause"))
         if paused:
             acts.append(("Resume its %d paused path(s)" % len(paused), "resume"))
         if active and not glob:
@@ -953,11 +957,16 @@ class App(object):
 
     def path_menu(self, it):
         p, name, st = it["path"], it["name"], it["state"]
+        # A row pinned with `switch <path> global` is listed under (global), but its rule is
+        # still bound to its own profile, and that is where resume and unbind act.
+        bound = it.get("bound") or name
         acts = []
         if st == "active":
-            acts.append(("Pause this path — it uses (global) meanwhile", "pause"))
+            acts.append(("Pause this path — it uses %s meanwhile" % self.machine(), "pause"))
+        elif st == "pinned":
+            acts.append(("Send this path back to %s (resume)" % bound, "resume"))
         else:
-            acts.append(("Resume this path on %s" % name, "resume"))
+            acts.append(("Resume this path on %s" % bound, "resume"))
         acts.append(("Switch this path to another account…", "switch"))
         acts.append(("Unbind this path (the login stays)", "unbind"))
         i = self.menu(tilde(p), [t for t, _ in acts])
@@ -966,13 +975,13 @@ class App(object):
         act = acts[i][1]
         if act == "pause" and self.confirm("Pause %s?" % tilde(p)):
             self.run(["pause", p])
-        elif act == "resume" and self.confirm("Resume %s on %s?" % (tilde(p), name)):
+        elif act == "resume" and self.confirm("Resume %s on %s?" % (tilde(p), bound)):
             self.run(["resume", p])
         elif act == "switch":
             dest = self.pick_account("Switch %s to…" % tilde(p), exclude=None)
             if dest and self.confirm("Move %s to %s?" % (tilde(p), dest)):
                 self.run(["switch", p, target(dest)])
-        elif act == "unbind" and self.confirm("Unbind %s from %s? Its login stays." % (tilde(p), name)):
+        elif act == "unbind" and self.confirm("Unbind %s from %s? Its login stays." % (tilde(p), bound)):
             self.run(["unbind", p])
 
     def signin_options(self):
