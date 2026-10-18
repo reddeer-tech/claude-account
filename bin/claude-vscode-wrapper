@@ -48,9 +48,10 @@ if [ -z "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" 
     # the slot, so the entry is present and a bare exit-0 probe read it as signed in. That
     # is the NORMAL end state of an expired refresh token. Treat it as exit 44 (not found)
     # so this takes the documented not-signed-in path: global + a loud per-launch warning.
-    # Anchored at the START on purpose — an mcpOAuth entry inside the same blob carries its
-    # own "accessToken":"" and must never trigger this.
-    case "$_blob" in '{"claudeAiOauth":{"accessToken":"",'*) _src=44 ;; esac
+    # Tied to the claudeAiOauth key, in either top-level order (newer Claude Code writes
+    # mcpOAuth first) — an mcpOAuth entry carries its own "accessToken":"" and must never
+    # trigger this, which is why it is not a bare substring match.
+    case "$_blob" in *'"claudeAiOauth":{"accessToken":"",'*) _src=44 ;; esac
     if [ "$_src" -eq 0 ]; then
       export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"
     elif [ "$_src" -ne 44 ]; then

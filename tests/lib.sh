@@ -41,16 +41,27 @@ while [ $# -gt 0 ]; do [ "$1" = "-s" ] && svc="$2"; [ "$1" = "-w" ] && w=1; shif
 # the entry EXISTS but its accessToken is "". Plan and tier survive, which is what used to
 # make it read as signed in. The mcpOAuth block carries its own empty accessToken on
 # purpose — a loose substring match on \"accessToken\":\"\" must not fire on a LIVE blob.
+# FAKE_MCP_FIRST=1 writes mcpOAuth FIRST, the order newer Claude Code uses (measured
+# 2026-10-18 on 5 of 8 real credentials): a blank check anchored at the start missed it.
 if grep -qxF "$svc" "$T_BLANK" 2>/dev/null; then
-  [ "$w" = 1 ] && printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"team","rateLimitTier":"default_raven"},"mcpOAuth":{"srv":{"accessToken":""}}}'
+  if [ "$w" = 1 ] && [ -n "${FAKE_MCP_FIRST:-}" ]; then
+    printf '{"mcpOAuth":{"srv":{"accessToken":""}},"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"team","rateLimitTier":"default_raven"}}'
+  elif [ "$w" = 1 ]; then
+    printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"team","rateLimitTier":"default_raven"},"mcpOAuth":{"srv":{"accessToken":""}}}'
+  fi
   exit 0
 fi
 # FAKE_ACCESS_EXPIRES_MS / FAKE_SIGNIN_ENDS_MS shape the signed-in blob: the access token's
 # expiry (default year 2100) and the refresh token's hard end, refreshTokenExpiresAt (default
 # absent — older credentials do not carry it, and absence must claim nothing).
 if grep -qxF "$svc" "$T_SIGNED" 2>/dev/null; then
-  [ "$w" = 1 ] && printf '{"claudeAiOauth":{"accessToken":"stub","subscriptionType":"max","rateLimitTier":"demo","expiresAt":%s%s},"mcpOAuth":{"srv":{"accessToken":""}}}' \
-    "${FAKE_ACCESS_EXPIRES_MS:-4102444800000}" "${FAKE_SIGNIN_ENDS_MS:+,\"refreshTokenExpiresAt\":$FAKE_SIGNIN_ENDS_MS}"
+  if [ "$w" = 1 ] && [ -n "${FAKE_MCP_FIRST:-}" ]; then
+    printf '{"mcpOAuth":{"srv":{"accessToken":""}},"claudeAiOauth":{"accessToken":"stub","subscriptionType":"max","rateLimitTier":"demo","expiresAt":%s%s}}' \
+      "${FAKE_ACCESS_EXPIRES_MS:-4102444800000}" "${FAKE_SIGNIN_ENDS_MS:+,\"refreshTokenExpiresAt\":$FAKE_SIGNIN_ENDS_MS}"
+  elif [ "$w" = 1 ]; then
+    printf '{"claudeAiOauth":{"accessToken":"stub","subscriptionType":"max","rateLimitTier":"demo","expiresAt":%s%s},"mcpOAuth":{"srv":{"accessToken":""}}}' \
+      "${FAKE_ACCESS_EXPIRES_MS:-4102444800000}" "${FAKE_SIGNIN_ENDS_MS:+,\"refreshTokenExpiresAt\":$FAKE_SIGNIN_ENDS_MS}"
+  fi
   exit 0
 fi
 exit 44
@@ -65,8 +76,12 @@ esac
 STUB
   # $FAKE_RESETS_AT overrides both reset timestamps, so a test can put the window in the
   # PAST — the branch that used to render a negative gap as a positive countdown.
+  # Each call is recorded — its arguments, and an Authorization header if one came on stdin —
+  # so a test can count usage calls and prove the token never rides on curl's argv.
   cat > "$T/bin/curl" <<'STUB'
 #!/bin/bash
+hdr=""; [ ! -t 0 ] && hdr=$(cat 2>/dev/null | grep -i '^Authorization:' | head -1)
+printf 'args:%s\n' "$*" >> "$T_CURLED"; [ -n "$hdr" ] && printf 'stdin:%s\n' "$hdr" >> "$T_CURLED"
 A="${FAKE_RESETS_AT:-2030-01-01T15:40:00Z}"; B="${FAKE_RESETS_AT:-2030-01-03T15:00:00Z}"
 printf '{"limits":[{"kind":"session","percent":40,"severity":"normal","resets_at":"%s"},{"kind":"weekly_all","percent":34,"severity":"normal","resets_at":"%s"}]}' "$A" "$B"
 STUB
@@ -82,6 +97,7 @@ STUB
   # writing to "$T/…" writes to "/…", fails silently, and every "nothing was opened"
   # assertion then passes for the wrong reason.
   export T_OPENED="$T/opened"; : > "$T_OPENED"
+  export T_CURLED="$T/curled"; : > "$T_CURLED"
   # doctor's live-sessions scan looks only at this sandbox's stand-in sessions, never at the
   # real Claude sessions on the machine: results stop depending on what is open, and each of
   # the ~36 doctor runs stops paying a ps + lsof per real session. The path is one the

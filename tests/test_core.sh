@@ -177,9 +177,15 @@ mkdir -p "$T/profiles/aband"
 # to run without one — so the earlier version of this guard compared coloured bytes to a
 # plain string and never fired in production, while this test passed under ca_sandbox's
 # NO_COLOR=1. Any assertion about a credential DECISION must run with colour on.
-out=$(PTYC '' login aband)
+# Two ways to end with nothing stored, both checked (1.2.0 told them apart): the sign-in
+# FAILS (claude auth login exits non-zero — abandoned, a bad code), or it says it worked and
+# nothing usable is there (2026-10-18: an open chat emptied it). Neither may write a label.
+out=$(FAKE_AUTH_RC=1 PTYC '' login aband)
 printf '%s' "$out" | grep -q 'Still not logged in' && ok "an abandoned login says so" || no "abandoned: $out"
 [ ! -f "$T/profiles/aband/.account" ] && ok "…and writes NO label" || no "label written: $(cat "$T/profiles/aband/.account")"
+out=$(PTYC '' login aband)
+printf '%s' "$out" | grep -q 'did not stick' && ok "a login that claims success and stores nothing says it did not stick" || no "no-stick: $out"
+[ ! -f "$T/profiles/aband/.account" ] && ok "…and writes NO label either" || no "label written: $(cat "$T/profiles/aband/.account")"
 mkdir -p "$T/profiles/good"; sign good
 out=$(PTYC '' login good)
 printf '%s' "$out" | grep -q "Profile 'good' is now:" && ok "a successful login reports the identity" || no "good: $out"
@@ -470,6 +476,63 @@ wout=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN \
 grep -qi 'not signed in\|NOT LOGGED IN' <<<"$wout" && ok "claude-whoami agrees" || no "whoami: $(grep -i account <<<"$wout")"
 
 
+section "an empty credential is found whatever order its keys are in"
+# 1.2.0. Newer Claude Code writes the blob with mcpOAuth FIRST. The 1.1.7 check was anchored
+# at the start, so it missed every blank such a client wrote: on 2026-10-18 outlook was blank
+# while doctor said "signed in", and the launchers would have routed new chats to it. Every
+# surface the 1.1.7 section checks, again, with the newer order.
+export FAKE_MCP_FIRST=1
+lst=$(X list --no-refresh 2>&1)
+grep -q 'deadprof.*NOT LOGGED IN' <<<"$lst" && ok "mcpOAuth first: list says NOT LOGGED IN" || no "list: $(grep deadprof <<<"$lst")"
+X profiles --no-refresh 2>&1 | grep -q 'deadprof.*NOT LOGGED IN' && ok "…profiles agrees" || no "profiles disagrees"
+dout=$(X doctor --no-refresh 2>&1)
+grep -qE 'deadprof.*(NOT signed in|not signed in)' <<<"$dout" && ok "…doctor agrees (it said signed in before)" || no "doctor: $(grep deadprof <<<"$dout")"
+grep -q 'liveprof: signed in' <<<"$dout" && ok "…and a live credential in the same order is still signed in" || no "live profile broken: $(grep liveprof <<<"$dout")"
+sout=$(cd "$T/Dead" && env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-shim" --version 2>&1)
+grep -qi 'not signed in' <<<"$sout" && ok "…the terminal shim falls back with the warning instead of routing to it" || no "shim: $sout"
+sout=$(cd "$T/Live" && env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-shim" --version 2>&1)
+grep -qi 'not signed in' <<<"$sout" && no "the shim called a live credential dead: $sout" || ok "…and routes a live one without a word"
+vout=$(cd "$T/Dead" && env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-vscode-wrapper" "$T/bin/claude" --version 2>&1)
+grep -qi 'not signed in' <<<"$vout" && ok "…the VS Code wrapper does the same" || no "wrapper: $vout"
+wp=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-whoami" --porcelain "$T/Dead" 2>&1 | cut -f3)
+[ "$wp" = no ] && ok "…and claude-whoami says not signed in (it said yes)" || no "whoami signed_in=$wp"
+wp=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-whoami" --porcelain "$T/Live" 2>&1 | cut -f3)
+[ "$wp" = yes ] && ok "…while a live one is yes" || no "whoami live signed_in=$wp"
+unset FAKE_MCP_FIRST
+# --porcelain's third field, every state. 1.1.7 used `return` at the top level there, which
+# bash refuses: a missing credential printed "error" and a blank one "yes".
+for st in "Dead:no" "Live:yes"; do d=${st%%:*}; want=${st#*:}
+  got=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-whoami" --porcelain "$T/$d" 2>&1)
+  [ "$(printf '%s' "$got" | cut -f3)" = "$want" ] && ! grep -q 'return' <<<"$got" && ok "porcelain, ${d} credential: $want" || no "porcelain $d: $got"
+done
+mkdir -p "$T/Never"; X add "$T/Never" neverprof >/dev/null 2>&1
+got=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-whoami" --porcelain "$T/Never" 2>&1)
+[ "$(printf '%s' "$got" | cut -f3)" = no ] && ok "porcelain, no credential at all: no (it said error)" || no "porcelain never: $got"
+got=$(SEC_MODE=err env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-whoami" --porcelain "$T/Live" 2>&1)
+[ "$(printf '%s' "$got" | cut -f3)" = error ] && ok "porcelain, a Keychain probe error: error, never yes or no" || no "porcelain err: $got"
+# The other decisions (1.2.0). Each used a bare exit status, so a blanked credential passed
+# for signed in everywhere below — in either key order.
+for order in "" 1; do
+  js=$(FAKE_MCP_FIRST=$order X list --json 2>&1)
+  python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); p={x["name"]:x["signed_in"] for x in d["profiles"]}; assert p["deadprof"] is False and p["liveprof"] is True, p' "$js" \
+    && ok "list --json: a blanked credential is signed_in false${order:+ (mcpOAuth first)}" || no "$js"
+done
+out=$(X switch "$T/Live" deadprof 2>&1)
+grep -q "'deadprof' is not signed in" <<<"$out" && ok "switch warns when the destination's login is empty" || no "$out"
+X switch "$T/Live" liveprof >/dev/null 2>&1
+mkdir -p "$T/Dead2"; out=$(X add "$T/Dead2" deadprof 2>&1)
+grep -q 'already signed in' <<<"$out" && no "add called a blanked profile signed in: $out" || ok "add does not call a blanked profile signed in"
+X unbind "$T/Dead2" >/dev/null 2>&1
+out=$(X create deadprof </dev/null 2>&1)
+grep -q 'exists and is signed in' <<<"$out" && no "create called it signed in: $out" || ok "create does not either"
+printf 'fallback\tdeadprof\n' > "$T/fb.tsv"; out=$(X import "$T/fb.tsv" 2>&1)
+grep -q "fallback 'deadprof' NOT applied" <<<"$out" && [ ! -f "$T/profiles/.fallback" ] && ok "import does not select a blanked profile machine-wide" || no "$out"
+grep -q 'claude-account login deadprof' <<<"$out" && ok "…and lists it among the profiles to sign in" || no "$out"
+X use deadprof --force >/dev/null 2>&1
+dout=$(X doctor --no-refresh 2>&1)
+grep -q "selected profile 'deadprof' is NOT signed in" <<<"$dout" && ok "doctor flags a selected profile whose login is empty" || no "$(grep -i 'selected\|deadprof' <<<"$dout")"
+X use global >/dev/null 2>&1
+
 section "reset-page points at the claude.ai reset, and never claims one exists"
 # 1.1.8. A limit reset ("Reset for free") is used on claude.ai → Settings → Usage. This tool
 # CANNOT see whether an account has one: the usage endpoint answers reset status with
@@ -606,6 +669,19 @@ dout=$(SEC_MODE=err X doctor --no-refresh 2>&1)
 grep -q 'siprof: could not read the credential' <<<"$dout" && ok "doctor reports a Keychain probe error on a profile as one" || no "$(grep siprof <<<"$dout")"
 grep -q '✓ siprof: signed in' <<<"$dout" && no "doctor called a probe error 'signed in'" || ok "…and never as signed in"
 
+section "a process is a Claude session by its executable, not by what its arguments mention"
+# A grep or tail of a Claude path matched doctor's process pattern and was reported as a live
+# session whose environment could not be read (2026-10-18). The rule, on the executables seen.
+icc(){ bash -c "$(grep '^is_claude_comm()' "$CA")"'; is_claude_comm "$1"' _ "$1"; }
+for c in "$HOME/.vscode/extensions/anthropic.claude-code-2.1.301-darwin-arm64/resources/native-binary/claude" \
+         "$HOME/.cursor/extensions/anthropic.claude-code-2.1.231-darwin-arm64/resources/native-binary/claude" \
+         "$HOME/.local/share/claude/versions/2.1.238" "$HOME/.local/bin/claude" claude; do
+  icc "$c" && ok "a session: $(printf "%s" "$c" | tail -c 44)" || no "not recognised as a session: $c"
+done
+for c in grep /usr/bin/grep /bin/zsh /usr/bin/tail less Python /opt/homebrew/bin/claude-account; do
+  icc "$c" && no "counted as a session: $c" || ok "not a session: $c"
+done
+
 section "doctor judges each live session the way the launcher would"
 # 1.1.9. A session keeps the routing it LAUNCHED with. doctor reported a chat opened while its
 # rule was paused as a launcher bypass and said to QUIT the editor; reopening that one chat
@@ -654,8 +730,12 @@ grep -q '2 live session(s) were handed an account when they launched' <<<"$lout"
 grep -q "pid $B3 .*carries 'other'; the folder uses 'lsprof'" <<<"$lout" && ok "…naming the account it carries" || no "$lout"
 grep -q "pid $B4 .*carries (token override)" <<<"$lout" && ok "a token override is named as one" || no "$lout"
 grep -q NEVERPRINTME <<<"$full" && no "doctor printed a token override's VALUE" || ok "…and its value is never printed"
-for p in "$B2" "$B5" "$B6" "$B7"; do grep -q "pid $p " <<<"$lout" && no "pid $p was flagged: $lout"; done
-grep -q "pid $B5 \\|pid $B6 " <<<"$lout" || ok "a profile blanked by a dead refresh token expects (global), as the launcher does"
+for p in "$B2" "$B5" "$B7"; do grep -q "pid $p " <<<"$lout" && no "pid $p was flagged: $lout"; done
+grep -q "pid $B5 " <<<"$lout" || ok "a profile blanked by a dead refresh token expects (global), as the launcher does"
+# B6 carries blprof, whose stored login is EMPTY: no routing complaint, but it is exactly the
+# kind of chat that can empty the next sign-in for blprof, so it is named as one (1.2.0).
+grep -q "pid $B6 .*on 'blprof', whose stored login is gone" <<<"$lout" && ok "a chat running on a login that is gone is named, to close before signing in again" || no "$lout"
+grep -E "pid $B6 .*(is on|carries|still on)" <<<"$lout" && no "B6 got a routing verdict too: $lout" || ok "…and gets no routing verdict on top"
 grep -q "pid $B2 \\|pid $B7 " <<<"$lout" || ok "chats on their folder's account are not flagged"
 # A Keychain probe ERROR is not "signed in": whether the profile is usable now is unknown, so a
 # chat with no account variable cannot be called a bypass.
@@ -714,6 +794,21 @@ fake "$T/UN"; G2=$!
 sleep 1
 live | grep -q '2 live session(s), each on its folder.s account' && ok "all-correct chats get the all-clear" || no "$(live)"
 stop "$G1" "$G2"
+
+# A login that says it worked and leaves nothing stored (2026-10-18: an open chat on the
+# profile emptied it) says it did not stick and names the chats that could have done it.
+mkdir -p "$T/NS"; X add "$T/NS" nostick >/dev/null 2>&1
+fake "$T/NS" CLAUDE_SECURESTORAGE_CONFIG_DIR="$T/profiles/nostick"; N1=$!
+sleep 1
+out=$(HOME="$T/home" PTY "" login nostick)
+grep -q 'did not stick' <<<"$out" && ok "a login that leaves nothing stored says it did not stick" || no "$out"
+grep -q "pid $N1 " <<<"$out" && ok "…naming the open chat on that profile, to close first" || no "$out"
+grep -q 'is now: NOT LOGGED IN' <<<"$out" && no "it still printed 'is now: NOT LOGGED IN'" || ok "…instead of 'is now: NOT LOGGED IN'"
+stop "$N1"
+out=$(HOME="$T/home" PTY "" login nostick)
+grep -q 'No chat on .nostick. is open now' <<<"$out" && ok "…and with no chat open, says so and to try again" || no "$out"
+out=$(FAKE_AUTH_RC=1 HOME="$T/home" PTY "" login nostick)
+grep -q 'Still not logged in' <<<"$out" && ! grep -q 'did not stick' <<<"$out" && ok "a sign-in that failed outright still just says so" || no "$out"
 
 # An environment ps cannot read. Built from bash, which this macOS hides; where an OS does show
 # it, the case cannot be staged this way and is skipped rather than passed.

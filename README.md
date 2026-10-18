@@ -86,8 +86,37 @@ claude-account usage --all            # live quota for every account
 
 Day to day you run nothing: open the project and work.
 
+### The full-screen view
+
+```sh
+claude-account            # in a terminal; also: claude-account ui
+```
+
+Every account in one screen, with its live usage, its paths and what each one is doing, in your
+own groups and order. Arrow keys move, Enter opens what you can do with the account or path under
+the cursor, `[` `]` move an account inside its group, `g` puts it in groups, `s` sorts for a moment
+by usage left or by when the sign-in ends, and `m` has the rest. Everything the commands below do
+can be done from there - each change runs the same `claude-account` command you would type and
+shows what it printed. Signing out and forgetting a profile ask you to type its name first. Piped
+or in a script, plain `claude-account` still prints `list`.
+
+### Groups and order
+
+```sh
+claude-account group clients every kindly     # a group (an account can be in several)
+claude-account group personal global gmail    # global is the global account
+claude-account order outlook gmail            # these first, in this order
+claude-account order --in clients kindly      # the order inside one group
+```
+
+`overview`, `profiles`, `list`, `verify` and the full-screen view all follow it. They look exactly
+as before until you make a group or an order. Kept in `~/.config/claude-accounts/groups.tsv`;
+`export` and `import` carry it to another Mac.
+
 | | |
 |---|---|
+| `ui` | the full-screen view (also plain `claude-account` in a terminal) |
+| `group` / `order` | your groups and order - `group --help`, `order --help` |
 | `overview` (alias `ov`) | the whole picture in one screen: every credential, its paths, live usage |
 | `statusline` | the account this session is spending - wire it into Claude Code's `statusLine` setting |
 | `vscode-status install\|remove\|status` | the status bar item for VS Code/Cursor naming the account each window's folder uses (`setup` installs it) |
