@@ -518,8 +518,10 @@ class App(object):
         if w - len(right) - 1 > x + 2:
             put(scr, 0, w - len(right) - 1, right, curses.A_DIM)
 
-        foot = " ↑↓ move  ⏎ actions  → paths  e %s all  [ ] reorder  g groups  m menu  s sort  r refresh  q quit" % (
-            "collapse" if self.all_expanded() else "expand")
+        # The key line: each key bold, what it does dim (Alexy, 2026-10-18), so the keys stand out
+        foot = [("↑↓", "move"), ("⏎", "actions"), ("→", "paths"),
+                ("e", "%s all" % ("collapse" if self.all_expanded() else "expand")), ("[ ]", "reorder"),
+                ("g", "groups"), ("m", "menu"), ("s", "sort"), ("r", "refresh"), ("q", "quit")]
         detail = self.detail_lines() if h >= 22 else []
         dh = min(len(detail), max(0, h - 14)) if detail else 0
         list_top, list_bot = 2, h - 3 - (dh + 1 if dh else 0)
@@ -571,7 +573,10 @@ class App(object):
         if text:
             put(scr, h - 2, 1, text.splitlines()[0] if text else "",
                 P("red") if kind < 0 else (P("green") if kind > 0 else curses.A_DIM))
-        put(scr, h - 1, 0, foot[:max(0, w - 1)], curses.A_DIM)
+        x = 1
+        for key, what in foot:
+            x = put(scr, h - 1, x, key, curses.A_BOLD)
+            x = put(scr, h - 1, x, " %s  " % what, curses.A_DIM)
         scr.noutrefresh()
         curses.doupdate()
 

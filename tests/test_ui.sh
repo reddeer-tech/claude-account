@@ -63,6 +63,23 @@ s=$(scr)
 grep -qE '▶ ● \(global\)' <<<"$s" && ok "the cursor starts on the first account, (global), marked as the machine's" || no "$s"
 grep -q 'gamma.*floating — no path' <<<"$s" && grep -q 'alpha.*1 path' <<<"$s" && ok "each row says what uses the account" || no "$s"
 grep -q '⏎ actions' <<<"$s" && ok "the keys are always on screen" || no "no key hints"
+# each key bold, what it does dim (1.2.4) — read from the attributes tmux reports for the last line
+TM capture-pane -p -e -t ui | tail -1 | python3 -I -c '
+import re, sys
+line = sys.stdin.read(); on = set(); seen = []
+for tok in re.split(r"(\x1b\[[0-9;]*m)", line):
+    if tok.startswith("\x1b["):
+        for c in (tok[2:-1] or "0").split(";"):
+            if c == "0": on = set()
+            elif c in ("1", "2"): on.add(c)
+    elif tok.strip():
+        seen.append((tok.strip(), "1" in on, "2" in on))
+keys = ["↑↓", "⏎", "→", "e", "[ ]", "g", "m", "s", "r", "q"]
+bold = [t for t, b, d in seen if b and not d]
+dim = [t for t, b, d in seen if d and not b]
+assert bold == keys, (bold, seen)
+assert "groups" in dim and "quit" in dim, dim
+' && ok "…each key bold, what it does dim" || no "the key line is not bold keys and dim labels"
 
 section "moving, and an account's paths"
 k Down; wait_for '▶ +alpha' 10 && ok "↓ moves to the next account" || no "$(scr | head -8)"
