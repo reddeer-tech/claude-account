@@ -24,7 +24,8 @@ ca_sandbox(){
          CLAUDE_ACCOUNTS_DIR="$T/profiles" \
          CLAUDE_ACCOUNTS_BACKUPS="$T/bk" \
          CLAUDE_ACCOUNTS_LIB="$REPO/libexec" \
-         NO_COLOR=1 CA_NO_REFRESH=1
+         NO_COLOR=1 CA_NO_REFRESH=1 \
+         CLAUDE_ACCOUNTS_NO_AUTOSETUP=1    # never the automatic setup: it writes into ~/bin, shell and editor files
   install -m 0600 "$REPO/templates/paths.map" "$CLAUDE_ACCOUNTS_MAP"
   mkdir -p "$T/profiles" "$T/bin"
 

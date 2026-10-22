@@ -38,23 +38,29 @@ git clone git@github.com:reddeer-tech/claude-account.git
 cd claude-account && ./install.sh
 ```
 
-### After installing - required
+### After installing - nothing to run
 
-```sh
-claude-account setup
-```
+The first `claude-account` command you run at a terminal sets everything up, and says what it did
+(never as root, in CI or from a script):
 
-**This step is not optional.** Until it runs, typing `claude` still starts the real binary and
-no rule you add has any effect. It installs the routing shims and the resolver into directories
-you own (`~/bin`, `~/.config/claude-accounts`), checks the shim wins on your `PATH`, and prints
-the one line each editor needs - VS Code, Cursor, Windsurf and VSCodium all launch the Claude
-binary by absolute path, so a `PATH` shim alone never reaches them. It is the same extension in
-every one of them; only the `settings.json` it reads differs, and `setup` names each file.
+- the routing launchers in `~/bin` and the resolver in `~/.config/claude-accounts`, so typing
+  `claude` picks the account by folder (with no rules yet it behaves exactly as before)
+- `~/bin` first on your `PATH`, when it is not already, as a marked block in your login shell's
+  profile (`~/.zprofile`, `~/.bash_profile`, or a fish `conf.d` file)
+- the `claudeCode.claudeProcessWrapper` line in each VS Code-family editor that has the Claude
+  extension, because those editors start Claude by absolute path and never see `PATH`. The file
+  keeps its comments, a backup is taken first, and the editor needs one restart
+- the status bar item that names each window's account, installed with the editor's own tool
 
-It only *reports* on `PATH` order and editor settings rather than changing them: both mean
-editing files you own - your shell profile, and a `settings.json` that is JSONC with comments.
+`claude-account doctor` shows the result. `claude-account setup` does the same with a full
+report, and puts back anything you removed by hand; `claude-account uninstall` takes all of it
+out again and keeps your rules, groups and logins. `CLAUDE_ACCOUNTS_NO_AUTOSETUP=1` turns the
+automatic part off. To put the launchers somewhere other than `~/bin`, run
+`CLAUDE_ACCOUNTS_BINDIR=<folder> claude-account setup` once; the folder must be your own and not
+writable by other users.
 
-Then `claude-account doctor` verifies the result.
+Anything you remove by hand later - the `PATH` block, the editor line, the status bar item -
+stays removed. A `claude` in `~/bin` that is not claude-account's is never touched.
 
 ### Updating
 
@@ -64,16 +70,8 @@ npm update -g claude-account       # npm
 git pull && ./install.sh           # from source
 ```
 
-then, whichever way you installed:
-
-```sh
-claude-account setup               # refreshes the shims and resolver in ~/bin and ~/.config
-claude-account doctor              # confirms every piece matches this version
-```
-
-`setup` is part of every update, not just the first install: the shims and the resolver live in
-directories you own, so a package upgrade cannot touch them. It changes nothing unless the
-shipped copies moved on, and `doctor` flags them whenever they are older than the CLI.
+That is all: the first command after an upgrade brings the launchers, the resolver and the
+status bar item up to date, once, and every command after that costs nothing extra.
 
 ## Use
 
@@ -136,7 +134,7 @@ as before until you make a group or an order. Kept in `~/.config/claude-accounts
 | `use <profile>` / `use global` | point every path with no rule at that profile / back at your global account - switch the machine's "default" account at ease; no credential is copied or replaced (`fallback` is the older name, same command) |
 | `use` / `use -q` | show what is selected / just the name, for scripts |
 | `login` / `logout` / `refresh` | credentials; `refresh` renews an expired access token. A sign-in itself lasts about four weeks from `login`, however much it is used - `list`, `profiles` and `doctor` warn five days ahead, and only `login` renews it |
-| `doctor` / `setup` | health check; and one-time PATH + VS Code wiring |
+| `doctor` / `setup` / `uninstall` | health check; set everything up with a full report (any command does it quietly, once per version); and take it all out again, keeping rules and logins |
 | `export` / `import` | move rules and labels to another machine |
 
 `claude-account --help` is the full reference.

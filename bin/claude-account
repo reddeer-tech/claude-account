@@ -9,7 +9,7 @@ set -uo pipefail
 # you ran claude-account from — a cloned repo, say — ran as you, and several of these sites
 # are handed a whole credential on stdin. -I leaves out the cwd, PYTHON* variables and user
 # site-packages; only the standard library is used. tests/test_core.sh fails on a bare one.
-CA_VERSION="1.2.7"   # kept in step with package.json by `make version`
+CA_VERSION="1.2.8"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # How close a credential's SIGN-IN end must be before every identity line and doctor say so.
@@ -281,7 +281,7 @@ global_ambiguous(){ # <verb>
 
 # Every command word, one list — the dispatch guard and create's shadow warning both
 # consult it, so adding a verb in one place covers both.
-CA_VERBS="list ls profiles logins overview ov label verify version doctor setup rename fallback use create export import usage refresh logout switch global status pause resume add remove rm login forget statusline undo vscode-status help"
+CA_VERBS="list ls profiles logins overview ov label verify version doctor setup rename fallback use create export import usage refresh logout switch global status pause resume add remove rm login forget statusline undo vscode-status uninstall help"
 
 # `none` is the token that CLEARS the fallback (claude-account use global), so a
 # profile by that name would make the clearing command ambiguous — the same trap as a
@@ -1317,6 +1317,30 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
 VSIXPY
 }
 
+# <label> <extensions dir> <app> <tool> <version> <.vsix> <scratch dir>: install the status bar item
+# into ONE editor through its own tool. 0 when the editor's record then names it with its folder;
+# 2 when the editor's tool is not there (the .vsix is left to install from the editor).
+vsitem_install_one(){
+  local el="$1" ex="$2" ea="$3" cn="$4" want="$5" vsix="$6" tmpd="$7" tool reg rver rok rloc f
+  if [ ! -f "$vsix" ]; then s_warn "$el: could not build the status bar item's package."; return 1; fi
+  tool=$(editor_cli "$ea" "$cn") || tool=""
+  if [ -z "$tool" ]; then
+    mkdir -p "$SETUP_CFG" && cp "$vsix" "$SETUP_CFG/"
+    s_warn "$el: its command-line tool was not found in $ea.app, so the status bar item was not installed. In $el: Extensions → … → Install from VSIX…, and pick $(tilde "$SETUP_CFG")/$(basename "$vsix")"
+    return 2
+  fi
+  if "$tool" --install-extension "$vsix" --force >"$tmpd/install.log" 2>&1 \
+     && reg=$(vscode_status_registered "$ex") && IFS=$'\t' read -r rver rok rloc <<<"$reg" \
+     && [ "$rver" = "$want" ] && [ "$rok" = yes ]; then
+    # folders copied in by setup 1.2.6 and earlier: the editor never recorded them
+    for f in "$ex"/"$VSC_ID"-*; do [ -d "$f" ] && [ "$f" != "$rloc" ] && rm -rf -- "$f"; done
+    s_did "$el: installed the Claude Account status bar item ($want)."
+    return 0
+  fi
+  s_warn "$el: the editor's tool did not install the status bar item — it said: $(tail -1 "$tmpd/install.log" 2>/dev/null)"
+  return 1
+}
+
 cmd_vscode_status(){
   local src; src=$(vscode_status_srcdir) || { red "cannot find the vscode-status source next to this install"; exit 1; }
   local want; want=$(vscode_status_version "$src") || want=""
@@ -1343,31 +1367,14 @@ cmd_vscode_status(){
         [ "$gate" = "--only-with-claude" ] && [ "$rver" = "$want" ] && [ "$rok" = yes ] && continue
         did=1
         [ -n "$tmpd" ] && { [ -f "$vsix" ] || vscode_status_vsix "$src" "$vsix"; }
-        if [ ! -f "$vsix" ]; then red "$el: could not build the status bar item's package"; continue; fi
-        if [ -z "$tool" ]; then
-          mkdir -p "$HOME/.config/claude-accounts" && cp "$vsix" "$HOME/.config/claude-accounts/"
-          yel "$el: its command-line tool was not found in $ea.app, so the item was not installed."
-          dim "  In $el: Extensions → … → Install from VSIX…, and pick"
-          dim "  $HOME/.config/claude-accounts/$(basename "$vsix")"
-          continue
-        fi
-        if "$tool" --install-extension "$vsix" --force >"$tmpd/install.log" 2>&1 \
-           && reg=$(vscode_status_registered "$ex") && IFS=$'\t' read -r rver rok rloc <<<"$reg" \
-           && [ "$rver" = "$want" ] && [ "$rok" = yes ]; then
-          # folders copied in by setup 1.2.6 and earlier: the editor never recorded them
-          for f in "$ex"/"$VSC_ID"-*; do
-            [ -d "$f" ] && [ "$f" != "$rloc" ] && rm -rf -- "$f"
-          done
-          grn "$el: installed the Claude Account status bar item ($want)."
-        else
-          red "$el: the editor's tool did not install the status bar item."
-          dim "  it said: $(tail -1 "$tmpd/install.log" 2>/dev/null)"
-        fi
+        ss_set "removed.item.$el"           # asked for by name: no longer a removal to respect
+        vsitem_install_one "$el" "$ex" "$ea" "$cn" "$want" "$vsix" "${tmpd:-/nonexistent}" && ss_set "added.item.$el" 1
         ;;
       remove)
         [ -n "$reg" ] && [ -n "$tool" ] && "$tool" --uninstall-extension "$VSC_ID" >/dev/null 2>&1
         local gone=0
         for f in "$ex"/"$VSC_ID"-*; do [ -d "$f" ] && { rm -rf -- "$f"; gone=1; }; done
+        ss_set "removed.item.$el" 1          # the automatic setup leaves it out from now on
         if [ -n "$reg" ] || [ "$gone" = 1 ]; then grn "$el: removed the status bar item."; did=1
         else dim "$el: not installed."; fi
         ;;
@@ -1397,144 +1404,664 @@ cmd_vscode_status(){
   return 0
 }
 
-cmd_setup(){
-  # Opt-in wiring. A package install deliberately does NOT do this: linking `claude` ahead of the
-  # real binary hijacks it for every caller, and npm/brew must never do that behind your back.
-  #
-  # TWO different directories, and conflating them is the bug this comment exists to prevent:
-  #   srcdir  where the shims SHIP  — inside the Cellar / node_modules, never on PATH
-  #   bindir  where they must LAND  — a dir you own and control the PATH order of
-  # Resolving the symlink gives the first; it must not be used as the second.
-  local self srcdir bindir
+read -r -d "" JSONC_PY <<'JSONCPY' || true
+# Read and edit an editor's settings.json, which is JSONC: comments and trailing commas allowed.
+#   get <file> <key>                              -> present<TAB><value> | absent | nofile | unparseable
+#   set <file> <key> <value> <backupdir> <label>  -> added | created | unparseable | present
+#   del <file> <key> <value> <backupdir> <label>  -> removed | absent | other | nofile | unparseable
+# Every edit keeps the rest of the file byte for byte, is proven to parse with every OTHER setting
+# unchanged before it is written, takes a backup first, follows a symlinked settings.json to its
+# target, and replaces the file atomically. Anything it cannot read with certainty it refuses.
+import json, os, shutil, sys, tempfile, time
+
+def lex(text):
+    toks, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n﻿":
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i); i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0: raise ValueError("an unterminated comment")
+            i = j + 2
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= n: raise ValueError("an unterminated string")
+            toks.append(("s", i, j + 1)); i = j + 1
+        elif c in "{}[],:":
+            toks.append((c, i, i + 1)); i += 1
+        else:
+            j = i
+            while j < n and text[j] not in " \t\r\n{}[],:\"/": j += 1
+            if j == i: raise ValueError("a stray character")
+            toks.append(("v", i, j)); i = j
+    return toks
+
+def strict(text, toks):
+    out = []
+    for k, (kind, s, e) in enumerate(toks):
+        if kind == "," and k + 1 < len(toks) and toks[k + 1][0] in "}]":
+            continue
+        out.append(text[s:e])
+    return " ".join(out)
+
+def members(text, toks):
+    """The top-level object's members [{key,k,vend,comma}], and the index of its closing brace."""
+    if not toks or toks[0][0] != "{": raise ValueError("not a settings object")
+    def value_end(p):
+        if toks[p][0] in "{[":
+            depth = 0
+            for q in range(p, len(toks)):
+                if toks[q][0] in "{[": depth += 1
+                elif toks[q][0] in "}]":
+                    depth -= 1
+                    if depth == 0: return q
+            raise ValueError("unbalanced brackets")
+        if toks[p][0] in "}],:": raise ValueError("a missing value")
+        return p
+    out, p = [], 1
+    while True:
+        if toks[p][0] == "}":
+            if p != len(toks) - 1: raise ValueError("text after the settings object")
+            return out, p
+        if toks[p][0] != "s" or toks[p + 1][0] != ":": raise ValueError("a malformed setting")
+        key = json.loads(text[toks[p][1]:toks[p][2]])
+        vend = value_end(p + 2)
+        comma = vend + 1 if toks[vend + 1][0] == "," else None
+        if comma is None and toks[vend + 1][0] != "}": raise ValueError("a missing comma")
+        out.append({"key": key, "k": p, "vend": vend, "comma": comma})
+        p = (comma + 1) if comma is not None else vend + 1
+
+def load(path):
+    text = open(path, encoding="utf-8", newline="").read()   # line endings exactly as they are
+    toks = lex(text)
+    obj = json.loads(strict(text, toks))
+    mem, _ = members(text, toks)
+    if not isinstance(obj, dict): raise ValueError("not a settings object")
+    if len({m["key"] for m in mem}) != len(mem): raise ValueError("a setting written twice")
+    return text, toks, obj, mem
+
+def check(new, want):
+    t2 = lex(new); o2 = json.loads(strict(new, t2)); members(new, t2)
+    if o2 != want: raise ValueError("the edit would change other settings")
+
+def write(path, new, bkdir, label):
+    real = os.path.realpath(path)
+    if os.path.exists(real):
+        # settings can hold tokens (claudeCode.environmentVariables): a private folder, private files
+        os.makedirs(bkdir, mode=0o700, exist_ok=True); os.chmod(bkdir, 0o700)
+        b = os.path.join(bkdir, "%s-settings.json.%s" % (label, time.strftime("%Y%m%d-%H%M%S")))
+        shutil.copy2(real, b); os.chmod(b, 0o600)
+    d = os.path.dirname(real); os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.json.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f: f.write(new)
+        if os.path.exists(real): shutil.copymode(real, tmp)
+        os.replace(tmp, real)
+    except BaseException:
+        if os.path.exists(tmp): os.unlink(tmp)
+        raise
+
+def main():
+    cmd, path, key = sys.argv[1], sys.argv[2], sys.argv[3]
+    if cmd == "get":
+        if not os.path.exists(path): print("nofile"); return
+        try: _, _, obj, _ = load(path)
+        except (OSError, ValueError, IndexError) as e: print("unparseable: %s" % e); return
+        if key not in obj: print("absent"); return
+        v = obj[key]; print("present\t%s" % (v if isinstance(v, str) else json.dumps(v))); return
+    value, bkdir, label = sys.argv[4], sys.argv[5], sys.argv[6]
+    member = "%s: %s" % (json.dumps(key), json.dumps(value))
+    if cmd == "set":
+        if not os.path.exists(path) or not open(path, encoding="utf-8", newline="").read().strip():
+            write(path, "{\n    %s\n}\n" % member, bkdir, label); print("created"); return
+        try:
+            text, toks, obj, mem = load(path)
+            if key in obj: print("present"); return
+            nl = "\r\n" if "\r\n" in text else "\n"
+            if not mem:
+                o, c = toks[0][2], toks[-1][1]
+                inner = text[o:c]
+                if inner.strip() == "":                      # {}  or  {\n}
+                    new = text[:o] + nl + "    " + member + nl + text[c:]
+                else:                                        # only comments inside: they follow it
+                    new = text[:o] + nl + "    " + member + inner + text[c:]
+            else:
+                ks = toks[mem[0]["k"]][1]; ls = text.rfind("\n", 0, ks) + 1
+                indent = text[ls:ks] if text[ls:ks].strip() == "" and text[ls:ks] else "    "
+                last = mem[-1]
+                anchor, prefix = (toks[last["comma"]][2], "") if last["comma"] is not None else (toks[last["vend"]][2], ",")
+                if last["comma"] is not None: member += ","     # the file ends its settings with commas: so does ours
+                eol = text.find("\n", anchor); eol = len(text) if eol < 0 else eol
+                if eol > 0 and text[eol - 1] == "\r": eol -= 1
+                rest = text[anchor:eol].strip()
+                if rest == "" or rest.startswith("//"):
+                    new = text[:anchor] + prefix + text[anchor:eol] + nl + indent + member + text[eol:]
+                else:
+                    new = text[:anchor] + prefix + nl + indent + member + text[anchor:]
+            want = dict(obj); want[key] = value
+            check(new, want)
+        except (OSError, ValueError, IndexError) as e:
+            print("unparseable: %s" % e); return
+        write(path, new, bkdir, label); print("added"); return
+    if cmd == "del":
+        if not os.path.exists(path): print("nofile"); return
+        try:
+            text, toks, obj, mem = load(path)
+            if key not in obj: print("absent"); return
+            if obj[key] != value: print("other"); return
+            i = next(n for n, m in enumerate(mem) if m["key"] == key); m = mem[i]
+            a = toks[m["k"]][1]
+            b = toks[m["comma"]][2] if m["comma"] is not None else toks[m["vend"]][2]
+            ls = text.rfind("\n", 0, a) + 1
+            if text[ls:a].strip() == "": a = ls
+            le = text.find("\n", b); le = len(text) if le < 0 else le
+            if text[b:le].strip() == "": b = min(le + 1, len(text))
+            edits = [(a, b)]
+            if m["comma"] is None and i > 0 and mem[i - 1]["comma"] is not None:
+                pc = toks[mem[i - 1]["comma"]][1]; edits.append((pc, pc + 1))
+            new = text
+            for s, e in sorted(edits, reverse=True): new = new[:s] + new[e:]
+            want = dict(obj); del want[key]
+            check(new, want)
+        except (OSError, ValueError, IndexError) as e:
+            print("unparseable: %s" % e); return
+        write(path, new, bkdir, label); print("removed"); return
+
+main()
+JSONCPY
+read -r -d "" PROFILE_PY <<'PROFPY' || true
+# The PATH block claude-account keeps in a login shell's startup file, between two marker lines.
+#   add <file> <bindir> <shell> <backupdir>  -> added | present | <error>
+#   del <file> <backupdir>                   -> removed | absent | <error>
+# Appends or removes ONLY its own marked lines; takes a backup first; follows a symlinked file to
+# its target; writes atomically; keeps line endings and permissions.
+import os, shutil, sys, tempfile, time
+BEGIN, END = "# >>> claude-account >>>", "# <<< claude-account <<<"
+
+def block(bindir, shell, nl):
+    q = bindir.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+    line = ('set -gx PATH "%s" $PATH' % q) if shell == "fish" else ('export PATH="%s:$PATH"' % q)
+    return nl.join([BEGIN, "# claude-account's launcher first on PATH. Remove with: claude-account uninstall", line, END]) + nl
+
+def read(path):
+    real = os.path.realpath(path)
+    return real, (open(real, encoding="utf-8", newline="").read() if os.path.exists(real) else None)
+
+def backup(real, bkdir):
+    # profiles often export tokens: a private folder, private files
+    os.makedirs(bkdir, mode=0o700, exist_ok=True); os.chmod(bkdir, 0o700)
+    b = os.path.join(bkdir, "%s.%s" % (os.path.basename(real).lstrip(".") or "profile", time.strftime("%Y%m%d-%H%M%S")))
+    shutil.copy2(real, b); os.chmod(b, 0o600)
+
+def write(real, new, bkdir):
+    if os.path.exists(real):
+        backup(real, bkdir)
+    d = os.path.dirname(real); os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(real) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f: f.write(new)
+        if os.path.exists(real): shutil.copymode(real, tmp)
+        else: os.chmod(tmp, 0o644)
+        os.replace(tmp, real)
+    except BaseException:
+        if os.path.exists(tmp): os.unlink(tmp)
+        raise
+
+def spans(text):
+    """[(start, end)] of every marked block, whole lines, in text order."""
+    out, i = [], 0
+    while True:
+        a = text.find(BEGIN, i)
+        if a < 0: return out
+        if a > 0 and text[a - 1] not in "\r\n": i = a + 1; continue      # not at a line start
+        b = text.find(END, a)
+        if b < 0: raise ValueError("an unclosed claude-account block")
+        e = text.find("\n", b); e = len(text) if e < 0 else e + 1
+        out.append((a, e)); i = e
+
+def main():
+    cmd, path = sys.argv[1], sys.argv[2]
+    try:
+        real, text = read(path)
+        if cmd == "add":
+            bindir, shell, bk = sys.argv[3], sys.argv[4], sys.argv[5]
+            # it becomes a line of shell: a newline in it would be a second command (security review)
+            if not bindir.startswith("/") or any(ord(ch) < 32 or ord(ch) == 127 for ch in bindir):
+                print("error: refusing a folder that is not absolute or holds a control character"); return
+            if text is not None and spans(text): print("present"); return
+            nl = "\r\n" if text and "\r\n" in text else "\n"
+            if text is None or text == "": new = block(bindir, shell, nl)
+            else: new = text + ("" if text.endswith(("\n", "\r")) else nl) + nl + block(bindir, shell, nl)
+            write(real, new, bk); print("added"); return
+        if cmd == "del":
+            bk = sys.argv[3]
+            if text is None: print("absent"); return
+            sp = spans(text)
+            if not sp: print("absent"); return
+            new = text
+            for a, e in reversed(sp):
+                # also the one blank line add put in front of it
+                if a >= 2 and new[a - 2:a] == "\n\n": a -= 1
+                elif a >= 4 and new[a - 4:a] == "\r\n\r\n": a -= 2
+                new = new[:a] + new[e:]
+            if new.strip() == "":       # nothing left but what we added (fish's conf.d file, or a profile setup created)
+                backup(real, bk); os.unlink(real); print("removed"); return
+            write(real, new, bk); print("removed"); return
+    except (OSError, ValueError) as e:
+        print("error: %s" % e)
+
+main()
+PROFPY
+
+# ── Setup: explicit and automatic (1.2.8) ──────────────────────────────────────────────────
+# `setup` is a list of STEPS, each with a check ("is this in place and current?") and an
+# action. `claude-account setup` runs every step and reports each one. Every other command runs
+# them too, quietly, but only ONCE per installed version: ~/.config/claude-accounts/.setup-state
+# records the version whose checks last ran, so after that a command pays one file read. A
+# later version that adds a step needs nothing else: on the first command after the upgrade the
+# stamp differs, the new step's check fails, and only that step does anything. (Alexy's design,
+# 2026-10-23.)
+#
+# claude-account's OWN files — the resolver and the two launchers — are always kept present and
+# current: they are the tool. What it puts into files that are NOT its own — the PATH block in a
+# shell profile, the wrapper line in an editor's settings — and the optional status bar item are
+# added ONCE per Mac and recorded in that state file. Removed by hand later, they stay removed:
+# doctor says so, and `claude-account setup` puts them back. `claude-account uninstall` removes
+# all of it, keeps rules, groups and logins, and turns the automatic run off until the next setup.
+#
+# ⚠ Never automatic when the config is redirected (CLAUDE_ACCOUNTS_MAP or CLAUDE_ACCOUNTS_DIR set):
+# that is every test sandbox, and an automatic run there would write into the REAL ~/bin, editor
+# settings and shell profile. CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 turns it off for one shell or a CI job.
+SETUP_MODE=explicit   # explicit | auto
+AUTOSETUP_NOTE=""     # the one line the full-screen view shows after an automatic run
+tilde(){ case "$1" in "$HOME") printf '~\n' ;; "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}" ;; *) printf '%s\n' "$1" ;; esac; }
+bold(){ printf '\033[1m%s\033[0m\n' "$*"; }
+SETUP_SAID=""         # auto: what changed or needs attention, printed once at the end
+SETUP_FIRST=0         # auto: this Mac had never been set up
+s_did(){  if [ "$SETUP_MODE" = auto ]; then SETUP_SAID+="  $1"$'\n'; else grn "$1"; fi; }
+SETUP_WARNINGS=""     # every warning of this run, kept for doctor in .setup-warnings
+s_warn(){ SETUP_WARNINGS+="$1"$'\n'; if [ "$SETUP_MODE" = auto ]; then SETUP_SAID+="  ! $1"$'\n'; else yel "$1"; fi; }
+s_info(){ [ "$SETUP_MODE" = auto ] || dim "$1"; }
+s_line(){ [ "$SETUP_MODE" = auto ] || echo "$1"; }
+
+SETUP_CFG="$HOME/.config/claude-accounts"
+SETUP_STATE="$SETUP_CFG/.setup-state"
+ss_get(){ # <key> -> its value, or nothing
+  [ -f "$SETUP_STATE" ] || return 0
+  awk -F= -v k="$1" '$1==k { sub(/^[^=]*=/, ""); print; exit }' "$SETUP_STATE" 2>/dev/null
+}
+ss_set(){ # <key> [value] — no value deletes the key. Written whole, then renamed into place.
+  mkdir -p "$SETUP_CFG" || return 1
+  local t; t=$(mktemp "$SETUP_STATE.XXXXXX") || return 1
+  { [ -f "$SETUP_STATE" ] && awk -F= -v k="$1" '$1!=k' "$SETUP_STATE"
+    [ $# -ge 2 ] && printf '%s=%s\n' "$1" "$2"; } > "$t"
+  mv -f "$t" "$SETUP_STATE"
+}
+
+# Where the package ships its pieces (SETUP_SRC…) and where the launchers land (SETUP_BIN).
+# <mode>: explicit (claude-account setup) honours CLAUDE_ACCOUNTS_BINDIR, or the older BINDIR;
+# auto and uninstall NEVER read the environment — a project's .envrc or a CI job commonly sets
+# BINDIR, and an automatic run that obeyed it could put a folder like `bin` (relative to wherever
+# you are) first on PATH (security review, 2026-10-23). Otherwise: the folder setup recorded, or
+# ~/bin. Whatever it is must pass bindir_ok; if not, SETUP_BIN_BAD says why and nothing is placed.
+setup_locate(){
+  local mode="${1:-explicit}" self t c from=default cand
   self="${BASH_SOURCE[0]:-$0}"
-  while [ -L "$self" ]; do
-    local t; t="$(readlink "$self")"
-    case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac
-  done
-  srcdir="$(cd "$(dirname "$self")" && pwd)"
-  bindir="${BINDIR:-$HOME/bin}"
-
-  mkdir -p "$bindir"
-  # The package's shipped copies. Source/npm keep the shims beside this script; Homebrew
-  # parks them unlinked in libexec/shims (so a package install can never hijack `claude`).
-  local pkg_shim="" pkg_wrap="" pkg_res=""
-  for c in "$srcdir/claude-shim" "$srcdir/../libexec/shims/claude-shim"; do [ -f "$c" ] && { pkg_shim="$c"; break; }; done
-  for c in "$srcdir/claude-vscode-wrapper" "$srcdir/../libexec/shims/claude-vscode-wrapper"; do [ -f "$c" ] && { pkg_wrap="$c"; break; }; done
-  for c in "$srcdir/../libexec/resolve.sh" "$srcdir/../lib/claude-account/resolve.sh"; do [ -f "$c" ] && { pkg_res="$c"; break; }; done
-
-  # The RESOLVER the shims run. They live in $bindir with no libexec beside them, so they
-  # find it at ~/.config/claude-accounts/resolve.sh — which only a source install used to
-  # create. A Homebrew-only machine therefore had NO resolver the shims could reach: rules
-  # were accepted and completely inert. Install it here, and refresh it on every setup so a
-  # `brew upgrade` cannot leave an old resolver under a new CLI.
-  local cfg="$HOME/.config/claude-accounts"
-  mkdir -p "$cfg" "$cfg/profiles"
-  # remember where the shims landed, so doctor checks the SAME place — its old
-  # hardcoded ~/bin contradicted setup's own BINDIR escape hatch
-  write_line "$cfg/.bindir" "$bindir"
-  if [ -n "$pkg_res" ]; then
-    if [ ! -f "$cfg/resolve.sh" ]; then
-      install -m 0755 "$pkg_res" "$cfg/resolve.sh"; grn "Installed the resolver into $cfg."
-    elif ! cmp -s "$pkg_res" "$cfg/resolve.sh"; then
-      install -m 0755 "$pkg_res" "$cfg/resolve.sh"; grn "Updated the resolver in $cfg to this version."
-    fi
-  elif [ -f "$cfg/resolve.sh" ]; then
-    dim "Resolver already in place ($cfg) — this copy ships none beside it."
-  else
-    yel "cannot find the package's libexec/resolve.sh next to $srcdir — the resolver was not installed."
+  while [ -L "$self" ]; do t="$(readlink "$self")"; case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac; done
+  SETUP_SRC="$(cd "$(dirname "$self")" && pwd)"
+  cand=$(head -1 "$SETUP_CFG/.bindir" 2>/dev/null || true); [ -n "$cand" ] && from=recorded
+  if [ "$mode" = explicit ]; then
+    if [ -n "${CLAUDE_ACCOUNTS_BINDIR:-}" ]; then cand=$CLAUDE_ACCOUNTS_BINDIR; from=env
+    elif [ -n "${BINDIR:-}" ]; then cand=$BINDIR; from=env; fi
   fi
-  [ -f "$cfg/paths.map" ] || { for c in "$srcdir/../templates/paths.map" "$srcdir/../share/claude-account/templates/paths.map"; do
-      [ -f "$c" ] && { install -m 0600 "$c" "$cfg/paths.map"; break; }; done; }
+  [ -n "$cand" ] || { cand="$HOME/bin"; from=default; }
+  SETUP_BIN="$cand"; SETUP_BIN_BAD=""
+  SETUP_BIN_BAD=$(bindir_ok "$cand" "$from") && SETUP_BIN_BAD=""
+  PKG_SHIM=""; PKG_WRAP=""; PKG_RES=""
+  for c in "$SETUP_SRC/claude-shim" "$SETUP_SRC/../libexec/shims/claude-shim"; do [ -f "$c" ] && { PKG_SHIM="$c"; break; }; done
+  for c in "$SETUP_SRC/claude-vscode-wrapper" "$SETUP_SRC/../libexec/shims/claude-vscode-wrapper"; do [ -f "$c" ] && { PKG_WRAP="$c"; break; }; done
+  for c in "$SETUP_SRC/../libexec/resolve.sh" "$SETUP_SRC/../lib/claude-account/resolve.sh"; do [ -f "$c" ] && { PKG_RES="$c"; break; }; done
+}
+# <dir> <where it came from> -> 0 when the launchers may go there; else prints why not.
+# Absolute and plain (no control characters: it is written into a shell profile and a JSON file);
+# yours and not writable by anyone else (or its nearest existing parent, when it does not exist
+# yet); and, when it came from an environment variable, not inside a git work tree — a cloned
+# repo's bin/ first on PATH would shadow every command with that repo's files.
+bindir_ok(){
+  local d="$1" from="$2" e mode
+  case "$d" in /*) ;; *) echo "it is not an absolute path"; return 1 ;; esac
+  case "$d" in *[[:cntrl:]]*) echo "it contains a control character"; return 1 ;; esac
+  [ "$d" = / ] && { echo "it is /"; return 1; }
+  e="$d"; while [ ! -e "$e" ] && [ "$e" != / ]; do e=$(dirname "$e"); done
+  [ -d "$e" ] || { echo "it is not a folder"; return 1; }
+  [ -O "$e" ] || { echo "$(tilde "$e") is not yours"; return 1; }
+  mode=$(stat -f %Lp "$e" 2>/dev/null) || mode=""
+  case "$mode" in *[2367]?|*?[2367]) echo "$(tilde "$e") can be written by other users (mode $mode)"; return 1 ;; esac
+  if [ "$from" = env ] && [ "$(git -C "$e" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
+    echo "$(tilde "$e") is inside a git repository"; return 1
+  fi
+  return 0
+}
+# ours = the launcher's own header line, in the first few hundred bytes, as every release since
+# 1.0.0 has carried (a file merely MENTIONING claude-accounts is not ours to overwrite or delete)
+is_our_launcher(){ [ -f "$1" ] && head -c 400 "$1" 2>/dev/null | grep -q '^# Per-path Claude account routing'; }
+is_our_wrapper(){ [ -f "$1" ] && head -c 400 "$1" 2>/dev/null | grep -q '^# VS Code `claudeCode.claudeProcessWrapper` target'; }
 
-  # The status bar extension's source. The shims live in $bindir with no package tree
-  # beside them, so keep a copy where the CLI can always find it — and refresh it on
-  # every setup so an upgrade cannot leave an older extension behind.
-  for c in "$srcdir/../vscode-status" "$srcdir/../share/claude-account/vscode-status"; do
+# Step 1 — the config dir and the resolver the launchers run.
+# The launchers live in SETUP_BIN with no libexec beside them, so they find the resolver at
+# ~/.config/claude-accounts/resolve.sh — kept current here, or a `brew upgrade` would leave an
+# old resolver under a new CLI (measured 2026-08-28: a Homebrew-only Mac routed NOTHING).
+setup_step_files(){
+  local c
+  mkdir -p "$SETUP_CFG" "$SETUP_CFG/profiles"
+  # remember where the launchers landed, so doctor and later runs check the SAME place
+  [ -z "$SETUP_BIN_BAD" ] && { [ "$(head -1 "$SETUP_CFG/.bindir" 2>/dev/null)" = "$SETUP_BIN" ] || write_line "$SETUP_CFG/.bindir" "$SETUP_BIN"; }
+  if [ -n "$PKG_RES" ]; then
+    if [ ! -f "$SETUP_CFG/resolve.sh" ]; then
+      install -m 0755 "$PKG_RES" "$SETUP_CFG/resolve.sh"; s_did "Installed the resolver into $SETUP_CFG."
+    elif ! cmp -s "$PKG_RES" "$SETUP_CFG/resolve.sh"; then
+      install -m 0755 "$PKG_RES" "$SETUP_CFG/resolve.sh"; s_did "Updated the resolver to $CA_VERSION."
+    fi
+  elif [ -f "$SETUP_CFG/resolve.sh" ]; then
+    s_info "Resolver already in place ($SETUP_CFG) — this copy ships none beside it."
+  else
+    s_warn "cannot find the package's libexec/resolve.sh next to $SETUP_SRC — the resolver was not installed."
+  fi
+  [ -f "$SETUP_CFG/paths.map" ] || { for c in "$SETUP_SRC/../templates/paths.map" "$SETUP_SRC/../share/claude-account/templates/paths.map"; do
+      [ -f "$c" ] && { install -m 0600 "$c" "$SETUP_CFG/paths.map"; break; }; done; }
+  # the status bar item's source, kept where the CLI can always find it
+  for c in "$SETUP_SRC/../vscode-status" "$SETUP_SRC/../share/claude-account/vscode-status"; do
     if [ -f "$c/extension.js" ]; then
-      mkdir -p "$cfg/vscode-status"
-      install -m 0644 "$c/extension.js"      "$cfg/vscode-status/extension.js"
-      install -m 0644 "$c/package.json.in"   "$cfg/vscode-status/package.json.in"
+      mkdir -p "$SETUP_CFG/vscode-status"
+      cmp -s "$c/extension.js" "$SETUP_CFG/vscode-status/extension.js" || install -m 0644 "$c/extension.js" "$SETUP_CFG/vscode-status/extension.js"
+      cmp -s "$c/package.json.in" "$SETUP_CFG/vscode-status/package.json.in" || install -m 0644 "$c/package.json.in" "$SETUP_CFG/vscode-status/package.json.in"
       break
     fi
   done
+  return 0
+}
 
-  # Shims already deployed and OURS: refresh them if the package's copy moved on.
-  if grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null && [ -n "$pkg_shim" ]; then
+# Step 2 — the two launchers (`claude` and the editor wrapper). Always kept current.
+setup_step_launchers(){
+  if [ -n "$SETUP_BIN_BAD" ]; then
+    s_warn "will not put the launchers in $SETUP_BIN: $SETUP_BIN_BAD. Choose a folder of your own that comes first on PATH:  CLAUDE_ACCOUNTS_BINDIR=\"\$HOME/.local/bin\" claude-account setup"
+    return 1
+  fi
+  mkdir -p "$SETUP_BIN"
+  if is_our_launcher "$SETUP_BIN/claude"; then
     local upd=0
-    cmp -s "$pkg_shim" "$bindir/claude" || { install -m 0755 "$pkg_shim" "$bindir/claude"; upd=1; }
-    [ -n "$pkg_wrap" ] && { cmp -s "$pkg_wrap" "$bindir/claude-vscode-wrapper" 2>/dev/null || { install -m 0755 "$pkg_wrap" "$bindir/claude-vscode-wrapper"; upd=1; }; }
-    [ "$upd" = 1 ] && grn "Updated the routing shims in $bindir to this version."
+    [ -n "$PKG_SHIM" ] && { cmp -s "$PKG_SHIM" "$SETUP_BIN/claude" || { install -m 0755 "$PKG_SHIM" "$SETUP_BIN/claude"; upd=1; }; }
+    [ -n "$PKG_WRAP" ] && { cmp -s "$PKG_WRAP" "$SETUP_BIN/claude-vscode-wrapper" 2>/dev/null || { install -m 0755 "$PKG_WRAP" "$SETUP_BIN/claude-vscode-wrapper"; upd=1; }; }
+    if [ "$upd" = 1 ]; then s_did "Updated the launchers in $SETUP_BIN to $CA_VERSION."
+    else s_info "Launchers already in place ($SETUP_BIN)."; fi
+    return 0
   fi
-
-  if [ ! -f "$srcdir/claude-shim" ] && [ -z "$pkg_shim" ]; then
-    # A source install deploys the shim under its FINAL name, so there is no claude-shim to
-    # copy — that is a finished install, not a broken one. Only complain if neither exists.
-    if grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null; then
-      dim "Shims already deployed in $bindir — nothing to link."
-    else
-      red "cannot find claude-shim next to $srcdir, and $bindir/claude is not ours." >&2
-      red "run ./install.sh from a source checkout, or reinstall the package." >&2
-      return 1
-    fi
-  elif [ "$srcdir" = "$bindir" ]; then
-    dim "Shims already in place ($bindir) — nothing to link."
-  elif grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null; then
-    dim "Shims already deployed in $bindir (refreshed above if the package copy changed)."
-  else
-    # ⚠️ NEVER overwrite a claude we did not put there. This used to clobber it silently, so
-    # anyone keeping the real Claude Code binary in ~/bin lost it with no backup. Shadowing is
-    # done by winning PATH ORDER from a different directory — never by writing over the binary.
-    if [ -e "$bindir/claude" ] && ! grep -q 'claude-accounts' "$bindir/claude" 2>/dev/null; then
-      red "$bindir/claude already exists and is not our shim — refusing to overwrite it." >&2
-      echo "  That looks like a real claude binary. The shim has to sit EARLIER on PATH than" >&2
-      echo "  it, in its own directory — putting it on top would destroy the binary." >&2
-      echo >&2
-      echo "      BINDIR=\"\$HOME/.local/bin\" claude-account setup" >&2
-      echo "      # then ensure that dir precedes $bindir in your shell profile" >&2
-      return 1
-    fi
-    install -m 0755 "$pkg_shim" "$bindir/claude"
-    install -m 0755 "$pkg_wrap" "$bindir/claude-vscode-wrapper"
-    grn "Linked the routing shims into $bindir."
+  if [ -z "$PKG_SHIM" ]; then
+    # A source install deploys the launcher under its FINAL name, so there is nothing to copy
+    # when it is already ours; anything else is a broken install.
+    s_warn "cannot find the launchers next to $SETUP_SRC, and $SETUP_BIN/claude is not one — reinstall the package, or run ./install.sh from a source checkout."
+    return 1
   fi
-
-  local first; first=$("$SHELL" -lc 'command -v claude' 2>/dev/null | tail -1)
-  if [ "$first" = "$bindir/claude" ]; then
-    grn "PATH ok — the shim wins in your login shell."
-  else
-    yel "PATH: your login shell resolves claude to '${first:-<not found>}', not $bindir/claude."
-    echo "      add this to your shell profile, then open a new terminal:"
-    echo "        export PATH=\"$bindir:\$PATH\""
+  # ⚠️ NEVER overwrite a claude we did not put there. Shadowing is done by winning PATH ORDER
+  # from a different directory — never by writing over the binary.
+  if [ -e "$SETUP_BIN/claude" ]; then
+    s_warn "$SETUP_BIN/claude already exists and is not claude-account's launcher — left alone. Put the launchers somewhere else that comes first on PATH:  CLAUDE_ACCOUNTS_BINDIR=\"\$HOME/.local/bin\" claude-account setup"
+    return 1
   fi
+  install -m 0755 "$PKG_SHIM" "$SETUP_BIN/claude"
+  [ -n "$PKG_WRAP" ] && install -m 0755 "$PKG_WRAP" "$SETUP_BIN/claude-vscode-wrapper"
+  s_did "Put the claude launcher in $SETUP_BIN — claude now picks the account by folder; with no rules it behaves exactly as before."
+  return 0
+}
 
-  local found=0 el es ex ea
+# The login shell's startup file that should carry the PATH block: zsh and bash read their
+# profile on every login shell (a macOS Terminal tab is one); fish gets a conf.d file of its own.
+shell_profile(){
+  case "$(basename "${SHELL:-}")" in
+    zsh)  printf '%s\n' "${ZDOTDIR:-$HOME}/.zprofile" ;;
+    bash) local f; for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+            [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }; done
+          printf '%s\n' "$HOME/.bash_profile" ;;
+    fish) printf '%s\n' "$HOME/.config/fish/conf.d/claude-account.fish" ;;
+    *) return 1 ;;
+  esac
+}
+login_claude(){ "${SHELL:-/bin/sh}" -lc 'command -v claude' 2>/dev/null | tail -1; }
+
+# Step 3 — the launcher must come first on PATH. When it does not, a marked block goes into the
+# login shell's profile (the way rustup and conda do it), once per Mac.
+setup_step_path(){
+  is_our_launcher "$SETUP_BIN/claude" || return 0
+  local first prof added; first=$(login_claude)
+  if [ "$first" = "$SETUP_BIN/claude" ]; then s_info "PATH ok — the launcher comes first in your login shell."; return 0; fi
+  added=$(ss_get added.path)
+  if ! prof=$(shell_profile); then
+    s_warn "PATH: your login shell finds claude at '${first:-<not found>}'. Add this to its startup file, then open a new terminal:  export PATH=\"$SETUP_BIN:\$PATH\""
+    return 0
+  fi
+  if [ "$SETUP_MODE" = auto ] && [ -n "$added" ]; then
+    # added once already: removed by hand, or overridden later in startup — respected; doctor says so
+    return 0
+  fi
+  local r; r=$(python3 -I -c "$PROFILE_PY" add "$prof" "$SETUP_BIN" "$(basename "${SHELL:-}")" "$SETUP_CFG/backups" 2>&1)
+  case "$r" in
+    added|present)
+      ss_set added.path "$prof"
+      first=$(login_claude)
+      if [ "$first" = "$SETUP_BIN/claude" ]; then
+        [ "$r" = added ] && s_did "Put $SETUP_BIN first on PATH in $(tilde "$prof") — open a new terminal once."
+      else
+        s_warn "PATH: $(tilde "$prof") puts $SETUP_BIN first, but something later in your shell's startup still finds '${first:-<not found>}' — move the claude-account lines to the end of that file."
+      fi ;;
+    *) s_warn "PATH: could not edit $(tilde "$prof") ($r). Add this line to it, then open a new terminal:  export PATH=\"$SETUP_BIN:\$PATH\"" ;;
+  esac
+  return 0
+}
+
+# Step 4 — the wrapper setting in each editor that has the Claude extension, so chats started
+# from it are routed too. Edited with comments and formatting kept, a backup taken, and the
+# result proven to parse with every other setting unchanged before it replaces the file.
+setup_step_editor_settings(){
+  local wrap="$SETUP_BIN/claude-vscode-wrapper" el es ex ea cn r found=0
+  # never point an editor at a wrapper that is not there: every Claude chat in it would fail to start
+  if ! is_our_launcher "$SETUP_BIN/claude" || ! is_our_wrapper "$wrap" || [ ! -x "$wrap" ]; then
+    s_info "Editors left alone: claude-account's launchers are not in place in $SETUP_BIN."
+    return 0
+  fi
   while IFS=$'\t' read -r el es ex ea cn; do
     [ -z "$el" ] && continue; found=1
-    if [ -f "$es" ] && grep -q 'claudeCode.claudeProcessWrapper' "$es"; then
-      grn "$el: wrapper already configured."
-    else
-      # WHY not edit it for them: it is JSONC with comments, and a rewrite risks their settings.
-      if editor_has_claude "$ex"; then yel "$el (Claude extension installed): add this line to its settings.json, then restart $el once:"
-      else dim "$el found: to route Claude sessions started from it, add this line to its settings.json and restart it once:"; fi
-      echo "        \"claudeCode.claudeProcessWrapper\": \"$bindir/claude-vscode-wrapper\","
-      dim "        file: $es"
+    if ! editor_has_claude "$ex"; then
+      grep -q 'claudeCode.claudeProcessWrapper' "$es" 2>/dev/null && continue
+      s_info "$el found: to route Claude sessions started from it once you add the Claude extension, add this line to its settings.json and restart it once:"
+      s_line "        \"claudeCode.claudeProcessWrapper\": \"$wrap\","
+      continue
     fi
+    r=$(python3 -I -c "$JSONC_PY" get "$es" claudeCode.claudeProcessWrapper 2>&1)
+    case "$r" in
+      present$'\t'*)
+        ss_set "added.editor.$el" 1
+        if [ "${r#present$'\t'}" = "$wrap" ]; then
+          s_info "$el: wrapper already configured."
+        elif [ "$SETUP_MODE" = explicit ]; then
+          s_warn "$el: claudeCode.claudeProcessWrapper is set to \"${r#present$'\t'}\", not \"$wrap\" — left as you set it."
+        fi
+        continue ;;
+    esac
+    # absent, no file yet, or a file it cannot read safely
+    if [ "$SETUP_MODE" = auto ] && [ -n "$(ss_get "added.editor.$el")" ]; then continue; fi   # removed by hand: respected
+    r=$(python3 -I -c "$JSONC_PY" set "$es" claudeCode.claudeProcessWrapper "$wrap" "$SETUP_CFG/backups" "$(printf '%s' "$el" | tr -c 'A-Za-z0-9' '-')" 2>&1)
+    case "$r" in
+      added|created)
+        ss_set "added.editor.$el" 1
+        s_did "$el: added the wrapper setting to its settings.json (backup in $(tilde "$SETUP_CFG/backups")) — restart $el once so its chats are routed." ;;
+      *)
+        s_warn "$el: its settings.json could not be edited safely ($r) — add this line to it yourself, then restart $el once:"
+        s_line "        \"claudeCode.claudeProcessWrapper\": \"$wrap\","
+        [ "$SETUP_MODE" = auto ] && SETUP_SAID+="        \"claudeCode.claudeProcessWrapper\": \"$wrap\","$'\n' ;;
+    esac
   done < <(editors)
-  [ "$found" = 0 ] && dim "No VS Code-family editor found (VS Code, Cursor, Windsurf, VSCodium) — terminal routing still works."
-  if [ "$found" = 1 ]; then
-    echo
-    # Only where Claude actually runs: adding our item to an editor with no Claude
-    # extension would be noise. Never fatal — a missing source must not break setup.
-    if vscode_status_srcdir >/dev/null 2>&1; then
-      cmd_vscode_status install --only-with-claude 2>/dev/null || true
-    elif [ -d "$HOME/.config/claude-accounts/vscode-status" ]; then
-      cmd_vscode_status install --only-with-claude 2>/dev/null || true
+  [ "$found" = 0 ] && s_info "No VS Code-family editor found (VS Code, Cursor, Windsurf, VSCodium) — terminal routing still works."
+  return 0
+}
+
+# Step 5 — the status bar item, in each editor that has the Claude extension. Installed once per
+# editor, and upgraded or repaired when the editor's record holds another version or a folder
+# that is gone; removed by you (in the editor, or with vscode-status remove), it stays removed.
+setup_step_item(){
+  local src want; src=$(vscode_status_srcdir) || { s_info "(status bar item source not found in this install — skipping)"; return 0; }
+  want=$(vscode_status_version "$src") || return 0
+  local el es ex ea cn reg rver rok rloc tmpd="" vsix="" did=0
+  while IFS=$'\t' read -r el es ex ea cn; do
+    [ -z "$el" ] && continue
+    [ -d "$ex" ] && editor_has_claude "$ex" || continue
+    reg=$(vscode_status_registered "$ex"); rver=""; rok=""; rloc=""
+    [ -n "$reg" ] && IFS=$'\t' read -r rver rok rloc <<<"$reg"
+    if [ "$rver" = "$want" ] && [ "$rok" = yes ]; then ss_set "added.item.$el" 1; s_info "$el: status bar item installed ($want)."; continue; fi
+    if [ "$SETUP_MODE" = auto ]; then
+      [ -n "$(ss_get "removed.item.$el")" ] && continue
+      [ -z "$reg" ] && [ -n "$(ss_get "added.item.$el")" ] && continue
     else
-      dim "(status bar item source not found in this install — skipping)"
+      ss_set "removed.item.$el"
+    fi
+    [ -z "$tmpd" ] && { tmpd=$(mktemp -d "${TMPDIR:-/tmp}/ca-vsix.XXXXXX" 2>/dev/null) || tmpd=""; }
+    [ -n "$tmpd" ] && vsix="$tmpd/claude-account-status-$want.vsix" && { [ -f "$vsix" ] || vscode_status_vsix "$src" "$vsix"; }
+    if vsitem_install_one "$el" "$ex" "$ea" "$cn" "$want" "$vsix" "${tmpd:-/nonexistent}"; then ss_set "added.item.$el" 1; did=1; fi
+  done < <(editors)
+  [ -n "$tmpd" ] && [ -d "$tmpd" ] && rm -rf -- "$tmpd"
+  [ "$did" = 1 ] && s_info "Reload the editor window once (or restart it) if the status bar item does not appear."
+  return 0
+}
+
+# Every step, in order. Returns 1 when the launchers could not be placed (explicit setup's exit).
+setup_steps(){
+  local rc=0
+  setup_locate "$SETUP_MODE"
+  setup_step_files
+  setup_step_launchers || rc=1
+  setup_step_path
+  setup_step_editor_settings
+  setup_step_item
+  return $rc
+}
+
+# A lock directory holding its owner's pid. Taken over only from a holder that is gone (dead
+# pid, or no pid written 2+ minutes ago), by an atomic rename that is undone if it turns out to
+# have caught a lock somebody else had just made. (Security review: the first version could let
+# two runs proceed at once.)
+setup_lock_take(){ # <dir>
+  local l="$1" p
+  if mkdir "$l" 2>/dev/null; then echo $$ > "$l/pid"; return 0; fi
+  p=$(cat "$l/pid" 2>/dev/null || true)
+  if [ -n "$p" ]; then kill -0 "$p" 2>/dev/null && return 1
+  else [ -n "$(find "$l" -maxdepth 0 -mmin +2 2>/dev/null)" ] || return 1; fi
+  mv "$l" "$l.gone.$$" 2>/dev/null || return 1
+  if [ "$(cat "$l.gone.$$/pid" 2>/dev/null || true)" != "$p" ]; then mv "$l.gone.$$" "$l" 2>/dev/null; return 1; fi
+  rm -rf -- "$l.gone.$$"
+  mkdir "$l" 2>/dev/null || return 1
+  echo $$ > "$l/pid"; return 0
+}
+setup_lock_give(){ [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -rf -- "$1"; return 0; }
+setup_record_warnings(){
+  if [ -n "$SETUP_WARNINGS" ]; then write_line "$SETUP_CFG/.setup-warnings" "${SETUP_WARNINGS%$'\n'}"
+  else rm -f "$SETUP_CFG/.setup-warnings"; fi
+}
+
+# The automatic run, from every command but help, version, statusline, setup, uninstall,
+# vscode-status and the view's background data calls. A matching stamp makes it one file read.
+# Only for a person at a terminal, as the owner of this home: never as root (sudo keeps HOME, and
+# root-owned settings.json or .zprofile files would lock the user out of them), never in CI, never
+# from a script with no terminal on its input.
+autosetup(){
+  [ -n "${CLAUDE_ACCOUNTS_NO_AUTOSETUP:-}" ] && return 0
+  [ -n "${CLAUDE_ACCOUNTS_MAP:-}${CLAUDE_ACCOUNTS_DIR:-}" ] && return 0
+  if [ -f "$SETUP_STATE" ]; then
+    local k v
+    while IFS='=' read -r k v || [ -n "${k:-}" ]; do
+      case "$k" in version) [ "$v" = "$CA_VERSION" ] && return 0 ;; auto) [ "$v" = off ] && return 0 ;; esac
+    done < "$SETUP_STATE"
+  fi
+  [ -n "${CI:-}" ] && return 0
+  [ -t 0 ] || return 0
+  [ "$(id -u)" = 0 ] && return 0
+  [ -O "$HOME" ] || return 0
+  SETUP_MODE=auto; SETUP_SAID=""; SETUP_WARNINGS=""
+  setup_locate auto
+  [ ! -f "$SETUP_STATE" ] && ! is_our_launcher "$SETUP_BIN/claude" && SETUP_FIRST=1
+  local lock="$SETUP_CFG/.setup.lock"
+  mkdir -p "$SETUP_CFG" 2>/dev/null || { SETUP_MODE=explicit; return 0; }
+  setup_lock_take "$lock" || { SETUP_MODE=explicit; return 0; }     # another one is doing it
+  trap 'setup_lock_give "'"$lock"'"' EXIT INT TERM HUP
+  setup_steps >/dev/null 2>&1 || true
+  ss_set version "$CA_VERSION"
+  setup_record_warnings
+  setup_lock_give "$lock"; trap - EXIT INT TERM HUP
+  SETUP_MODE=explicit
+  if [ -n "$SETUP_SAID" ]; then
+    if [ "$SETUP_FIRST" = 1 ]; then AUTOSETUP_NOTE="claude-account set itself up — undo all of it with: claude-account uninstall"
+      { bold "claude-account set itself up:"; printf '%s' "$SETUP_SAID"; dim "  undo all of it: claude-account uninstall · details: claude-account doctor"; echo; } >&2
+    else AUTOSETUP_NOTE="claude-account updated itself to $CA_VERSION"
+      { bold "claude-account updated itself to $CA_VERSION:"; printf '%s' "$SETUP_SAID"; echo; } >&2
     fi
   fi
-  echo; dim "then:  claude-account doctor"
+  return 0
 }
+
+cmd_setup(){
+  # Opt-in wiring. A package install deliberately does NOT do this itself: linking `claude`
+  # ahead of the real binary is a choice, made by running claude-account (any command does it
+  # since 1.2.8) or this command. This one runs every step, reports each, puts back anything
+  # removed by hand, and turns the automatic run back on after an `uninstall`.
+  SETUP_MODE=explicit
+  ss_set auto
+  local rc=0
+  SETUP_WARNINGS=""
+  setup_steps || rc=$?
+  ss_set version "$CA_VERSION"
+  setup_record_warnings
+  echo; dim "then:  claude-account doctor"
+  return $rc
+}
+
+cmd_uninstall(){
+  # Everything setup put in place, out again: the status bar item, the editors' wrapper line,
+  # the PATH block, the launchers. Rules, groups, profiles and logins are kept, so `setup` brings
+  # it all back with no sign-in. The automatic run stays off until the next `setup`.
+  SETUP_MODE=explicit
+  setup_locate uninstall
+  local wrap="$SETUP_BIN/claude-vscode-wrapper" el es ex ea cn r f prof
+  if vscode_status_srcdir >/dev/null 2>&1; then cmd_vscode_status remove 2>/dev/null | grep -v 'Restart the editor once' || true; fi
+  while IFS=$'\t' read -r el es ex ea cn; do
+    [ -z "$el" ] && continue
+    r=$(python3 -I -c "$JSONC_PY" del "$es" claudeCode.claudeProcessWrapper "$wrap" "$SETUP_CFG/backups" "$(printf '%s' "$el" | tr -c 'A-Za-z0-9' '-')" 2>&1)
+    case "$r" in
+      removed) grn "$el: removed the wrapper setting from its settings.json (backup in $(tilde "$SETUP_CFG/backups"))." ;;
+      other)   yel "$el: its wrapper setting points somewhere else — left as you set it." ;;
+      absent|nofile) ;;
+      *) yel "$el: its settings.json could not be edited safely ($r) — remove the claudeCode.claudeProcessWrapper line yourself." ;;
+    esac
+  done < <(editors)
+  for prof in "$(ss_get added.path)" "${ZDOTDIR:-$HOME}/.zprofile" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" "$HOME/.config/fish/conf.d/claude-account.fish"; do
+    [ -n "$prof" ] && [ -f "$prof" ] || continue
+    r=$(python3 -I -c "$PROFILE_PY" del "$prof" "$SETUP_CFG/backups" 2>&1)
+    [ "$r" = removed ] && grn "Removed the claude-account PATH lines from $(tilde "$prof") (backup in $(tilde "$SETUP_CFG/backups"))."
+  done
+  is_our_launcher "$SETUP_BIN/claude" && { rm -f -- "$SETUP_BIN/claude"; grn "Removed the claude launcher from $SETUP_BIN."; }
+  is_our_wrapper "$SETUP_BIN/claude-vscode-wrapper" && { rm -f -- "$SETUP_BIN/claude-vscode-wrapper"; grn "Removed the editor wrapper from $SETUP_BIN."; }
+  rm -f "$SETUP_CFG/.setup-warnings"
+  local k
+  awk -F= '/^added\./{print $1}' "$SETUP_STATE" 2>/dev/null | while IFS= read -r k; do ss_set "$k"; done
+  ss_set auto off
+  echo
+  dim "Kept: your rules, groups, profiles and logins in $(tilde "$SETUP_CFG")."
+  dim "New terminals and editor windows now start the real claude, on your global account everywhere;"
+  dim "chats already open keep the account they started with. Put it all back with: claude-account setup"
+}
+
 
 cmd_doctor(){
   # Renew first, then report. Otherwise doctor raises an EXPIRED alarm it could have fixed
@@ -1552,6 +2079,13 @@ cmd_doctor(){
   echo "CLAUDE ACCOUNT DOCTOR"; echo
 
   echo "routing plumbing"
+  if [ -n "${CLAUDE_ACCOUNTS_NO_AUTOSETUP:-}" ]; then wrn "automatic setup is off in this shell (CLAUDE_ACCOUNTS_NO_AUTOSETUP)"
+  elif [ "$(ss_get auto)" = off ]; then wrn "automatic setup is off since claude-account uninstall — claude-account setup turns it back on"
+  elif [ -n "$(ss_get version)" ]; then ok_ "automatic setup on (last checked for $(ss_get version))"; fi
+  if [ -s "$SETUP_CFG/.setup-warnings" ]; then
+    wrn "the last setup could not finish everything — claude-account setup shows it again:"
+    sed 's/^/      /' "$SETUP_CFG/.setup-warnings"
+  fi
   [ -x "$dbin/claude" ] && ok_ "terminal shim present" || bad "missing shim $dbin/claude"
   # Check the shell the USER actually gets (login shell), not whatever PATH this
   # process happens to have inherited — a tool-spawned shell may lack ~/bin and
@@ -3756,7 +4290,7 @@ cmd_ui(){
     red "claude-account ui needs a terminal — in a script use: claude-account overview"; exit 2; fi
   python3 -I -c 'import curses' >/dev/null 2>&1 || { red "this python3 has no curses module, which the full-screen view needs"; dim "  claude-account overview prints the same picture"; exit 1; }
   local self; self="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)/$(basename "$_ca_self")"
-  CA_SELF="$self" exec python3 -I "$ui"
+  CA_SELF="$self" CA_UI_NOTE="${AUTOSETUP_NOTE:-}" exec python3 -I "$ui"
 }
 
 # Everything the view shows, as one JSON object. No network and no refresh: usage comes
@@ -3874,7 +4408,7 @@ main(){
     # remove`, run from a folder containing a `vscode-status/` directory, silently
     # became `remove vscode-status`. A command name is never a profile or a path.
     case "$1" in
-      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|reset-page|refresh|logout|switch|global|status|pause|resume|add|unbind|remove|rm      |login|forget|statusline|undo|vscode-status|help|group|groups|order|ui|_ui-state|_ui-groups|_ui-usage)
+      list|ls|profiles|logins|overview|ov|label|verify|version|doctor|setup|rename|fallback|use|create      |export|import|usage|reset-page|refresh|logout|switch|global|status|pause|resume|add|unbind|remove|rm      |login|forget|statusline|undo|vscode-status|help|group|groups|order|ui|uninstall|_ui-state|_ui-groups|_ui-usage)
         set -- "$@" ;;                      # a command: leave the order alone
       *)
     case "$2" in
@@ -3888,6 +4422,11 @@ main(){
   fi
 # Plain `claude-account` in a terminal opens the full-screen view (1.2.0). With no terminal
 # — piped, in a script — it is `list`, exactly as before, so nothing that captures it changes.
+# The automatic setup (1.2.8): every command but these keeps the machine set up, once per version.
+case "${1:-}" in
+  -h|--help|help|--version|-v|version|statusline|setup|uninstall|vscode-status|_ui-state|_ui-groups|_ui-usage) ;;
+  *) autosetup ;;
+esac
 if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ] && ui_ready; then cmd_ui; fi
 case "${1:-list}" in
   list|ls|-l|--list) shift || true; cmd_list "$@" ;;
@@ -3913,6 +4452,7 @@ case "${1:-list}" in
   --version|-V|version) echo "claude-account $CA_VERSION" ;;
   doctor) shift; cmd_doctor "$@" ;;
   setup)  cmd_setup ;;
+  uninstall) cmd_uninstall ;;
   rename) shift; cmd_rename "$@" ;;
   use|fallback) shift; cmd_use "$@" ;;
   create)       shift; cmd_create "$@" ;;
@@ -3973,7 +4513,12 @@ INSPECT
 
   --no-refresh on list/profiles/verify/doctor/overview skips renewing expired tokens
 
-  claude-account setup                       wire up PATH + VS Code after a package install
+  claude-account setup                       set everything up and report it: the launchers, PATH, the
+                                             editors' wrapper setting and status bar item. Any command
+                                             does this by itself once per version; this one also puts
+                                             back what you removed by hand
+  claude-account uninstall                   undo all of that; rules, groups and logins are kept
+                                             (CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 turns the automatic run off)
   claude-account vscode-status install       add a status bar item to VS Code/Cursor naming
                                              the account this folder routes to (remove|status)
   claude-account refresh [profile|--all]     renew expired access tokens (default: all)

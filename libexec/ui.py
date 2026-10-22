@@ -260,7 +260,8 @@ class App(object):
         self.cursor = 0            # index into self.items, always a selectable item
         self.top = 0
         self.items = []
-        self.msg = ("", 0)
+        # the automatic setup's one line, if this launch did it (printed before the screen opened too)
+        self.msg = (os.environ.get("CA_UI_NOTE") or "", 1 if os.environ.get("CA_UI_NOTE") else 0)
         self.want = None           # (kind, account, path) to put the cursor back on
 
     # ── data ──
