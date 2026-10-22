@@ -257,6 +257,21 @@ k Enter; wait_for 'press Enter to go back to the view' 60 && ok "…runs the rea
 scr | grep -q '\$ claude-account login alpha' && ok "…showing the command it ran" || no "$(scr)"
 k Enter; wait_for 'this machine:' 30 && ok "…and Enter brings the view back" || no "$(scr)"
 
+section "Ctrl+C quits quietly wherever it lands"
+# Only the main screen's wait for a key caught it: in a menu or during the first load it printed
+# a Python traceback (1.2.6). The pane's own shell must survive the Ctrl+C to report the exit,
+# hence the trap — a handler, not '' (ignoring it would be inherited and the view never sees it).
+cstart(){ TM kill-session -t ui >/dev/null 2>&1; : > "$T/ui.err"
+  TM new-session -d -s ui -x 160 -y 50 "trap 'true' INT; env $SANDBOX_ENV bash '$CA' ui 2>'$T/ui.err'; echo UI-EXITED-\$?; sleep 600"; }
+for where in "during the first load" "in a menu"; do
+  cstart
+  if [ "$where" = "in a menu" ]; then wait_for 'week +34%' 60; k Enter; wait_for 'Refresh its usage' 15; else sleep 0.3; fi
+  TM send-keys -t ui C-c
+  wait_for 'UI-EXITED-0' 15 && [ ! -s "$T/ui.err" ] && ok "Ctrl+C $where exits cleanly, with nothing on stderr" \
+    || no "$(scr | grep -o 'UI-EXITED-[0-9]*'): $(head -3 "$T/ui.err")"
+done
+start; wait_for 'this machine:' 60      # the view running again, as the next section expects
+
 section "a small window, and quitting"
 TM resize-window -t ui -x 80 -y 20; sleep 1
 wait_for 'this machine' 15 && ok "it redraws in an 80×20 window" || no "$(scr)"

@@ -2,7 +2,7 @@
   "name": "claude-account-status",
   "displayName": "Claude Account status",
   "description": "Shows which Claude account the current folder routes to, in the status bar.",
-  "version": "@@VERSION@@",
+  "version": "1.2.7",
   "publisher": "reddeer-tech",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],

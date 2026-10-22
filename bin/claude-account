@@ -9,7 +9,7 @@ set -uo pipefail
 # you ran claude-account from — a cloned repo, say — ran as you, and several of these sites
 # are handed a whole credential on stdin. -I leaves out the cwd, PYTHON* variables and user
 # site-packages; only the standard library is used. tests/test_core.sh fails on a bare one.
-CA_VERSION="1.2.6"   # kept in step with package.json by `make version`
+CA_VERSION="1.2.7"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # How close a credential's SIGN-IN end must be before every identity line and doctor say so.
@@ -1202,31 +1202,37 @@ cmd_import(){
 # dir or extensions dir present), so setup and doctor can speak about each by name.
 editors(){
   local spec label sdir xdir
-  local adir
+  local adir cli
   for spec in \
-    "VS Code|Code|.vscode|Visual Studio Code" \
-    "VS Code Insiders|Code - Insiders|.vscode-insiders|Visual Studio Code - Insiders" \
-    "Cursor|Cursor|.cursor|Cursor" \
-    "Windsurf|Windsurf|.windsurf|Windsurf" \
-    "VSCodium|VSCodium|.vscode-oss|VSCodium"; do
+    "VS Code|Code|.vscode|Visual Studio Code|code" \
+    "VS Code Insiders|Code - Insiders|.vscode-insiders|Visual Studio Code - Insiders|code-insiders" \
+    "Cursor|Cursor|.cursor|Cursor|cursor" \
+    "Windsurf|Windsurf|.windsurf|Windsurf|windsurf" \
+    "VSCodium|VSCodium|.vscode-oss|VSCodium|codium"; do
     label="${spec%%|*}"; spec="${spec#*|}"
     sdir="${spec%%|*}"; spec="${spec#*|}"
-    xdir="${spec%%|*}"; adir="${spec##*|}"
+    xdir="${spec%%|*}"; spec="${spec#*|}"
+    adir="${spec%%|*}"; cli="${spec##*|}"
     local sp="$HOME/Library/Application Support/$sdir/User/settings.json" xp="$HOME/$xdir/extensions"
     if [ -d "$HOME/Library/Application Support/$sdir" ] || [ -d "$xp" ]; then
-      printf '%s\t%s\t%s\t%s\n' "$label" "$sp" "$xp" "$adir"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$sp" "$xp" "$adir" "$cli"
     fi
   done
 }
 # does that editor have the Claude Code extension installed?
 editor_has_claude(){ ls -d "$1"/anthropic.claude-code-* >/dev/null 2>&1; }
 
-# The companion VS Code status bar item. Deliberately OPT-IN and never installed by
-# `setup`: the project's rule is that a package install must not change things behind
-# your back (the same reason the formula parks the shims unlinked). Installed as a
-# plain folder — VS Code loads any well-formed extension directory at startup, so
-# there is no vsce, no npm and no `code` CLI dependency, and the same folder works for
-# Cursor/Windsurf/VSCodium.
+# The companion VS Code status bar item, installed by `setup` (an opt-in step, never by the
+# package install itself — the same rule that parks the shims unlinked).
+#
+# ⚠ Installed through the EDITOR'S OWN TOOL since 1.2.7 (`code --install-extension <vsix>`).
+# It used to be copied in as a plain folder named with the CLI's version, on the belief that
+# VS Code loads any well-formed folder. It does not any more: VS Code trusts only its own record
+# (extensions.json). Measured 2026-10-22: that record still named the 1.1.8 folder, which a
+# later setup had replaced, so VS Code flagged the item invalid ("Unable to read file
+# …-1.1.8/package.json") and put the new 1.2.6 folder on its .obsolete list to delete. The tool
+# keeps that record right in every VS Code-family editor. The item carries its OWN version (in
+# vscode-status/package.json.in): a CLI upgrade reinstalls it only when the item itself changed.
 vscode_status_srcdir(){
   local self srcdir
   self="${BASH_SOURCE[0]:-$0}"
@@ -1239,51 +1245,156 @@ vscode_status_srcdir(){
   done
   return 1
 }
+VSC_ID="reddeer-tech.claude-account-status"
+vscode_status_version(){ python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$1/package.json.in" 2>/dev/null; }
+
+# <app name> <tool name> -> the editor's own command-line tool, inside its app bundle. Absolute
+# path on purpose: `code` on PATH is optional, and a GUI-launched setup has no shell PATH.
+editor_cli(){
+  local base dirs="${CA_EDITOR_APPS:-/Applications:$HOME/Applications}"
+  local IFS=:
+  for base in $dirs; do
+    [ -x "$base/$1.app/Contents/Resources/app/bin/$2" ] && { printf '%s\n' "$base/$1.app/Contents/Resources/app/bin/$2"; return 0; }
+  done
+  return 1
+}
+
+# <extensions dir> -> "<version>\t<yes|no: its folder exists>\t<folder>" from the editor's own
+# record, or nothing when the editor has no record of the item. Read only.
+vscode_status_registered(){
+  python3 -I - "$1" "$VSC_ID" <<'REGPY'
+import json, os, sys
+d, ident = sys.argv[1], sys.argv[2]
+try:
+    entries = json.load(open(os.path.join(d, "extensions.json")))
+except (OSError, ValueError):
+    sys.exit(0)
+for e in entries if isinstance(entries, list) else []:
+    if ((e.get("identifier") or {}).get("id") or "").lower() == ident:
+        loc = (e.get("location") or {}).get("path") or os.path.join(d, e.get("relativeLocation") or "")
+        print("%s\t%s\t%s" % (e.get("version") or "?", "yes" if os.path.isfile(os.path.join(loc, "package.json")) else "no", loc))
+        break
+REGPY
+}
+
+# <src dir> <out.vsix> — the package the editor's tool installs: the two files under extension/,
+# plus the manifest and content-types entries every .vsix carries.
+vscode_status_vsix(){
+  python3 -I - "$1" "$2" <<'VSIXPY'
+import json, sys, zipfile
+from xml.sax.saxutils import escape, quoteattr
+src, out = sys.argv[1], sys.argv[2]
+pkg = json.load(open(src + "/package.json.in"))
+manifest = """<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
+  <Metadata>
+    <Identity Language="en-US" Id=%s Version=%s Publisher=%s/>
+    <DisplayName>%s</DisplayName>
+    <Description xml:space="preserve">%s</Description>
+    <Categories>Other</Categories>
+    <Properties>
+      <Property Id="Microsoft.VisualStudio.Code.Engine" Value=%s/>
+    </Properties>
+  </Metadata>
+  <Installation>
+    <InstallationTarget Id="Microsoft.VisualStudio.Code"/>
+  </Installation>
+  <Dependencies/>
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
+  </Assets>
+</PackageManifest>
+""" % (quoteattr(pkg["name"]), quoteattr(pkg["version"]), quoteattr(pkg["publisher"]),
+       escape(pkg["displayName"]), escape(pkg["description"]), quoteattr(pkg["engines"]["vscode"]))
+types = ('<?xml version="1.0" encoding="utf-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+         '<Default Extension=".json" ContentType="application/json"/><Default Extension=".js" ContentType="application/javascript"/>'
+         '<Default Extension=".vsixmanifest" ContentType="text/xml"/></Types>')
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("[Content_Types].xml", types)
+    z.writestr("extension.vsixmanifest", manifest)
+    z.write(src + "/package.json.in", "extension/package.json")
+    z.write(src + "/extension.js", "extension/extension.js")
+VSIXPY
+}
 
 cmd_vscode_status(){
   local src; src=$(vscode_status_srcdir) || { red "cannot find the vscode-status source next to this install"; exit 1; }
-  local dest_name="reddeer-tech.claude-account-status-$CA_VERSION"
-  local action="${1:-status}" gate="${2:-}" any=0 el es ex ea
+  local want; want=$(vscode_status_version "$src") || want=""
+  [ -n "$want" ] || { red "cannot read the status bar item's version from $src/package.json.in"; exit 1; }
+  local action="${1:-status}" gate="${2:-}" any=0 did=0 el es ex ea cn reg rver rok rloc tool f
   case "$action" in
     install|remove|status) ;;
     *) red "usage: claude-account vscode-status [install|remove|status]"; exit 2 ;;
   esac
-  while IFS=$'\t' read -r el es ex ea; do
+  local tmpd=""; tmpd=$(mktemp -d "${TMPDIR:-/tmp}/ca-vsix.XXXXXX" 2>/dev/null) || tmpd=""
+  local vsix="$tmpd/claude-account-status-$want.vsix"
+  while IFS=$'\t' read -r el es ex ea cn; do
     [ -z "$el" ] && continue
     [ -d "$ex" ] || continue
     # setup passes --only-with-claude: skip editors that do not have the Claude extension
     [ "$gate" = "--only-with-claude" ] && ! editor_has_claude "$ex" && continue
     any=1
-    local installed; installed=$(ls -d "$ex"/reddeer-tech.claude-account-status-* 2>/dev/null | head -1)
+    reg=$(vscode_status_registered "$ex"); rver=""; rok=""; rloc=""
+    [ -n "$reg" ] && IFS=$'\t' read -r rver rok rloc <<<"$reg"
+    tool=$(editor_cli "$ea" "$cn") || tool=""
     case "$action" in
       install)
-        [ -n "$installed" ] && rm -rf "$installed"
-        mkdir -p "$ex/$dest_name"
-        install -m 0644 "$src/extension.js" "$ex/$dest_name/extension.js"
-        sed "s/@@VERSION@@/$CA_VERSION/" "$src/package.json.in" > "$ex/$dest_name/package.json"
-        grn "$el: installed the Claude Account status bar item ($CA_VERSION)."
+        # setup: nothing to do when the editor already has this version and its folder
+        [ "$gate" = "--only-with-claude" ] && [ "$rver" = "$want" ] && [ "$rok" = yes ] && continue
+        did=1
+        [ -n "$tmpd" ] && { [ -f "$vsix" ] || vscode_status_vsix "$src" "$vsix"; }
+        if [ ! -f "$vsix" ]; then red "$el: could not build the status bar item's package"; continue; fi
+        if [ -z "$tool" ]; then
+          mkdir -p "$HOME/.config/claude-accounts" && cp "$vsix" "$HOME/.config/claude-accounts/"
+          yel "$el: its command-line tool was not found in $ea.app, so the item was not installed."
+          dim "  In $el: Extensions → … → Install from VSIX…, and pick"
+          dim "  $HOME/.config/claude-accounts/$(basename "$vsix")"
+          continue
+        fi
+        if "$tool" --install-extension "$vsix" --force >"$tmpd/install.log" 2>&1 \
+           && reg=$(vscode_status_registered "$ex") && IFS=$'\t' read -r rver rok rloc <<<"$reg" \
+           && [ "$rver" = "$want" ] && [ "$rok" = yes ]; then
+          # folders copied in by setup 1.2.6 and earlier: the editor never recorded them
+          for f in "$ex"/"$VSC_ID"-*; do
+            [ -d "$f" ] && [ "$f" != "$rloc" ] && rm -rf -- "$f"
+          done
+          grn "$el: installed the Claude Account status bar item ($want)."
+        else
+          red "$el: the editor's tool did not install the status bar item."
+          dim "  it said: $(tail -1 "$tmpd/install.log" 2>/dev/null)"
+        fi
         ;;
       remove)
-        if [ -n "$installed" ]; then rm -rf "$installed"; grn "$el: removed the status bar item."
+        [ -n "$reg" ] && [ -n "$tool" ] && "$tool" --uninstall-extension "$VSC_ID" >/dev/null 2>&1
+        local gone=0
+        for f in "$ex"/"$VSC_ID"-*; do [ -d "$f" ] && { rm -rf -- "$f"; gone=1; }; done
+        if [ -n "$reg" ] || [ "$gone" = 1 ]; then grn "$el: removed the status bar item."; did=1
         else dim "$el: not installed."; fi
         ;;
       status)
-        if [ -n "$installed" ]; then
-          local v="${installed##*claude-account-status-}"
-          if [ "$v" = "$CA_VERSION" ]; then grn "$el: installed ($v)"
-          else yel "$el: installed ($v) — this CLI is $CA_VERSION; re-run: claude-account vscode-status install"; fi
-        else dim "$el: not installed"; fi
+        if [ -z "$reg" ]; then
+          if ls -d "$ex"/"$VSC_ID"-* >/dev/null 2>&1; then
+            yel "$el: copied in by an older setup but not recorded by the editor, so it does not run — claude-account vscode-status install"
+          else dim "$el: not installed"; fi
+        elif [ "$rok" != yes ]; then
+          yel "$el: the editor's record points at a folder that is gone ($rver), so it shows the item as invalid — claude-account vscode-status install"
+        elif [ "$rver" != "$want" ]; then
+          yel "$el: installed ($rver) — this CLI ships $want; claude-account vscode-status install"
+        else grn "$el: installed ($rver)"; fi
         ;;
     esac
   done < <(editors)
+  [ -n "$tmpd" ] && [ -d "$tmpd" ] && rm -rf -- "$tmpd"
   [ "$any" = 0 ] && { dim "No VS Code-family editor found."; return 0; }
   case "$action" in
-    install) dim "Restart the editor once; the item appears at the right of the status bar,"
-             dim "naming the account THIS FOLDER routes to (the editor's own Account panel shows"
-             dim "one shared email in every window, so it cannot tell you that)."
-             dim "Don't want it?  claude-account vscode-status remove" ;;
-    remove)  dim "Restart the editor once to clear it from the status bar." ;;
+    install) [ "$did" = 1 ] && {
+             dim "Reload the editor window once (or restart it) if the item does not appear at the right of"
+             dim "the status bar. It names the account THIS FOLDER routes to (the editor's own Account panel"
+             dim "shows one shared email in every window, so it cannot tell you that)."
+             dim "Don't want it?  claude-account vscode-status remove"; } ;;
+    remove)  [ "$did" = 1 ] && dim "Restart the editor once to clear it from the status bar." ;;
   esac
+  return 0
 }
 
 cmd_setup(){
@@ -1397,7 +1508,7 @@ cmd_setup(){
   fi
 
   local found=0 el es ex ea
-  while IFS=$'\t' read -r el es ex ea; do
+  while IFS=$'\t' read -r el es ex ea cn; do
     [ -z "$el" ] && continue; found=1
     if [ -f "$es" ] && grep -q 'claudeCode.claudeProcessWrapper' "$es"; then
       grn "$el: wrapper already configured."
@@ -1456,7 +1567,7 @@ cmd_doctor(){
   [ -x "$dbin/claude-vscode-wrapper" ] && ok_ "VS Code wrapper present" || bad "missing VS Code wrapper"
   # one line per editor: a problem only where the Claude extension is actually installed
   local _ed=0 el es ex ea epid est emt
-  while IFS=$'\t' read -r el es ex ea; do
+  while IFS=$'\t' read -r el es ex ea cn; do
     [ -z "$el" ] && continue; _ed=1
     if [ -f "$es" ] && grep -q 'claudeProcessWrapper' "$es"; then ok_ "$el: setting points at the wrapper"
       # a setting the running app has never loaded is a setting that does nothing:
@@ -1477,11 +1588,14 @@ print(int(time.mktime(time.strptime(s,"%a %b %d %H:%M:%S %Y"))) if s else "")' 2
   done < <(editors)
   [ "$_ed" = 0 ] && dim "  (no VS Code-family editor found)"
   if [ "$_ed" = 1 ]; then
-    local _vs; _vs=$(cmd_vscode_status status 2>/dev/null | grep -c 'installed (' || true)
-    if [ "${_vs:-0}" -gt 0 ]; then
-      cmd_vscode_status status 2>/dev/null | grep 'this CLI is' >/dev/null \
-        && wrn "vscode-status item is older than this CLI — claude-account vscode-status install" \
-        || ok_ "vscode-status item installed and current"
+    # from each editor's own record (1.2.7): a missing folder is exactly the invalid-item state
+    # VS Code showed on 2026-10-22, which the old folder check reported as "installed and current"
+    local _vs _esc=$'\033'; _vs=$(cmd_vscode_status status 2>/dev/null | sed "s/${_esc}\[[0-9;]*m//g")
+    if grep -qE 'folder that is gone|not recorded by the editor|this CLI ships' <<<"$_vs"; then
+      wrn "vscode-status item needs reinstalling — claude-account vscode-status install"
+      grep -E 'folder that is gone|not recorded by the editor|this CLI ships' <<<"$_vs" | sed 's/^/      /'
+    elif grep -q 'installed (' <<<"$_vs"; then
+      ok_ "vscode-status item installed and current"
     fi
   fi
   local cc; cc=$(grep -c 'CLAUDE_CONFIG_DIR' "$dbin/claude" "$dbin/claude-vscode-wrapper" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')

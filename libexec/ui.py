@@ -1286,7 +1286,14 @@ def main():
         enc = locale.getpreferredencoding(False)
     ASCII = "utf" not in (enc or "").lower().replace("-", "")
     os.environ.setdefault("ESCDELAY", "25")   # Esc closes a menu at once, not after a second
-    curses.wrapper(lambda scr: App(scr).loop())
+    try:
+        curses.wrapper(lambda scr: App(scr).loop())
+    except KeyboardInterrupt:
+        # Ctrl+C quits quietly wherever it lands. Only the main screen's wait for a key caught it,
+        # so pressed in a menu, mid-redraw or during the first load it printed a Python traceback
+        # (reproduced 2026-10-22: 20 and 36 lines, exit 130). curses.wrapper has already put the
+        # terminal back by the time it reaches here.
+        pass
     return 0
 
 
