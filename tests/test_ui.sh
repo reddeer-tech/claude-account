@@ -311,6 +311,32 @@ goto "$o2"; k '['; wait_for 'done: claude-account order' 90
 ! grep -q $'^group\t' "$G" && ok "…and makes no group" || no "$(cat "$G")"
 k q; wait_for 'UI-EXITED-0' 15
 
+section "a view left open while claude-account is upgraded keeps working"
+# Homebrew's layout: bin/claude-account is a link into Cellar/claude-account/<version>/bin, and
+# an upgrade relinks it and deletes the old version's folder. 1.2.0–1.2.8 ran every action by the
+# followed link, so after the upgrade each one failed with "No such file or directory".
+BR="$T/brew"; mkdir -p "$BR/Cellar/claude-account/1.0/bin" "$BR/Cellar/claude-account/2.0/bin" "$BR/bin"
+cp "$CA" "$BR/Cellar/claude-account/1.0/bin/claude-account"
+sed 's/^CA_VERSION="[^"]*"/CA_VERSION="9.9.9"/' "$CA" > "$BR/Cellar/claude-account/2.0/bin/claude-account"
+ln -s ../Cellar/claude-account/1.0/bin/claude-account "$BR/bin/claude-account"
+TM kill-session -t ui >/dev/null 2>&1
+TM new-session -d -s ui -x 160 -y 50 "env $SANDBOX_ENV bash '$BR/bin/claude-account' ui; echo UI-EXITED-\$?; sleep 600"
+wait_for 'this machine:' 60
+CAV=$(sed -n 's/^CA_VERSION="\([^"]*\)".*/\1/p' "$CA")
+ln -sfn ../Cellar/claude-account/2.0/bin/claude-account "$BR/bin/claude-account"; rm -rf "$BR/Cellar/claude-account/1.0"
+goto alpha; k Enter; wait_for 'Pause its 1 path' 15; k Down; k Down; k Enter; yes
+wait_for 'claude-account pause alpha' 60 && awk -F'\t' -v p="$T/A" '$1==p && $3=="paused"{f=1} END{exit !f}' "$M" \
+  && ok "an action after the upgrade runs the new version and works" || no "$(scr | head -12)"
+popup_close
+wait_for 'claude-account was updated to 9.9.9 — press q and run it again for the new view' 30 && ok "…and the view says it was updated and to reopen it" || no "$(scr | head -6)"
+scr | grep -q "v$CAV " && ok "…while its header still names the version it is running" || no "$(scr | head -2)"
+! scr | grep -q 'No such file' && ok "…with no 'No such file or directory' anywhere" || no "$(scr | grep 'No such')"
+X resume alpha >/dev/null 2>&1
+rm -f "$BR/bin/claude-account"
+k r; wait_for 'claude-account was removed or upgraded while this view was open — press q and run it again' 30 \
+  && ok "if claude-account is gone altogether, it says so plainly instead of a shell error" || no "$(scr | head -6)"
+k q; wait_for 'UI-EXITED-0' 15
+
 section "each window shows how long until it resets"
 python3 -I -B - "$REPO/libexec/ui.py" <<'PY' && ok "the countdown is the largest unit: 2h, 45m, 3d, now, nothing without a time" || no "the countdown helper is wrong"
 import datetime, importlib.util, sys

@@ -34,9 +34,21 @@ def tilde(p):
     return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + "/") else p
 
 
+def gone():
+    """What to say when the claude-account this view runs is no longer there: removed, or
+    upgraded at a path that named its version. The view itself is already in memory."""
+    if CA and os.path.isfile(CA):
+        return ""
+    # the instruction first: a narrow terminal cuts the end of the line
+    return ("claude-account was removed or upgraded while this view was open — press q and run it"
+            " again (nothing is at %s now)" % tilde(CA))
+
+
 def ca(args, timeout=120):
     """Run the CLI with no terminal and capture what it says. NO_COLOR keeps it plain;
     stdin is /dev/null so nothing it runs can sit waiting for an answer."""
+    if gone():
+        return 127, gone()
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
     try:
@@ -60,6 +72,8 @@ class Model(object):
         self.loading = set()
         self.lock = threading.Lock()
         self.error = ""
+        self.version = None       # the version this view first read; a later one = upgraded under it
+        self.newer = ""
 
     def reload(self):
         rc, out = ca(["_ui-state"])
@@ -69,6 +83,11 @@ class Model(object):
         try:
             self.state = json.loads(out)
             self.error = ""
+            v = self.state.get("version") or ""
+            if self.version is None:
+                self.version = v
+            elif v != self.version:
+                self.newer = v
             return True
         except ValueError:
             self.error = "could not read claude-account's state: " + out[:200]
@@ -584,7 +603,7 @@ class App(object):
             x = put(scr, 0, x, "  " + acct["label"])
         if mach != GLOBAL:
             x = put(scr, 0, x, "  (selected with use)", curses.A_DIM)
-        right = "sort: %s   v%s   ? keys" % (SORTS[self.sort], st.get("version", ""))
+        right = "sort: %s   v%s   ? keys" % (SORTS[self.sort], self.m.version or st.get("version", ""))
         if w - len(right) - 1 > x + 2:
             put(scr, 0, w - len(right) - 1, right, curses.A_DIM)
 
@@ -596,8 +615,12 @@ class App(object):
         dh = min(len(detail), max(0, h - 14)) if detail else 0
         list_top, list_bot = 2, h - 3 - (dh + 1 if dh else 0)
         rows = max(1, list_bot - list_top)
-        if self.m.error:
-            put(scr, 2, 1, self.m.error, P("red"))
+        # claude-account was upgraded while this view was open: its actions run the new one,
+        # but this screen is still the old view's code until it is opened again
+        newer = ("claude-account was updated to %s — press q and run it again for the new view"
+                 % self.m.newer) if self.m.newer else ""
+        if self.m.error or newer:
+            put(scr, 2, 1, self.m.error or newer, P("red") if self.m.error else P("yellow"))
             list_top += 2
             rows = max(1, rows - 2)
         if not self.items:
@@ -801,6 +824,9 @@ class App(object):
     def run_in_terminal(self, args, refetch=None):
         """For what needs the real terminal — a browser sign-in, a y/N of the CLI's own,
         a long report: leave the screen, run it, wait for Enter, come back."""
+        if gone():
+            self.msg = (gone(), -1)
+            return 127
         self.remember()
         curses.def_prog_mode()
         curses.endwin()

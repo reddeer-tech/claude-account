@@ -9,7 +9,7 @@ set -uo pipefail
 # you ran claude-account from — a cloned repo, say — ran as you, and several of these sites
 # are handed a whole credential on stdin. -I leaves out the cwd, PYTHON* variables and user
 # site-packages; only the standard library is used. tests/test_core.sh fails on a bare one.
-CA_VERSION="1.2.9"   # kept in step with package.json by `make version`
+CA_VERSION="1.2.10"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # How close a credential's SIGN-IN end must be before every identity line and doctor say so.
@@ -24,6 +24,7 @@ CA_GROUPS_FILE="${CLAUDE_ACCOUNTS_GROUPS:-$(dirname "$MAP")/groups.tsv}"
 # layout: bin/../libexec), then the per-user config dir. Keeps a from-source run,
 # a Homebrew install and an npm install all working from one file.
 _ca_self="${BASH_SOURCE[0]:-$0}"
+_ca_launch="$_ca_self"          # the path it was started by, links kept (the full-screen view runs it again)
 # Follow symlinks FIRST. Homebrew links /opt/homebrew/bin/claude-account -> ../Cellar/…/bin/,
 # and npm links into node_modules; dirname of the LINK is a directory with no libexec beside
 # it, so every candidate below missed and the lookup fell through to ~/.config — a file only
@@ -4368,7 +4369,13 @@ cmd_ui(){
   if [ ! -t 0 ] || [ ! -t 1 ]; then
     red "claude-account ui needs a terminal — in a script use: claude-account overview"; exit 2; fi
   python3 -I -c 'import curses' >/dev/null 2>&1 || { red "this python3 has no curses module, which the full-screen view needs"; dim "  claude-account overview prints the same picture"; exit 1; }
-  local self; self="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)/$(basename "$_ca_self")"
+  # The view runs claude-account again for every action, by the path it was STARTED by, links
+  # kept: Homebrew relinks /opt/homebrew/bin/claude-account on every upgrade, while the folder it
+  # points to (…/Cellar/claude-account/<version>/bin) is deleted by that upgrade. Following the
+  # link here, as 1.2.0–1.2.8 did, broke every action in a view left open across an upgrade
+  # ("No such file or directory", exit 127).
+  local self; self="$(cd "$(dirname "$_ca_launch")" 2>/dev/null && pwd -L)/$(basename "$_ca_launch")"
+  [ -f "$self" ] || self="$(cd "$(dirname "$_ca_self")" 2>/dev/null && pwd)/$(basename "$_ca_self")"
   CA_SELF="$self" CA_UI_NOTE="${AUTOSETUP_NOTE:-}" exec python3 -I "$ui"
 }
 
