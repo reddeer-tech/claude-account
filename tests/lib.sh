@@ -37,6 +37,9 @@ ca_sandbox(){
 #!/bin/bash
 # T_SECLOG=<file> records one line per call, so a test can assert a command read no login.
 [ -n "${T_SECLOG:-}" ] && echo "$*" >> "$T_SECLOG"
+# T_SECHOLD=<file>: every call touches <file>.in, then waits while <file> exists, so a test can
+# hold a command at a Keychain read: inside the rules lock, or half-way through a rename.
+if [ -n "${T_SECHOLD:-}" ]; then : > "$T_SECHOLD.in"; while [ -e "$T_SECHOLD" ]; do sleep 0.05; done; fi
 [ "${SEC_MODE:-}" = "err" ] && exit 36
 # T_KC=<dir> (opt-in) makes this a real store for what rename does: add-generic-password, on
 # argv or through `security -i` on stdin, writes the bytes to $T_KC/<service>; find prints

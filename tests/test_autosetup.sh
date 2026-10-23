@@ -171,9 +171,16 @@ TX "$T/err" list >/dev/null
 section "the lock: a dead holder is taken over, a live one is left alone"
 newhome h12; mkdir -p "$HOME/.config/claude-accounts/.setup.lock"; echo 99999 > "$HOME/.config/claude-accounts/.setup.lock/pid"
 TX /dev/null list >/dev/null; [ -e "$HOME/bin/claude" ] && [ ! -d "$HOME/.config/claude-accounts/.setup.lock" ] && ok "a lock whose holder is gone (pid 99999) is taken over, then released" || no "$(ls -la "$HOME/.config/claude-accounts")"
-newhome h13; mkdir -p "$HOME/.config/claude-accounts/.setup.lock"; sleep 300 & live=$!; echo $live > "$HOME/.config/claude-accounts/.setup.lock/pid"
+# a stand-in holder whose command line names claude-account, as a real one's does
+newhome h13; mkdir -p "$HOME/.config/claude-accounts/.setup.lock"; python3 -I -c 'import time; time.sleep(300)' claude-account & live=$!; echo $live > "$HOME/.config/claude-accounts/.setup.lock/pid"
 TX /dev/null list >/dev/null; [ ! -e "$HOME/bin/claude" ] && [ "$(cat "$HOME/.config/claude-accounts/.setup.lock/pid")" = "$live" ] && ok "a lock whose holder is alive is left alone, and this command just carries on" || no "it ran under a live lock"
-kill $live 2>/dev/null
+X setup > "$T/setup.out" 2>&1 & sp=$!; sleep 1.5
+kill -0 $sp 2>/dev/null && [ ! -e "$HOME/bin/claude" ] && ok "setup waits for an automatic run in another terminal" || no "setup did not wait"
+{ kill $live; wait $live; } 2>/dev/null; wait $sp; rc=$?
+[ $rc = 0 ] && [ -e "$HOME/bin/claude" ] && [ ! -d "$HOME/.config/claude-accounts/.setup.lock" ] && ok "…and runs once it ends, leaving no lock" || no "rc=$rc; $(cat "$T/setup.out")"
+newhome h14; mkdir -p "$HOME/.config/claude-accounts/.setup.lock"; sleep 300 & other=$!; echo $other > "$HOME/.config/claude-accounts/.setup.lock/pid"
+TX /dev/null list >/dev/null; [ -e "$HOME/bin/claude" ] && [ ! -d "$HOME/.config/claude-accounts/.setup.lock" ] && ok "a lock whose pid now belongs to something other than claude-account is taken over" || no "$(ls -la "$HOME/.config/claude-accounts")"
+{ kill $other; wait $other; } 2>/dev/null
 
 section "two commands at once: one sets up, both work"
 newhome h5

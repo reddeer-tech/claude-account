@@ -323,8 +323,24 @@ assert m.left(at(days=3, hours=8)) == "3d"
 assert m.left(at(seconds=-5)) == "now"
 assert m.left(None) == "" and m.left("not a time") == ""
 PY
+python3 -I -B - "$REPO/libexec/ui.py" <<'PY' && ok "the panel's countdown is redone at draw time, in the printed bars' wording" || no "the panel's countdown is wrong"
+import datetime, importlib.util, sys
+spec = importlib.util.spec_from_file_location("ui", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+now = datetime.datetime.now(datetime.timezone.utc)
+at = lambda **k: (now + datetime.timedelta(**k)).strftime("%Y-%m-%dT%H:%M:%SZ")
+assert m.until(at(days=3, hours=2, minutes=5, seconds=30)) == "in 3d 2h 5m"
+assert m.until(at(hours=2, minutes=30, seconds=30)) == "in 2h 30m"
+assert m.until(at(minutes=41, seconds=30)) == "in 41m"
+assert m.until(at(seconds=20)) == "now" and m.until(at(seconds=-5)) == "passed"
+assert m.until(None) == "" and m.until("x") == ""
+stale = {"resets": "resets Thu 1 Jan 8:00 AM (in 9h 0m)", "resets_at": at(hours=2, minutes=30, seconds=30)}
+assert m.resets_line(stale) == "resets Thu 1 Jan 8:00 AM (in 2h 30m)", m.resets_line(stale)
+assert m.resets_line({"resets": "used 5/10"}) == "used 5/10"
+assert m.resets_line({"resets": "resets 2030-01-01", "resets_at": at(hours=1)}) == "resets 2030-01-01"
+PY
 start "FAKE_RESETS_AT='$(date -u -v+2H -v+30M +%Y-%m-%dT%H:%M:%SZ)'"
 wait_for '5h +40% 2h +week +34% 2h' 60 && ok "the rows say it after each percentage: 5h 40% 2h · week 34% 2h" || no "$(scr | head -8)"
+scr | grep -qE 'resets .+ \(in 2h [0-9]+m\)' && ok "…and the panel under the list says it in full" || no "$(scr | tail -12)"
 mkdir -p "$T/E"; X add "$T/E" epsilon >/dev/null 2>&1; sign epsilon
 k r; wait_for "└ $T/E" 60 && ok "an account added while the view is open shows its path too" || no "$(scr | head -16)"
 k q; wait_for 'UI-EXITED-0' 15

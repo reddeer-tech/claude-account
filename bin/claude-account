@@ -9,7 +9,7 @@ set -uo pipefail
 # you ran claude-account from — a cloned repo, say — ran as you, and several of these sites
 # are handed a whole credential on stdin. -I leaves out the cwd, PYTHON* variables and user
 # site-packages; only the standard library is used. tests/test_core.sh fails on a bare one.
-CA_VERSION="1.2.8"   # kept in step with package.json by `make version`
+CA_VERSION="1.2.9"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # How close a credential's SIGN-IN end must be before every identity line and doctor say so.
@@ -125,6 +125,27 @@ plan = o.get("subscriptionType", "?"); tier = o.get("rateLimitTier", "?")
 print(plan + " | " + tier + when + signin)
 ACCTPY
 
+# Every read of a stored login goes through kc_read (1.2.9). `security -w` prints a value as
+# TEXT when it is plain ASCII and as HEX when it is not (measured 2026-10-18: a login holding
+# an "é", say in an MCP server's name, came back as 7b22…), and every reader here parses JSON
+# text, so such a login read as not signed in and a blanked one passed. A login is a JSON
+# object, so its text starts with "{" and its hex with a hex digit: the first character
+# decides, and the login is never held in a variable here. The exit status is security's.
+# Only kc_copy and rename read the raw value, because kc_copy writes back exactly those bytes.
+kc_read(){ # <service>
+  security find-generic-password -s "$1" -w 2>/dev/null | kc_text
+  return "${PIPESTATUS[0]}"
+}
+kc_text(){
+  local c
+  IFS= read -r -n 1 c || { printf '%s' "$c"; return 0; }
+  case "$c" in
+    [0-9a-fA-F]) if command -v xxd >/dev/null 2>&1; then { printf '%s' "$c"; cat; } | xxd -r -p 2>/dev/null
+                 else printf '%s' "$c"; cat; fi ;;
+    *) printf '%s' "$c"; cat ;;
+  esac
+}
+
 acct_identity(){ # <profile-dir or "" for global>
   # Report only what is genuinely PER-PROFILE. The OAuth token in the Keychain
   # carries subscriptionType / rateLimitTier / expiry; email and org do NOT live
@@ -136,7 +157,7 @@ acct_identity(){ # <profile-dir or "" for global>
     svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
   fi
   local blob rc
-  blob=$(security find-generic-password -s "$svc" -w 2>/dev/null); rc=$?
+  blob=$(kc_read "$svc"); rc=$?
   local out
   if [ -z "$blob" ]; then
     # exit 44 = errSecItemNotFound — genuinely no credential. Anything else is a PROBE
@@ -319,30 +340,85 @@ reserved_global(){ # <name> <verb>
   return 2
 }
 
+# Locks (1.2.9). A lock is a directory holding its owner's pid, made by mkdir, which is atomic
+# (macOS has no flock(1)). It is taken over only from a holder that is gone: a pid that is not
+# running, or is running something other than claude-account (the pid was reused), or no pid
+# at all two minutes after the directory appeared (killed between the two steps, or a version
+# before 1.2.9, which left the directory empty). One takeover at a time, behind a guard
+# directory, and the holder is judged again inside it, so two waiters can never both act on
+# the same dead holder; the lock path is only ever free while no one has it, so a third
+# command can at worst take it first. Before 1.2.9 the map lock broke any lock older than a
+# minute, so a slow command could lose it to a second one and both wrote.
+lock_take(){ # <dir> — one attempt; 0 = this process holds it now
+  local l="$1" p
+  if mkdir "$l" 2>/dev/null; then lock_stamp "$l"; return 0; fi
+  p=$(lock_pid "$l")
+  lock_gone "$l" "$p" || return 1
+  lock_guard "$l.take" || return 1
+  CA_GUARD="$l.take"
+  if [ "$(lock_pid "$l")" = "$p" ] && lock_gone "$l" "$p"; then
+    rm -rf -- "$l"
+    if mkdir "$l" 2>/dev/null; then lock_stamp "$l"; rmdir "$l.take" 2>/dev/null; CA_GUARD=""; return 0; fi
+  fi
+  rmdir "$l.take" 2>/dev/null; CA_GUARD=""; return 1
+}
+lock_pid(){ local p; p=$(cat "$1/pid" 2>/dev/null || true); case "$p" in *[!0-9]*) p="" ;; esac; printf '%s' "$p"; }
+lock_gone(){ # <dir> <the pid read from it, or "">
+  if [ -n "$2" ]; then ! lock_holder_alive "$2"
+  else [ -n "$(find "$1" -maxdepth 0 -mmin +2 2>/dev/null)" ]; fi
+}
+# The guard is held for a moment, so one a minute old was left by a command that was killed.
+lock_guard(){
+  mkdir "$1" 2>/dev/null && return 0
+  [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rmdir "$1" 2>/dev/null && mkdir "$1" 2>/dev/null
+}
+lock_stamp(){ { echo $$ > "$1/pid.$$" && mv "$1/pid.$$" "$1/pid"; } 2>/dev/null; return 0; }
+lock_holder_alive(){ # <pid> — unsure counts as alive
+  kill -0 "$1" 2>/dev/null || return 1
+  local c; c=$(ps -o command= -p "$1" 2>/dev/null) || return 0
+  case "$c" in ''|*claude-account*) return 0 ;; esac
+  return 1
+}
+lock_give(){ [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -rf -- "$1"; return 0; }
+
+# While a lock is held, every way out releases it. A signal ends the command as it normally
+# would (status 128+n), except inside crit_begin … crit_end, a sequence that must not stop
+# half-way: there it waits for crit_end. Before 1.2.9 the traps released the lock and let the
+# command carry on writing without it, so Ctrl+C never stopped a mutating command.
+CA_LOCK=""; CA_SETUP_LOCK=""; CA_GUARD=""; CA_SIGNAL=""; CA_CRIT=0
+on_signal(){ CA_SIGNAL=${CA_SIGNAL:-$1}; [ "$CA_CRIT" = 1 ] || exit "$CA_SIGNAL"; }
+locks_release(){
+  [ -n "$CA_GUARD" ] && rmdir "$CA_GUARD" 2>/dev/null
+  [ -n "$CA_LOCK" ] && lock_give "$CA_LOCK"; [ -n "$CA_SETUP_LOCK" ] && lock_give "$CA_SETUP_LOCK"; return 0
+}
+lock_traps(){
+  trap 'locks_release; [ -z "$CA_SIGNAL" ] || exit "$CA_SIGNAL"' EXIT
+  trap 'on_signal 130' INT; trap 'on_signal 143' TERM; trap 'on_signal 129' HUP; trap 'on_signal 141' PIPE
+}
+lock_traps_off(){ [ -n "$CA_LOCK$CA_SETUP_LOCK" ] || trap - EXIT INT TERM HUP PIPE; }
+crit_begin(){ CA_CRIT=1; }
+crit_end(){ CA_CRIT=0; [ -z "$CA_SIGNAL" ] || exit "$CA_SIGNAL"; }
+
 # F2 (from showrunner's IO_LOCK): write_map is atomic per writer, but two concurrent
-# mutating commands could still lose one writer's change between load and mv. mkdir is
-# the portable atomic primitive on macOS (no flock(1)). Taken once per process — every
-# mutating verb calls backup() first, and write_map/appenders re-take it defensively.
+# mutating commands could still lose one writer's change between load and mv. Taken once
+# per process — every mutating verb calls backup() first, and write_map/appenders re-take
+# it defensively — and held until the command ends.
 CA_MAP_LOCKED=0
 map_lock(){
   [ "$CA_MAP_LOCKED" = 1 ] && return 0
   local lock; lock="$(dirname "$MAP")/.map.lock"
   local i=0
-  while ! mkdir "$lock" 2>/dev/null; do
-    # a lock older than a minute is a crashed writer — break it
-    if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-      rmdir "$lock" 2>/dev/null; continue
-    fi
+  CA_LOCK="$lock"; lock_traps    # set first: lock_give only removes a lock holding this pid
+  until lock_take "$lock"; do
     i=$((i+1))
     if [ "$i" -gt 60 ]; then
-      red "another claude-account holds the map lock ($lock) — retry, or rmdir it if stale" >&2
+      CA_LOCK=""; lock_traps_off
+      red "another claude-account is changing your rules right now (pid $(cat "$lock/pid" 2>/dev/null || echo '?')) — try again in a moment" >&2
       return 1
     fi
     sleep 0.05
   done
   CA_MAP_LOCKED=1
-  CA_LOCK="$lock"
-  trap 'rmdir "$CA_LOCK" 2>/dev/null' EXIT INT TERM HUP PIPE
 }
 
 # F6 (from chatmux): tmp + rename for every one-line state file, so a reader never
@@ -575,7 +651,7 @@ acct_state(){ # <profile-dir or ""> -> signed-in | absent | error
   local svc="Claude Code-credentials"
   [ -n "${1:-}" ] && svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
   local blob rc
-  blob=$(security find-generic-password -s "$svc" -w 2>/dev/null); rc=$?
+  blob=$(kc_read "$svc"); rc=$?
   # ⚠ A credential can EXIST and be USELESS. When a refresh token dies, Claude Code POSTs
   # it, gets invalid_grant back, and writes
   #   {"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,...}}
@@ -1013,7 +1089,7 @@ sys.exit(1)') || return 1
   else
     security add-generic-password -U -a "$acct" -s "$2" -X "$hex" >/dev/null 2>&1
   fi
-  back=$(security find-generic-password -s "$2" -w 2>/dev/null) || return 1
+  back=$(security find-generic-password -s "$2" -w 2>/dev/null) || return 1   # raw: compared with the raw value
   [ "$back" = "$3" ]
 }
 
@@ -1039,7 +1115,8 @@ cmd_rename(){
   local osvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$old" | shasum -a 256 | cut -c1-8)"
   local nsvc="Claude Code-credentials-$(printf '%s' "$PROFILES/$new" | shasum -a 256 | cut -c1-8)"
   local secret rc moved=0
-  secret=$(security find-generic-password -s "$osvc" -w 2>/dev/null); rc=$?
+  crit_begin      # a Ctrl+C from here waits for the end, or for the undo of a failed step
+  secret=$(security find-generic-password -s "$osvc" -w 2>/dev/null); rc=$?   # raw: kc_copy writes these bytes
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 44 ]; then
     red "could not read the stored login of '$old' (security exit $rc) — nothing was renamed"; exit 1
   fi
@@ -1088,6 +1165,7 @@ RNPY
     dim "Moved its stored login to the new name (checked: the copy reads back identical)."
   fi
   grn "Renamed profile '$old' -> '$new'."
+  crit_end
 }
 
 cmd_export(){
@@ -1949,23 +2027,6 @@ setup_steps(){
   return $rc
 }
 
-# A lock directory holding its owner's pid. Taken over only from a holder that is gone (dead
-# pid, or no pid written 2+ minutes ago), by an atomic rename that is undone if it turns out to
-# have caught a lock somebody else had just made. (Security review: the first version could let
-# two runs proceed at once.)
-setup_lock_take(){ # <dir>
-  local l="$1" p
-  if mkdir "$l" 2>/dev/null; then echo $$ > "$l/pid"; return 0; fi
-  p=$(cat "$l/pid" 2>/dev/null || true)
-  if [ -n "$p" ]; then kill -0 "$p" 2>/dev/null && return 1
-  else [ -n "$(find "$l" -maxdepth 0 -mmin +2 2>/dev/null)" ] || return 1; fi
-  mv "$l" "$l.gone.$$" 2>/dev/null || return 1
-  if [ "$(cat "$l.gone.$$/pid" 2>/dev/null || true)" != "$p" ]; then mv "$l.gone.$$" "$l" 2>/dev/null; return 1; fi
-  rm -rf -- "$l.gone.$$"
-  mkdir "$l" 2>/dev/null || return 1
-  echo $$ > "$l/pid"; return 0
-}
-setup_lock_give(){ [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -rf -- "$1"; return 0; }
 setup_record_warnings(){
   if [ -n "$SETUP_WARNINGS" ]; then write_line "$SETUP_CFG/.setup-warnings" "${SETUP_WARNINGS%$'\n'}"
   else rm -f "$SETUP_CFG/.setup-warnings"; fi
@@ -1992,14 +2053,14 @@ autosetup(){
   SETUP_MODE=auto; SETUP_SAID=""; SETUP_WARNINGS=""
   setup_locate auto
   [ ! -f "$SETUP_STATE" ] && ! is_our_launcher "$SETUP_BIN/claude" && SETUP_FIRST=1
-  local lock="$SETUP_CFG/.setup.lock"
   mkdir -p "$SETUP_CFG" 2>/dev/null || { SETUP_MODE=explicit; return 0; }
-  setup_lock_take "$lock" || { SETUP_MODE=explicit; return 0; }     # another one is doing it
-  trap 'setup_lock_give "'"$lock"'"' EXIT INT TERM HUP
+  CA_SETUP_LOCK="$SETUP_CFG/.setup.lock"; lock_traps
+  if ! lock_take "$CA_SETUP_LOCK"; then                          # another one is doing it
+    CA_SETUP_LOCK=""; lock_traps_off; SETUP_MODE=explicit; return 0; fi
   setup_steps >/dev/null 2>&1 || true
   ss_set version "$CA_VERSION"
   setup_record_warnings
-  setup_lock_give "$lock"; trap - EXIT INT TERM HUP
+  lock_give "$CA_SETUP_LOCK"; CA_SETUP_LOCK=""; lock_traps_off
   SETUP_MODE=explicit
   if [ -n "$SETUP_SAID" ]; then
     if [ "$SETUP_FIRST" = 1 ]; then AUTOSETUP_NOTE="claude-account set itself up — undo all of it with: claude-account uninstall"
@@ -2011,12 +2072,29 @@ autosetup(){
   return 0
 }
 
+# setup and uninstall wait for an automatic run in another terminal rather than race it
+setup_lock_wait(){
+  local i=0
+  mkdir -p "$SETUP_CFG" 2>/dev/null
+  CA_SETUP_LOCK="$SETUP_CFG/.setup.lock"; lock_traps
+  until lock_take "$CA_SETUP_LOCK"; do
+    i=$((i+1))
+    if [ "$i" -gt 600 ]; then
+      CA_SETUP_LOCK=""; lock_traps_off
+      red "another claude-account is setting this Mac up right now — try again in a moment" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+}
+
 cmd_setup(){
   # Opt-in wiring. A package install deliberately does NOT do this itself: linking `claude`
   # ahead of the real binary is a choice, made by running claude-account (any command does it
   # since 1.2.8) or this command. This one runs every step, reports each, puts back anything
   # removed by hand, and turns the automatic run back on after an `uninstall`.
   SETUP_MODE=explicit
+  setup_lock_wait || return 1
   ss_set auto
   local rc=0
   SETUP_WARNINGS=""
@@ -2032,6 +2110,7 @@ cmd_uninstall(){
   # the PATH block, the launchers. Rules, groups, profiles and logins are kept, so `setup` brings
   # it all back with no sign-in. The automatic run stays off until the next `setup`.
   SETUP_MODE=explicit
+  setup_lock_wait || return 1
   setup_locate uninstall
   local wrap="$SETUP_BIN/claude-vscode-wrapper" el es ex ea cn r f prof
   if vscode_status_srcdir >/dev/null 2>&1; then cmd_vscode_status remove 2>/dev/null | grep -v 'Restart the editor once' || true; fi
@@ -2644,7 +2723,7 @@ cmd_logout(){
 refresh_token_if_needed(){ # <profile-dir or "" for global> ; 0=ok 1=still bad 2=not needed
   local pdir="${1:-}" svc="Claude Code-credentials"
   [ -n "$pdir" ] && svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-  local blob; blob=$(security find-generic-password -s "$svc" -w 2>/dev/null)
+  local blob; blob=$(kc_read "$svc")
   [ -z "$blob" ] && return 3                      # no credential at all
   local exp rexp
   exp=$(printf '%s' "$blob"  | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('expiresAt',0))" 2>/dev/null)
@@ -2658,7 +2737,7 @@ refresh_token_if_needed(){ # <profile-dir or "" for global> ; 0=ok 1=still bad 2
   local rc2; rc2=$(real_claude) || return 1
   ( cd / && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
       ${pdir:+CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir"} "$rc2" -p "hi" >/dev/null 2>&1 ) || true
-  local exp2; exp2=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+  local exp2; exp2=$(kc_read "$svc" \
       | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('expiresAt',0))" 2>/dev/null)
   [ -n "$exp2" ] && [ "$exp2" -gt "$now" ] && return 0 || return 1
 }
@@ -2737,7 +2816,7 @@ cmd_usage(){
   fi
   local svc="Claude Code-credentials"
   [ -n "$pdir" ] && svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-  local tok; tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+  local tok; tok=$(kc_read "$svc" \
       | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
   if [ -z "$tok" ]; then red "No login for '$name'."; dim "  claude-account login $name"; exit 1; fi
   echo "USAGE — $name${label:+  ($label)}"
@@ -2750,7 +2829,7 @@ cmd_usage(){
   if printf '%s' "$body" | grep -q 'authentication_error\|token has expired'; then
     dim "  access token expired — refreshing…"
     if refresh_token_if_needed "$pdir"; then
-      tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+      tok=$(kc_read "$svc" \
             | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
       body=$(usage_fetch "$tok")
     fi
@@ -2795,7 +2874,7 @@ GLPY
 acct_is_expired(){ # <profile-dir or "" for global> ; 0 = expired
   local svc="Claude Code-credentials"
   [ -n "${1:-}" ] && svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
-  local blob; blob=$(security find-generic-password -s "$svc" -w 2>/dev/null)
+  local blob; blob=$(kc_read "$svc")
   [ -z "$blob" ] && return 1
   printf '%s' "$blob" | python3 -I -c "
 import json,sys,time
@@ -2816,7 +2895,7 @@ acct_signin(){ # <profile-dir or "" for global>
   [ -n "${1:-}" ] && svc="Claude Code-credentials-$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
   # Piped straight into python, never held in a variable: an assignment prints its value
   # under `bash -x`, and this one would be the whole credential.
-  security find-generic-password -s "$svc" -w 2>/dev/null | python3 -I -c '
+  kc_read "$svc" | python3 -I -c '
 import json,sys,time,datetime
 try: o=json.load(sys.stdin).get("claudeAiOauth") or {}
 except Exception: raise SystemExit
@@ -3165,7 +3244,7 @@ usage_get(){ # <profile-dir or "" for global>
   local pdir="$1" svc="Claude Code-credentials" tok body
   CA_UG_KIND=err; CA_UG_TEXT=""; CA_UG_BODY=""
   [ -n "$pdir" ] && svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
-  tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+  tok=$(kc_read "$svc" \
       | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
   if [ -z "$tok" ]; then CA_UG_KIND=note; CA_UG_TEXT="(not signed in — no usage to fetch)"; return 0; fi
   body=$(usage_fetch "$tok")
@@ -3174,7 +3253,7 @@ usage_get(){ # <profile-dir or "" for global>
       CA_UG_KIND=note; CA_UG_TEXT="(access token expired — not renewing under --no-refresh)"; return 0; fi
     refresh_token_if_needed "$pdir" >/dev/null 2>&1; local _rrc=$?
     if [ "$_rrc" = 0 ] || [ "$_rrc" = 2 ]; then
-      tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+      tok=$(kc_read "$svc" \
             | python3 -I -c "import json,sys;print((json.load(sys.stdin).get('claudeAiOauth') or {}).get('accessToken',''))" 2>/dev/null)
       body=$(usage_fetch "$tok")
     fi

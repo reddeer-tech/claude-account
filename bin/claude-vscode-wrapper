@@ -43,6 +43,8 @@ if [ -z "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" 
     # CLAUDE_ACCOUNTS_STRICT=1 restores the old fail-fast behaviour.
     svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
     _blob=$(security find-generic-password -s "$svc" -w 2>/dev/null); _src=$?
+    # `security -w` prints a login holding any non-ASCII as hex (1.2.9): read it as the text it is
+    case "$_blob" in [0-9a-fA-F]*) _blob=$(printf '%s' "$_blob" | xxd -r -p 2>/dev/null) ;; esac
     # ⚠ A credential can EXIST and be USELESS. When a refresh token dies, Claude Code
     # writes {"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,...}} over
     # the slot, so the entry is present and a bare exit-0 probe read it as signed in. That

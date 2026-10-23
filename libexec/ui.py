@@ -247,6 +247,40 @@ def left(ts):
     return "%dm" % (s // 60)
 
 
+def until(ts):
+    """The panel's countdown, at the granularity the printed bars use (in 3d 2h 5m, in 41m,
+    now, passed), worked out at draw time like the rows'."""
+    if not ts:
+        return ""
+    try:
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        s = (t - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    except (ValueError, TypeError):
+        return ""
+    if s < 0:
+        return "passed"
+    d, x = divmod(int(s), 86400)
+    h, x = divmod(x, 3600)
+    m = x // 60
+    if d:
+        return "in %dd %dh %dm" % (d, h, m)
+    if h:
+        return "in %dh %dm" % (h, m)
+    if m:
+        return "in %dm" % m
+    return "now"
+
+
+def resets_line(r):
+    """The reset text under a bar. The date comes from the fetch; the countdown in brackets is
+    redone at draw time, so it no longer stands still while the rows' countdowns move."""
+    text = r.get("resets") or ""
+    rel = until(r.get("resets_at"))
+    if rel and text.endswith(")") and " (" in text:
+        return text[:text.rindex(" (")] + " (" + rel + ")"
+    return text
+
+
 # ── the app ──────────────────────────────────────────────────────────────────────────
 
 class App(object):
@@ -601,7 +635,7 @@ class App(object):
                     x = put(scr, y, x, "  [")
                     x = put(scr, y, x, "█" * filled, P.band(v))
                     x = put(scr, y, x, "░" * (20 - filled) + "]", curses.A_DIM)
-                    put(scr, y, x + 2, r.get("resets") or "")
+                    put(scr, y, x + 2, resets_line(r))
                 else:
                     put(scr, y, 1, line, attr)
                 y += 1

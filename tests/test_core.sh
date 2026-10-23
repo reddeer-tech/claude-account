@@ -890,4 +890,102 @@ SEC_MODE=err X rename rsmall2 rsmall3 >/dev/null 2>&1; rc=$?
 [ $rc = 1 ] && [ -d "$T/profiles/rsmall2" ] && ok "a Keychain probe error refuses the rename instead of leaving the login behind" || no "rc=$rc"
 grep -c 'security add-generic-password' "$CA" | grep -qx 1 && ok "one place in the CLI writes a login" || no "$(grep -n 'security add-generic-password' "$CA")"
 
+section "a login holding non-ASCII, which security prints as hex, reads the same everywhere"
+# 1.2.9. `security -w` prints a non-ASCII value as hex (measured 2026-10-18). Every reader parsed
+# JSON text, so such a login read as not signed in, and a blanked one as signed in by the
+# launchers. The stub's store prints hex exactly as the real tool does.
+mkdir -p "$T/Uni" "$T/Unib" "$T/profiles/uni" "$T/profiles/unib"
+rexp=$(python3 -I -c 'import time; print(int((time.time()+2*86400)*1000))')
+printf '{"claudeAiOauth":{"accessToken":"tok-uni","refreshToken":"r","expiresAt":4102444800000,"refreshTokenExpiresAt":%s,"subscriptionType":"max","rateLimitTier":"demo"},"mcpOAuth":{"Café|1a2b":{"accessToken":""}}}' "$rexp" > "$KC/$(svc_of uni)"
+printf '{"mcpOAuth":{"Café|1a2b":{"accessToken":""}},"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"subscriptionType":"team","rateLimitTier":"default_raven"}}' > "$KC/$(svc_of unib)"
+X add "$T/Uni" uni >/dev/null 2>&1; X add "$T/Unib" unib >/dev/null 2>&1
+security find-generic-password -s "$(svc_of uni)" -w | grep -qx '[0-9a-f]*' && ok "the stub prints such a login as hex, like security does" || no "the stub printed text"
+lst=$(X list --no-refresh 2>&1)
+grep -q "$T/Uni .*max | demo" <<<"$lst" && ok "list reads its plan and tier" || no "$(grep "$T/Uni " <<<"$lst")"
+grep -q "$T/Uni .*sign in again by" <<<"$lst" && ok "…and when its sign-in ends" || no "$(grep "$T/Uni " <<<"$lst")"
+grep -q "$T/Unib .*NOT LOGGED IN" <<<"$lst" && ok "…and calls the blanked one NOT LOGGED IN" || no "$(grep "$T/Unib" <<<"$lst")"
+js=$(X list --json 2>&1)
+python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); p={x["name"]:x["signed_in"] for x in d["profiles"]}; assert p["uni"] is True and p["unib"] is False, p' "$js" && ok "list --json: true and false" || no "$js"
+dout=$(X doctor --no-refresh 2>&1)
+grep -q 'uni: signed in' <<<"$dout" && grep -qE 'unib.*(NOT signed in|not signed in)' <<<"$dout" && ok "doctor agrees on both" || no "$(grep -E 'uni' <<<"$dout")"
+# earlier sections leave a curl stub that records nothing: this one keeps the header it was sent
+printf '#!/bin/bash\n[ -t 0 ] || grep -i "^Authorization:" >> "$T_CURLED"\nprintf %%s %s\n' "'{\"limits\":[]}'" > "$T/bin/curl"; chmod +x "$T/bin/curl"
+: > "$T_CURLED"; X usage uni >/dev/null 2>&1
+grep -q '^Authorization: Bearer tok-uni$' "$T_CURLED" && ok "usage sends its access token" || no "curl was sent: $(sed 's/Bearer .*/Bearer …/' "$T_CURLED")"
+sout=$(cd "$T/Uni" && env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-shim" --version 2>&1)
+grep -qi 'not signed in' <<<"$sout" && no "the shim called it not signed in: $sout" || ok "the terminal shim routes it without a word"
+sout=$(cd "$T/Unib" && env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-shim" --version 2>&1)
+grep -qi 'not signed in' <<<"$sout" && ok "…and falls back from the blanked one with the warning" || no "shim: $sout"
+vout=$(cd "$T/Unib" && env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-vscode-wrapper" "$T/bin/claude" --version 2>&1)
+grep -qi 'not signed in' <<<"$vout" && ok "…so does the VS Code wrapper" || no "wrapper: $vout"
+for st in "Uni:yes" "Unib:no"; do d=${st%%:*}; want=${st#*:}
+  got=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-whoami" --porcelain "$T/$d" 2>&1 | cut -f3)
+  [ "$got" = "$want" ] && ok "claude-whoami --porcelain: $want" || no "porcelain $d: $got"
+done
+wout=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-whoami" "$T/Unib" 2>&1)
+grep -q 'login *: signed in' <<<"$wout" && no "claude-whoami called the blanked one signed in: $wout" || ok "claude-whoami's full view agrees"
+X use uni >/dev/null 2>&1; mkdir -p "$T/UniFree"
+wout=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN bash "$REPO/bin/claude-whoami" "$T/UniFree" 2>&1)
+grep -q 'login *: signed in' <<<"$wout" && ok "…and so does its view of a selected account" || no "$wout"
+X use global >/dev/null 2>&1
+raw=$(grep -n 'find-generic-password.* -w' "$CA" | grep -v 'kc_text$' | grep -vc '# raw:')
+[ "$raw" = 0 ] && [ "$(grep -c 'find-generic-password.* -w.*# raw:' "$CA")" = 2 ] && ok "every login read in the CLI goes through kc_read, but the two raw ones rename needs" || no "$(grep -n 'find-generic-password.* -w' "$CA")"
+for f in claude-shim claude-vscode-wrapper claude-whoami; do
+  [ "$(grep -c 'find-generic-password.* -w' "$REPO/bin/$f")" = "$(grep -c 'xxd -r -p' "$REPO/bin/$f")" ] && ok "$f decodes every login it reads" || no "$f: $(grep -n 'find-generic-password\|xxd' "$REPO/bin/$f")"
+done
+
+section "the rules lock: kept by a slow command, taken from a gone holder, released on a signal"
+LK="$(dirname "$CLAUDE_ACCOUNTS_MAP")/.map.lock"
+lk_clear(){ rm -f "$LK/pid"; rmdir "$LK" 2>/dev/null; }
+lk_wait(){ local i=0; until [ -e "$T/hold.in" ] || [ $i -gt 400 ]; do sleep 0.05; i=$((i+1)); done; }
+mkdir -p "$T/Lk1" "$T/Lk2" "$T/Lk3" "$T/Lk4"
+X add "$T/Lk1" lk1 >/dev/null 2>&1
+[ ! -e "$LK" ] && ok "a finished command leaves no lock behind" || no "$(ls -la "$LK")"
+dead=99998; while kill -0 $dead 2>/dev/null; do dead=$((dead-1)); done
+mkdir "$LK"; echo $dead > "$LK/pid"
+X add "$T/Lk2" lk2 >/dev/null 2>&1 && grep -q "$T/Lk2" "$CLAUDE_ACCOUNTS_MAP" && [ ! -e "$LK" ] && ok "a lock whose holder is gone is taken over at once, and released" || no "$(ls -la "$LK" 2>&1)"
+sleep 60 & other=$!; mkdir "$LK"; echo $other > "$LK/pid"
+X unbind "$T/Lk2" >/dev/null 2>&1 && ! grep -q "$T/Lk2" "$CLAUDE_ACCOUNTS_MAP" && [ ! -e "$LK" ] && ok "so is one whose pid now belongs to something other than claude-account" || no "$(ls -la "$LK" 2>&1)"
+{ kill $other; wait $other; } 2>/dev/null; lk_clear
+python3 -I -c 'import time; time.sleep(60)' claude-account & holder=$!; mkdir "$LK"; echo $holder > "$LK/pid"
+out=$(X add "$T/Lk3" lk3 2>&1); rc=$?
+[ $rc = 1 ] && grep -q 'another claude-account is changing your rules right now' <<<"$out" && ! grep -q "$T/Lk3" "$CLAUDE_ACCOUNTS_MAP" && [ "$(cat "$LK/pid")" = "$holder" ] \
+  && ok "a live claude-account's lock is waited for, then the command refuses, says why, and leaves it alone" || no "rc=$rc: $out"
+{ kill $holder; wait $holder; } 2>/dev/null; lk_clear
+mkdir "$LK"
+out=$(X add "$T/Lk3" lk3 2>&1); rc=$?
+[ $rc = 1 ] && ! grep -q "$T/Lk3" "$CLAUDE_ACCOUNTS_MAP" && ok "an empty lock, as versions before 1.2.9 make, counts as held while it is new" || no "rc=$rc: $out"
+touch -t "$(date -v-3M +%Y%m%d%H%M.%S)" "$LK"
+X add "$T/Lk3" lk3 >/dev/null 2>&1 && grep -q "$T/Lk3" "$CLAUDE_ACCOUNTS_MAP" && [ ! -e "$LK" ] && [ ! -e "$LK.take" ] && ok "…and is taken over once it is two minutes old, leaving no takeover guard" || no "$(ls -la "$LK" "$LK.take" 2>&1)"
+lk_clear
+mkdir "$LK"; echo $dead > "$LK/pid"; mkdir "$LK.take"
+out=$(X unbind "$T/Lk3" 2>&1); rc=$?
+[ $rc = 1 ] && grep -q "$T/Lk3" "$CLAUDE_ACCOUNTS_MAP" && ok "while another command is taking a dead lock over, this one waits its turn" || no "rc=$rc: $out"
+touch -t "$(date -v-2M +%Y%m%d%H%M.%S)" "$LK.take"
+X unbind "$T/Lk3" >/dev/null 2>&1 && ! grep -q "$T/Lk3" "$CLAUDE_ACCOUNTS_MAP" && [ ! -e "$LK" ] && [ ! -e "$LK.take" ] && ok "…and a takeover guard left by a killed command is cleared after a minute" || no "$(ls -la "$LK" "$LK.take" 2>&1)"
+lk_clear
+
+# a signal outside a rename ends the command and releases the lock (bash stood in for Ctrl+C:
+# a background job ignores SIGINT, so these send TERM)
+: > "$T/hold"; rm -f "$T/hold.in"
+T_SECHOLD="$T/hold" bash "$CA" resume "$T/Lk1" > "$T/lk.out" 2>&1 & bp=$!
+lk_wait; [ "$(cat "$LK/pid" 2>/dev/null)" = "$bp" ] && ok "a command holds the lock under its own pid" || no "pid $(cat "$LK/pid" 2>&1) vs $bp"
+kill -TERM $bp; rm -f "$T/hold"; wait $bp; rc=$?
+[ $rc = 143 ] && [ ! -e "$LK" ] && ! grep -q 'routing active again' "$T/lk.out" && ok "a signal ends it (exit 143), and the lock goes with it" || no "rc=$rc; $(cat "$T/lk.out"); $(ls -la "$LK" 2>&1)"
+# a lock taken over meanwhile is not its to remove
+: > "$T/hold"; rm -f "$T/hold.in"
+T_SECHOLD="$T/hold" bash "$CA" resume "$T/Lk1" > "$T/lk.out" 2>&1 & bp=$!
+lk_wait; python3 -I -c 'import time; time.sleep(60)' claude-account & holder=$!; echo $holder > "$LK/pid"
+rm -f "$T/hold"; wait $bp
+[ "$(cat "$LK/pid" 2>/dev/null)" = "$holder" ] && ok "a command never removes a lock that is no longer its own" || no "$(ls -la "$LK" 2>&1)"
+{ kill $holder; wait $holder; } 2>/dev/null; lk_clear
+# inside a rename the signal waits, so the rename happens whole
+mk_login lk4 1200; X add "$T/Lk4" lk4 >/dev/null 2>&1; cp "$KC/$(svc_of lk4)" "$T/lk4.orig"
+: > "$T/hold"; rm -f "$T/hold.in"
+T_SECHOLD="$T/hold" bash "$CA" rename lk4 lk5 > "$T/lk.out" 2>&1 & bp=$!
+lk_wait; kill -TERM $bp; sleep 0.5; rm -f "$T/hold"; wait $bp; rc=$?
+[ $rc = 143 ] && [ -d "$T/profiles/lk5" ] && [ ! -e "$T/profiles/lk4" ] && awk -F'\t' -v p="$T/Lk4" '$1==p && $2=="lk5"{f=1} END{exit !f}' "$CLAUDE_ACCOUNTS_MAP" \
+  && cmp -s "$KC/$(svc_of lk5)" "$T/lk4.orig" && [ ! -e "$KC/$(svc_of lk4)" ] && [ ! -e "$LK" ] \
+  && ok "a signal during rename waits for it to finish whole: folder, rule and login moved, then exit 143" || no "rc=$rc; $(cat "$T/lk.out"); $(ls "$T/profiles")"
+
 finish

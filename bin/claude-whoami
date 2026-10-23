@@ -45,6 +45,8 @@ if [ "$PORC" = 1 ]; then
   # outside a function — so a missing credential printed "error" and a BLANKED one "yes"
   # (found 2026-10-18; the VS Code status item reads this line). Decide on the exit status.
   _wb=$(security find-generic-password -s "Claude Code-credentials-$(printf '%s' "$pd" | shasum -a 256 | cut -c1-8)" -w 2>/dev/null); _wrc=$?
+  # `security -w` prints a login holding any non-ASCII as hex (1.2.9): read it as the text it is
+  case "$_wb" in [0-9a-fA-F]*) _wb=$(printf '%s' "$_wb" | xxd -r -p 2>/dev/null) ;; esac
   if [ "$_wrc" -eq 0 ]; then
     # a blanked credential (see claude-shim) is present but unusable — not "signed in"
     case "$_wb" in *'"claudeAiOauth":{"accessToken":"",'*) si=no ;; *) si=yes ;; esac
@@ -97,6 +99,7 @@ elif [ "$(printf '%s' "$line" | cut -f3)" = "(fallback)" ]; then
   echo "profile dir   : $pdir"
   svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
   _wb=$(security find-generic-password -s "$svc" -w 2>/dev/null); _fsrc=$?
+  case "$_wb" in [0-9a-fA-F]*) _wb=$(printf '%s' "$_wb" | xxd -r -p 2>/dev/null) ;; esac   # hex = non-ASCII (1.2.9)
   case "$_wb" in *'"claudeAiOauth":{"accessToken":"",'*) _fsrc=44 ;; esac   # blanked = not signed in
   if [ "$_fsrc" -eq 0 ]; then
     echo "login         : signed in"
@@ -119,6 +122,7 @@ else
   # in step, or lift it into resolve.sh.
   svc="Claude Code-credentials-$(printf '%s' "$pdir" | shasum -a 256 | cut -c1-8)"
   _wb=$(security find-generic-password -s "$svc" -w 2>/dev/null); _src=$?
+  case "$_wb" in [0-9a-fA-F]*) _wb=$(printf '%s' "$_wb" | xxd -r -p 2>/dev/null) ;; esac   # hex = non-ASCII (1.2.9)
     case "$_wb" in *'"claudeAiOauth":{"accessToken":"",'*) _src=44 ;; esac   # blanked = not signed in
   if [ "$_src" -eq 0 ]; then
     echo "login         : signed in"
