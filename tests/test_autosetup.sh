@@ -182,6 +182,94 @@ newhome h14; mkdir -p "$HOME/.config/claude-accounts/.setup.lock"; sleep 300 & o
 TX /dev/null list >/dev/null; [ -e "$HOME/bin/claude" ] && [ ! -d "$HOME/.config/claude-accounts/.setup.lock" ] && ok "a lock whose pid now belongs to something other than claude-account is taken over" || no "$(ls -la "$HOME/.config/claude-accounts")"
 { kill $other; wait $other; } 2>/dev/null
 
+section "a Mac with no Claude Code gets it from Anthropic's installer, without being asked (1.2.11)"
+# A PATH with every stub but claude, and nothing of this Mac's: its own claude lives in
+# ~/.local/bin of the REAL home, which no test home has.
+NC="$T/nc-bin"; mkdir -p "$NC"; for f in "$T/bin"/*; do [ "$(basename "$f")" = claude ] || ln -sf "$f" "$NC/"; done
+NCP="$NC:/usr/bin:/bin:/usr/sbin:/sbin"
+ncount(){ grep -c . "$T_INSTALLER_LOG" 2>/dev/null || true; }
+# the folder this run downloaded into, from the -o of the curl call it made
+dlfile(){ sed -n 's|.* -o \([^ ]*/install\.sh\) .*|\1|p' "$T_CURLED" | tail -1; }
+if [ -e /opt/homebrew/bin/claude ] || [ -e /usr/local/bin/claude ]; then
+  echo "  SKIP  this Mac has claude in /opt/homebrew/bin or /usr/local/bin, which claude-account always finds"
+else
+newhome h20; : > "$T_INSTALLER_LOG"; : > "$T_CURLED"
+PATH="$NCP" TX "$T/err" list >/dev/null
+[ "$(ncount)" = 1 ] && [ -x "$HOME/.local/bin/claude" ] && ok "the first command installs Claude Code" || no "runs=$(ncount); $(cat "$T/err")"
+grep -q "installing it with Anthropic's installer (one time, it can take a few minutes)" "$T/err" && grep -q "Installed Claude Code 9.9.9 with Anthropic's installer, at ~/.local/bin/claude" "$T/err" \
+  && ok "…says it is doing it while it does, then what it installed" || no "$(cat "$T/err")"
+grep -q -- "--proto =https" "$T_CURLED" && grep -q -- "-o " "$T_CURLED" && grep -q 'https://claude.ai/install.sh' "$T_CURLED" \
+  && ok "…downloading the installer over https only, to a file, never piped into bash" || no "$(cat "$T_CURLED")"
+grep -qx 'ran stdin=none' "$T_INSTALLER_LOG" && ok "…and running it with nothing to read from the terminal" || no "$(cat "$T_INSTALLER_LOG")"
+f=$(dlfile); case "$f" in "${TMPDIR:-/tmp}"*/ca-claude-install.*/install.sh) [ ! -e "$(dirname "$f")" ] && ok "…into a private temporary folder, gone afterwards" || no "$f is still there" ;; *) no "downloaded to '$f'" ;; esac
+[ "$(stat -f %Lp "$HOME/.config/claude-accounts/claude-install.log")" = 600 ] && ok "…its output kept in a private log" || no "$(ls -l "$HOME/.config/claude-accounts/claude-install.log")"
+grep -qx 'seen.claude=1' "$HOME/.config/claude-accounts/.setup-state" && grep -qx 'installed.claude=1' "$HOME/.config/claude-accounts/.setup-state" && ok "…and it is recorded" || no "$(cat "$HOME/.config/claude-accounts/.setup-state")"
+PATH="$NCP" TX "$T/err" list >/dev/null
+[ "$(ncount)" = 1 ] && [ ! -s "$T/err" ] && ok "the next command does nothing more" || no "runs=$(ncount); $(cat "$T/err")"
+rm -f "$HOME/.local/bin/claude"; sed -i '' 's/^version=.*/version=0.0.0/' "$HOME/.config/claude-accounts/.setup-state"
+PATH="$NCP" TX "$T/err" list >/dev/null
+[ "$(ncount)" = 1 ] && grep -q 'Claude Code is not installed any more' "$T/err" && ok "removed by hand, it stays removed on the next upgrade, and that is said" || no "runs=$(ncount); $(cat "$T/err")"
+out=$(PATH="$NCP" X setup 2>&1)
+[ "$(ncount)" = 2 ] && [ -x "$HOME/.local/bin/claude" ] && ok "claude-account setup installs it again" || no "runs=$(ncount); $out"
+out=$(PATH="$NCP" X uninstall 2>&1)
+grep -q 'Claude Code, which setup installed, stays installed' <<<"$out" && [ -x "$HOME/.local/bin/claude" ] && ok "uninstall leaves Claude Code installed, and says how to remove it" || no "$out"
+
+newhome h21; : > "$T_INSTALLER_LOG"
+PATH="$NCP" FAKE_INSTALL_FAIL=1 TX "$T/err" list >/dev/null
+grep -q "Could not install Claude Code (Anthropic's installer exit 1; details in ~/.config/claude-accounts/claude-install.log)" "$T/err" \
+  && grep -q 'Could not install Claude Code' "$HOME/.config/claude-accounts/.setup-warnings" && ok "a failed install is said, with the log, and doctor keeps showing it" || no "$(cat "$T/err")"
+grep -q 'Download failed' "$HOME/.config/claude-accounts/claude-install.log" && ok "…the installer's own words are in the log" || no "$(cat "$HOME/.config/claude-accounts/claude-install.log")"
+newhome h22; : > "$T_INSTALLER_LOG"
+PATH="$NCP" FAKE_INSTALL_HTML=1 TX "$T/err" list >/dev/null
+[ "$(ncount)" = 0 ] && grep -q 'was not a script' "$T/err" && ok "a download that is not a script (a network's sign-in page) is never run" || no "runs=$(ncount); $(cat "$T/err")"
+
+newhome h23; : > "$T_INSTALLER_LOG"
+out=$(PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 X global status </dev/null 2>&1); rc=$?
+[ $rc = 127 ] && grep -q 'Claude Code is not installed, and this needs it' <<<"$out" && [ "$(ncount)" = 0 ] \
+  && ok "with no terminal, a command that runs claude says how to get it and installs nothing" || no "rc=$rc runs=$(ncount): $out"
+out=$(PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 TX "$T/err" global status);
+[ "$(ncount)" = 1 ] && grep -q '9.9.9 (Claude Code)' <<<"$out" && ok "at a terminal, it installs Claude Code and carries on with the command" || no "runs=$(ncount): $out $(cat "$T/err")"
+newhome h24; : > "$T_INSTALLER_LOG"
+out=$(PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 X global usage </dev/null 2>&1); rc=$?
+[ $rc != 127 ] && [ "$(ncount)" = 0 ] && ! grep -q 'not installed' <<<"$out" && ok "global usage, which does not run claude, neither needs nor installs it" || no "rc=$rc: $out"
+mkdir -p "$T/lcopy"; printf '#!/bin/bash\n# Per-path Claude account routing\nexit 0\n' > "$T/lcopy/claude"; chmod +x "$T/lcopy/claude"
+out=$(PATH="$T/lcopy:$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 X global status </dev/null 2>&1); rc=$?
+[ $rc = 127 ] && ok "a copy of claude-account's own launcher is never taken for Claude Code" || no "rc=$rc: $out"
+out=$(PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 X doctor </dev/null 2>&1)
+grep -q 'Claude Code is not installed — nothing can sign in, and claude in a terminal fails. claude-account setup installs it' <<<"$out" && ok "doctor names the fix" || no "$(grep -i claude <<<"$out" | head -5)"
+newhome h26; : > "$T_INSTALLER_LOG"; mkdir -p "$HOME/.local/bin"; cp "$REPO/bin/claude-shim" "$HOME/.local/bin/claude"
+out=$(PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 TX "$T/err" global status);
+[ "$(ncount)" = 0 ] && grep -q "its installer would write ~/.local/bin/claude, where claude-account's launcher is" "$T/err" && cmp -s "$REPO/bin/claude-shim" "$HOME/.local/bin/claude" \
+  && ok "with the launcher in ~/.local/bin, the installer is never run over it, and it says how to move it" || no "runs=$(ncount): $(cat "$T/err")"
+out=$(CLAUDE_ACCOUNTS_BINDIR="$HOME/.local/bin" X setup 2>&1)
+grep -q "will not put the launchers in $HOME/.local/bin: it is where Claude Code's own installer puts claude" <<<"$out" && ok "setup will not put the launchers in ~/.local/bin" || no "$out"
+newhome h27; : > "$T_INSTALLER_LOG"
+out=$(PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 CI=1 TX "$T/err" global status)
+[ "$(ncount)" = 0 ] && grep -q 'it is not installed in CI' "$T/err" && ok "in CI, nothing installs it, even at a terminal" || no "runs=$(ncount): $(cat "$T/err")"
+mkdir -p "$T/sbx"; out=$(PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 CLAUDE_ACCOUNTS_MAP="$T/sbx/paths.map" CLAUDE_ACCOUNTS_DIR="$T/sbx/profiles" TX "$T/err" global status)
+[ "$(ncount)" = 0 ] && grep -q 'CLAUDE_ACCOUNTS_MAP or CLAUDE_ACCOUNTS_DIR points elsewhere' "$T/err" && ok "…nor with the config redirected, as every test sandbox is" || no "runs=$(ncount): $(cat "$T/err")"
+newhome h28; : > "$T_INSTALLER_LOG"
+PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 X global login </dev/null >"$T/out" 2>&1; rc=$?
+[ $rc = 3 ] && [ "$(ncount)" = 0 ] && ok "global login with no terminal stops before installing anything" || no "rc=$rc runs=$(ncount): $(cat "$T/out")"
+newhome h29; : > "$T_INSTALLER_LOG"
+PATH="$NCP" FAKE_INSTALL_HANG=1 CA_CLAUDE_INSTALL_SECS=3 TX "$T/err" list >/dev/null
+grep -q "did not finish in 0 minutes and was stopped" "$T/err" && ! pgrep -f 'fake-installer-hang' >/dev/null && ok "an installer that hangs is stopped, with everything it started" || no "$(cat "$T/err"); $(pgrep -fl fake-installer-hang)"
+grep -qx "tried.claude=$CAV" "$HOME/.config/claude-accounts/.setup-state" && ok "…and it is recorded as tried for this version" || no "$(cat "$HOME/.config/claude-accounts/.setup-state")"
+sed -i '' '/^version=/d' "$HOME/.config/claude-accounts/.setup-state"; : > "$T_INSTALLER_LOG"
+PATH="$NCP" TX "$T/err" list >/dev/null
+[ "$(ncount)" = 0 ] && grep -q 'Installing Claude Code did not finish last time' "$T/err" && ok "a cut-short install is not started again on every command" || no "runs=$(ncount): $(cat "$T/err")"
+newhome h30; : > "$T_INSTALLER_LOG"; mkdir -p "$HOME/.config/claude-accounts/.setup.lock"
+python3 -I -c 'import time; time.sleep(300)' claude-account & live=$!; echo $live > "$HOME/.config/claude-accounts/.setup.lock/pid"
+( PATH="$NCP" CLAUDE_ACCOUNTS_NO_AUTOSETUP=1 TX "$T/err30" global status > "$T/out30" ) & wp=$!; sleep 2
+[ "$(ncount)" = 0 ] && kill -0 $wp 2>/dev/null && ok "a command that needs Claude Code waits while another terminal is setting up" || no "runs=$(ncount)"
+{ kill $live; wait $live; } 2>/dev/null; wait $wp
+[ "$(ncount)" = 1 ] && grep -q '9.9.9 (Claude Code)' "$T/out30" && ok "…then installs it once and carries on" || no "runs=$(ncount): $(cat "$T/out30" "$T/err30")"
+fi
+
+newhome h25; : > "$T_INSTALLER_LOG"
+TX "$T/err" list >/dev/null
+[ "$(ncount)" = 0 ] && grep -qx 'seen.claude=1' "$HOME/.config/claude-accounts/.setup-state" && ok "a Mac that has Claude Code installs nothing, and remembers it was there" || no "runs=$(ncount)"
+
 section "two commands at once: one sets up, both work"
 newhome h5
 TX "$T/e1" list >"$T/o1" & p1=$!; TX "$T/e2" list >"$T/o2" & p2=$!; wait $p1; r1=$?; wait $p2; r2=$?

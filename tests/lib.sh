@@ -123,6 +123,23 @@ STUB
   # so a test can count usage calls and prove the token never rides on curl's argv.
   cat > "$T/bin/curl" <<'STUB'
 #!/bin/bash
+# Anthropic's installer (1.2.11): the -o file gets a stand-in that "installs" a fake claude in
+# $HOME/.local/bin and records each run in $T_INSTALLER_LOG. FAKE_INSTALL_FAIL=1 makes it fail;
+# FAKE_INSTALL_HTML=1 serves a page instead of a script; FAKE_INSTALL_HANG=1 starts a child that
+# never ends, named fake-installer-hang. Nothing here reaches the network.
+case "$*" in *claude.ai/install.sh*)
+  printf 'args:%s\n' "$*" >> "$T_CURLED"
+  out=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out=$a; prev=$a; done
+  if [ -n "${FAKE_INSTALL_HTML:-}" ]; then printf '<html>sign in to this network</html>' > "$out"; exit 0; fi
+  printf '%s\n' '#!/bin/bash' \
+    'echo "ran stdin=$([ -t 0 ] && echo tty || echo none)" >> "$T_INSTALLER_LOG"' \
+    '[ -n "${FAKE_INSTALL_FAIL:-}" ] && { echo "Download failed" >&2; exit 1; }' \
+    '[ -n "${FAKE_INSTALL_HANG:-}" ] && { bash -c "exec -a fake-installer-hang sleep 600"; exit 0; }' \
+    'mkdir -p "$HOME/.local/bin"' \
+    'printf "#!/bin/bash\necho \"9.9.9 (Claude Code)\"\n" > "$HOME/.local/bin/claude"; chmod +x "$HOME/.local/bin/claude"' \
+    'echo "Installation complete!"' > "$out"
+  exit 0 ;;
+esac
 hdr=""; [ ! -t 0 ] && hdr=$(cat 2>/dev/null | grep -i '^Authorization:' | head -1)
 printf 'args:%s\n' "$*" >> "$T_CURLED"; [ -n "$hdr" ] && printf 'stdin:%s\n' "$hdr" >> "$T_CURLED"
 A="${FAKE_RESETS_AT:-2030-01-01T15:40:00Z}"; B="${FAKE_RESETS_AT:-2030-01-03T15:00:00Z}"
@@ -141,6 +158,7 @@ STUB
   # assertion then passes for the wrong reason.
   export T_OPENED="$T/opened"; : > "$T_OPENED"
   export T_CURLED="$T/curled"; : > "$T_CURLED"
+  export T_INSTALLER_LOG="$T/installer.log"; : > "$T_INSTALLER_LOG"
   # The security stub keeps what is written (rename copies a login and reads it back, 1.2.5)
   export T_KC="$T/kc"; mkdir -p "$T_KC"
   # doctor's live-sessions scan looks only at this sandbox's stand-in sessions, never at the

@@ -51,16 +51,20 @@ The first `claude-account` command you run at a terminal sets everything up, and
   extension, because those editors start Claude by absolute path and never see `PATH`. The file
   keeps its comments, a backup is taken first, and the editor needs one restart
 - the status bar item that names each window's account, installed with the editor's own tool
+- Claude Code itself, when the Mac has no `claude` command: Anthropic's own installer puts it in
+  `~/.local/bin`, where it keeps itself up to date. Signing in needs it, and so does typing
+  `claude` in a terminal. A command that runs Claude Code installs it the same way if it is
+  missing
 
 `claude-account doctor` shows the result. `claude-account setup` does the same with a full
 report, and puts back anything you removed by hand; `claude-account uninstall` takes all of it
-out again and keeps your rules, groups and logins. `CLAUDE_ACCOUNTS_NO_AUTOSETUP=1` turns the
+out again and keeps your rules, groups and logins, and Claude Code. `CLAUDE_ACCOUNTS_NO_AUTOSETUP=1` turns the
 automatic part off. To put the launchers somewhere other than `~/bin`, run
 `CLAUDE_ACCOUNTS_BINDIR=<folder> claude-account setup` once; the folder must be your own and not
 writable by other users.
 
-Anything you remove by hand later - the `PATH` block, the editor line, the status bar item -
-stays removed. A `claude` in `~/bin` that is not claude-account's is never touched.
+Anything you remove by hand later - the `PATH` block, the editor line, the status bar item,
+Claude Code - stays removed. A `claude` in `~/bin` that is not claude-account's is never touched.
 
 ### Updating
 

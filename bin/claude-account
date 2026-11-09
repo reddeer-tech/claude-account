@@ -9,7 +9,7 @@ set -uo pipefail
 # you ran claude-account from — a cloned repo, say — ran as you, and several of these sites
 # are handed a whole credential on stdin. -I leaves out the cwd, PYTHON* variables and user
 # site-packages; only the standard library is used. tests/test_core.sh fails on a bare one.
-CA_VERSION="1.2.10"   # kept in step with package.json by `make version`
+CA_VERSION="1.2.11"   # kept in step with package.json by `make version`
 MAP="${CLAUDE_ACCOUNTS_MAP:-$HOME/.config/claude-accounts/paths.map}"
 PROFILES="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts/profiles}"
 # How close a credential's SIGN-IN end must be before every identity line and doctor say so.
@@ -55,11 +55,14 @@ grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
 yel(){ printf '\033[33m%s\033[0m\n' "$*"; }
 dim(){ printf '\033[2m%s\033[0m\n' "$*"; }
 
+# Claude Code itself: PATH, then the places its installers use whatever PATH says (the same list
+# the launcher searches). A copy of claude-account's own launcher is never it.
 real_claude(){ local d self; self="$HOME/bin/claude"
   IFS=: read -ra p <<< "$PATH"
-  for d in "${p[@]}" "$HOME/.local/bin"; do
+  for d in "${p[@]}" "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
     [ -x "$d/claude" ] || continue
     [ "$(cd "$d" && pwd)/claude" = "$self" ] && continue
+    is_our_launcher "$d/claude" && continue
     printf '%s\n' "$(cd "$d" && pwd)/claude"; return 0
   done; return 1; }
 
@@ -386,9 +389,10 @@ lock_give(){ [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && rm -rf -- "$1"; return 
 # would (status 128+n), except inside crit_begin … crit_end, a sequence that must not stop
 # half-way: there it waits for crit_end. Before 1.2.9 the traps released the lock and let the
 # command carry on writing without it, so Ctrl+C never stopped a mutating command.
-CA_LOCK=""; CA_SETUP_LOCK=""; CA_GUARD=""; CA_SIGNAL=""; CA_CRIT=0
+CA_LOCK=""; CA_SETUP_LOCK=""; CA_GUARD=""; CA_TMPD=""; CA_SIGNAL=""; CA_CRIT=0
 on_signal(){ CA_SIGNAL=${CA_SIGNAL:-$1}; [ "$CA_CRIT" = 1 ] || exit "$CA_SIGNAL"; }
 locks_release(){
+  [ -n "$CA_TMPD" ] && rm -rf -- "$CA_TMPD"
   [ -n "$CA_GUARD" ] && rmdir "$CA_GUARD" 2>/dev/null
   [ -n "$CA_LOCK" ] && lock_give "$CA_LOCK"; [ -n "$CA_SETUP_LOCK" ] && lock_give "$CA_SETUP_LOCK"; return 0
 }
@@ -1816,6 +1820,8 @@ bindir_ok(){
   case "$d" in /*) ;; *) echo "it is not an absolute path"; return 1 ;; esac
   case "$d" in *[[:cntrl:]]*) echo "it contains a control character"; return 1 ;; esac
   [ "$d" = / ] && { echo "it is /"; return 1; }
+  # Claude Code's own installer owns ~/.local/bin/claude, and the launcher would be in its way
+  [ "${d%/}" = "$HOME/.local/bin" ] && { echo "it is where Claude Code's own installer puts claude"; return 1; }
   e="$d"; while [ ! -e "$e" ] && [ "$e" != / ]; do e=$(dirname "$e"); done
   [ -d "$e" ] || { echo "it is not a folder"; return 1; }
   [ -O "$e" ] || { echo "$(tilde "$e") is not yours"; return 1; }
@@ -1868,7 +1874,7 @@ setup_step_files(){
 # Step 2 — the two launchers (`claude` and the editor wrapper). Always kept current.
 setup_step_launchers(){
   if [ -n "$SETUP_BIN_BAD" ]; then
-    s_warn "will not put the launchers in $SETUP_BIN: $SETUP_BIN_BAD. Choose a folder of your own that comes first on PATH:  CLAUDE_ACCOUNTS_BINDIR=\"\$HOME/.local/bin\" claude-account setup"
+    s_warn "will not put the launchers in $SETUP_BIN: $SETUP_BIN_BAD. Choose a folder of your own that comes first on PATH:  CLAUDE_ACCOUNTS_BINDIR=\"\$HOME/.config/claude-accounts/bin\" claude-account setup"
     return 1
   fi
   mkdir -p "$SETUP_BIN"
@@ -1889,7 +1895,7 @@ setup_step_launchers(){
   # ⚠️ NEVER overwrite a claude we did not put there. Shadowing is done by winning PATH ORDER
   # from a different directory — never by writing over the binary.
   if [ -e "$SETUP_BIN/claude" ]; then
-    s_warn "$SETUP_BIN/claude already exists and is not claude-account's launcher — left alone. Put the launchers somewhere else that comes first on PATH:  CLAUDE_ACCOUNTS_BINDIR=\"\$HOME/.local/bin\" claude-account setup"
+    s_warn "$SETUP_BIN/claude already exists and is not claude-account's launcher — left alone. Put the launchers somewhere else that comes first on PATH:  CLAUDE_ACCOUNTS_BINDIR=\"\$HOME/.config/claude-accounts/bin\" claude-account setup"
     return 1
   fi
   install -m 0755 "$PKG_SHIM" "$SETUP_BIN/claude"
@@ -2016,6 +2022,130 @@ setup_step_item(){
   return 0
 }
 
+# Said at once, even in the automatic run, whose other output is held until the end: for a
+# step that takes a while. The automatic run hands the terminal's stderr over as fd 3.
+s_now(){ if [ "$SETUP_MODE" = auto ]; then { printf '%s\n' "$1" >&3; } 2>/dev/null; else dim "$1"; fi; }
+
+# Claude Code, with Anthropic's own installer (https://code.claude.com/docs/en/setup), downloaded
+# whole into a private folder and only then run: never piped into bash, so a cut connection
+# cannot run half a script. Read 2026-11-09: it refuses sudo, checks the program it downloads
+# against Anthropic's published SHA-256, puts claude in ~/.local/bin, and never edits PATH or a
+# shell file (the launcher finds ~/.local/bin whatever PATH says). Its output goes to a log
+# (600); the result is checked by finding and running the claude it installed, never assumed.
+# Run for real 2026-11-09 in a throwaway HOME: 2.1.321 in ~/.local/bin, no shell file created, a
+# "not in your PATH" note in the log only, six minutes on a loaded Mac.
+claude_install(){
+  local d log="$SETUP_CFG/claude-install.log" rc=0 got ver why
+  why=$(may_install) || { s_warn "Claude Code is not installed, and it is not installed $why. To install it yourself: curl -fsSL https://claude.ai/install.sh | bash"; return 1; }
+  if is_our_launcher "$HOME/.local/bin/claude"; then
+    s_warn "Claude Code is not installed, and its installer would write ~/.local/bin/claude, where claude-account's launcher is. Move the launchers first:  CLAUDE_ACCOUNTS_BINDIR=\"\$HOME/.config/claude-accounts/bin\" claude-account setup"
+    return 1
+  fi
+  mkdir -p "$SETUP_CFG" 2>/dev/null
+  d=$(mktemp -d "${TMPDIR:-/tmp}/ca-claude-install.XXXXXX" 2>/dev/null) || { s_warn "Claude Code is not installed: no temporary folder to download its installer into."; return 1; }
+  CA_TMPD="$d"; chmod 700 "$d"
+  s_now "Claude Code is not installed — installing it with Anthropic's installer (one time, it can take a few minutes)…"
+  ( umask 077; : >> "$log"; printf '\n== %s  claude-account %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$CA_VERSION" >> "$log" ) 2>/dev/null
+  chmod 600 "$log" 2>/dev/null
+  if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 120 -o "$d/install.sh" https://claude.ai/install.sh >> "$log" 2>&1; then
+    rm -rf -- "$d"; CA_TMPD=""
+    s_warn "Could not download Claude Code's installer (details in $(tilde "$log")). To install it yourself: curl -fsSL https://claude.ai/install.sh | bash"
+    return 1
+  fi
+  if [ "$(head -c 2 "$d/install.sh" 2>/dev/null)" != '#!' ]; then
+    rm -rf -- "$d"; CA_TMPD=""
+    s_warn "The download of Claude Code's installer was not a script (a network sign-in page?) — nothing was run. To install it yourself: curl -fsSL https://claude.ai/install.sh | bash"
+    return 1
+  fi
+  # Its own downloads have no time limit, so a stalled connection would hang this command for
+  # good: python runs it in a process group of its own and ends the whole group after 20 minutes,
+  # or at once on Ctrl+C, which the group would otherwise never see.
+  ( cd "$d" && env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN python3 -I -c '
+import os, signal, subprocess, sys
+p = subprocess.Popen(sys.argv[2:], start_new_session=True)
+def end(code):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+            p.wait(10)
+            break
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+    sys.exit(code)
+try:
+    sys.exit(p.wait(timeout=int(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    end(124)
+except KeyboardInterrupt:
+    end(130)
+' "${CA_CLAUDE_INSTALL_SECS:-1200}" bash "$d/install.sh" ) </dev/null >> "$log" 2>&1 3>&- || rc=$?
+  rm -rf -- "$d"; CA_TMPD=""
+  [ "$rc" = 130 ] && exit 130
+  got=$(real_claude 2>/dev/null) && ver=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR "$got" --version 2>/dev/null | head -1)
+  if [ "$rc" != 0 ] || [ -z "$got" ] || [ -z "$ver" ]; then
+    if [ "$rc" = 124 ]; then
+      s_warn "Anthropic's installer did not finish in $(( ${CA_CLAUDE_INSTALL_SECS:-1200} / 60 )) minutes and was stopped (details in $(tilde "$log")). claude-account setup tries again; or install it yourself: curl -fsSL https://claude.ai/install.sh | bash"
+    else
+      s_warn "Could not install Claude Code (Anthropic's installer exit $rc; details in $(tilde "$log")). To install it yourself: curl -fsSL https://claude.ai/install.sh | bash"
+    fi
+    return 1
+  fi
+  ss_set seen.claude 1; ss_set installed.claude 1
+  s_did "Installed Claude Code ${ver%% *} with Anthropic's installer, at $(tilde "$got"); it keeps itself up to date."
+  return 0
+}
+
+# Who may install software on this Mac: a person, as the owner of this home, outside CI and
+# outside a test sandbox (which keeps the real HOME). Prints why not.
+may_install(){
+  if [ "$(id -u)" = 0 ]; then echo "as root — run claude-account setup as yourself"; return 1; fi
+  if [ ! -O "$HOME" ]; then echo "into a home folder that is not yours"; return 1; fi
+  if [ -n "${CI:-}" ]; then echo "in CI"; return 1; fi
+  if [ -n "${CLAUDE_ACCOUNTS_MAP:-}${CLAUDE_ACCOUNTS_DIR:-}" ]; then echo "while CLAUDE_ACCOUNTS_MAP or CLAUDE_ACCOUNTS_DIR points elsewhere"; return 1; fi
+  return 0
+}
+
+# Step 6 — Claude Code itself. Without a claude command nothing can sign in (login runs Claude
+# Code's own sign-in) and claude in a terminal fails; editor chats still work, the extension
+# hands the wrapper its own copy. Alexy's call (2026-11-09): install it with Anthropic's installer,
+# without asking. Once it has been here, the automatic run respects a removal by hand and says
+# so; setup and the commands that run claude install it again. The automatic run tries once per
+# version: an install cut short (Ctrl+C, a closed terminal) leaves no version stamp, and without
+# tried.claude every later command would start the whole download again.
+setup_step_claude(){
+  local got; got=$(real_claude 2>/dev/null)
+  if [ -n "$got" ]; then ss_set seen.claude 1; s_info "Claude Code: $(tilde "$got")."; return 0; fi
+  if [ "$SETUP_MODE" = auto ] && [ -n "$(ss_get seen.claude)" ]; then
+    s_warn "Claude Code is not installed any more, so nothing can sign in — claude-account setup installs it again."
+    return 0
+  fi
+  if [ "$SETUP_MODE" = auto ] && [ "$(ss_get tried.claude)" = "$CA_VERSION" ]; then
+    s_warn "Installing Claude Code did not finish last time — claude-account setup tries again."
+    return 0
+  fi
+  [ "$SETUP_MODE" = auto ] && ss_set tried.claude "$CA_VERSION"
+  claude_install
+  return 0
+}
+
+# For a command that has to run Claude Code (sign in, sign out, auth status): its path, after
+# installing it when there is none and a person is at the terminal. Holds the setup lock while
+# it does, so two terminals never install at once, and looks again once it has it: the other
+# one may have just finished. Messages go to stderr: this runs inside $( ). Exit 127 when there
+# is still no claude.
+need_claude(){
+  local got; got=$(real_claude 2>/dev/null) && { printf '%s\n' "$got"; return 0; }
+  if [ -t 0 ]; then
+    SETUP_MODE=explicit; SETUP_WARNINGS=""
+    setup_lock_wait || return 127
+    got=$(real_claude 2>/dev/null) && { printf '%s\n' "$got"; return 0; }
+    claude_install >&2 && got=$(real_claude 2>/dev/null) && { printf '%s\n' "$got"; return 0; }
+    return 127
+  fi
+  red "Claude Code is not installed, and this needs it. In a terminal run: claude-account setup  (or install it yourself: curl -fsSL https://claude.ai/install.sh | bash)" >&2
+  return 127
+}
+
 # Every step, in order. Returns 1 when the launchers could not be placed (explicit setup's exit).
 setup_steps(){
   local rc=0
@@ -2025,6 +2155,7 @@ setup_steps(){
   setup_step_path
   setup_step_editor_settings
   setup_step_item
+  setup_step_claude
   return $rc
 }
 
@@ -2058,7 +2189,7 @@ autosetup(){
   CA_SETUP_LOCK="$SETUP_CFG/.setup.lock"; lock_traps
   if ! lock_take "$CA_SETUP_LOCK"; then                          # another one is doing it
     CA_SETUP_LOCK=""; lock_traps_off; SETUP_MODE=explicit; return 0; fi
-  setup_steps >/dev/null 2>&1 || true
+  setup_steps 3>&2 >/dev/null 2>&1 || true      # fd 3: the terminal, for s_now
   ss_set version "$CA_VERSION"
   setup_record_warnings
   lock_give "$CA_SETUP_LOCK"; CA_SETUP_LOCK=""; lock_traps_off
@@ -2138,6 +2269,7 @@ cmd_uninstall(){
   ss_set auto off
   echo
   dim "Kept: your rules, groups, profiles and logins in $(tilde "$SETUP_CFG")."
+  [ -n "$(ss_get installed.claude)" ] && dim "Claude Code, which setup installed, stays installed — to remove it too: rm -f ~/.local/bin/claude && rm -rf ~/.local/share/claude"
   dim "New terminals and editor windows now start the real claude, on your global account everywhere;"
   dim "chats already open keep the account they started with. Put it all back with: claude-account setup"
 }
@@ -2252,7 +2384,7 @@ print('ok' if (t > need or (t == need and not pre)) else 'old')
       *)   wrn "could not read claude's version (probe failure — not proof it is too old)" ;;
     esac
   else
-    bad "no real claude binary found on PATH"
+    bad "Claude Code is not installed — nothing can sign in, and claude in a terminal fails. claude-account setup installs it"
   fi
   # direnv re-evaluates .envrc AFTER the shim ran, so a routed project whose .envrc
   # touches PATH or CLAUDE_* can override routing (seen wrapping launches in chatmux)
@@ -2666,7 +2798,7 @@ cmd_logout(){
   if ! security find-generic-password -s "$svc" >/dev/null 2>&1; then
     yel "Profile '$name' is not signed in — nothing to log out."; exit 0; fi
 
-  local rc; rc=$(real_claude) || { red "real claude not found"; exit 127; }
+  local rc; rc=$(need_claude) || exit $?
   env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN \
       CLAUDE_SECURESTORAGE_CONFIG_DIR="$pdir" "$rc" auth logout >/dev/null 2>&1
   security delete-generic-password -s "$svc" >/dev/null 2>&1   # belt and braces
@@ -2846,12 +2978,14 @@ cmd_usage(){
 }
 
 cmd_global(){
-  local rc; rc=$(real_claude) || { red "real claude not found"; exit 127; }
+  local rc=""
+  case "${1:-status}" in status|logout) rc=$(need_claude) || exit $? ;; esac   # login: after its terminal check; usage does not run claude
   case "${1:-status}" in
     status) env -u CLAUDE_SECURESTORAGE_CONFIG_DIR "$rc" auth status ;;
     login)
       if [ ! -t 0 ] || [ ! -t 1 ]; then
         yel "Interactive — run in your own terminal:"; echo; echo "    claude-account global login"; exit 3; fi
+      rc=$(need_claude) || exit $?
       env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN "$rc" auth login --claudeai
       mkdir -p "$PROFILES"
       python3 -I - <<'GLPY' > "$PROFILES/.global-account" 2>/dev/null || true
@@ -3839,7 +3973,6 @@ cmd_login(){
     esac
   done
   local pdir="$PROFILES/$name"; mkdir -p "$pdir"
-  local rc; rc=$(real_claude) || { red "real claude binary not found"; exit 127; }
 
   # OAuth needs a real terminal and a browser. An agent's Bash tool has no TTY, so
   # launching there would hang with no way to finish. Detect it and hand the user
@@ -3854,6 +3987,7 @@ cmd_login(){
     dim "Then come back and run:  claude-account verify"
     exit 3
   fi
+  local rc; rc=$(need_claude) || exit $?
 
   echo "Signing in to Claude profile '$name'."
   dim "A browser will open. Sign in with the account that owns this project."
